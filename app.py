@@ -14,6 +14,7 @@ import threading
 import zipfile
 from pathlib import Path
 
+import requests
 from flask import Flask, render_template_string, request, redirect, url_for, send_file, jsonify
 
 import qbank_pipeline as pipeline
@@ -83,23 +84,47 @@ PAGE = """
     <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">Download results (.zip)</a>
   </div>
 
-  <form action="/run" method="POST" enctype="multipart/form-data" class="bg-white rounded-lg shadow p-4 space-y-3">
-    <div>
-      <label class="block text-sm font-semibold mb-1">PDF file</label>
-      <input type="file" name="file" accept=".pdf" class="w-full text-sm border p-2 rounded">
-    </div>
-    <div>
-      <label class="block text-sm font-semibold mb-1">Subject code (3 letters)</label>
-      <input type="text" name="subject_code" maxlength="3" class="w-full text-sm border p-2 rounded uppercase" placeholder="PSY" required>
-    </div>
-    <div>
-      <label class="block text-sm font-semibold mb-1">Page offset</label>
-      <input type="number" name="page_offset" value="-1" class="w-full text-sm border p-2 rounded">
-    </div>
-    <button class="w-full bg-slate-800 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
-      Run
-    </button>
-  </form>
+  <div class="bg-white rounded-lg shadow p-4 border-2 border-emerald-500 space-y-3">
+    <p class="text-xs font-bold text-emerald-700 uppercase">Recommended for phone</p>
+    <form action="/run-url" method="POST" class="space-y-3">
+      <div>
+        <label class="block text-sm font-semibold mb-1">PDF link (Google Drive / Telegram / direct download URL)</label>
+        <input type="url" name="pdf_url" class="w-full text-sm border p-2 rounded" placeholder="https://..." required>
+      </div>
+      <div>
+        <label class="block text-sm font-semibold mb-1">Subject code (3 letters)</label>
+        <input type="text" name="subject_code" maxlength="3" class="w-full text-sm border p-2 rounded uppercase" placeholder="PSY" required>
+      </div>
+      <div>
+        <label class="block text-sm font-semibold mb-1">Page offset</label>
+        <input type="number" name="page_offset" value="-1" class="w-full text-sm border p-2 rounded">
+      </div>
+      <button class="w-full bg-emerald-600 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        Run (from link)
+      </button>
+    </form>
+  </div>
+
+  <details class="bg-white rounded-lg shadow p-4">
+    <summary class="text-sm font-semibold cursor-pointer">Or upload file directly (less reliable on mobile)</summary>
+    <form action="/run" method="POST" enctype="multipart/form-data" class="space-y-3 mt-3">
+      <div>
+        <label class="block text-sm font-semibold mb-1">PDF file</label>
+        <input type="file" name="file" accept=".pdf" class="w-full text-sm border p-2 rounded">
+      </div>
+      <div>
+        <label class="block text-sm font-semibold mb-1">Subject code (3 letters)</label>
+        <input type="text" name="subject_code" maxlength="3" class="w-full text-sm border p-2 rounded uppercase" placeholder="PSY" required>
+      </div>
+      <div>
+        <label class="block text-sm font-semibold mb-1">Page offset</label>
+        <input type="number" name="page_offset" value="-1" class="w-full text-sm border p-2 rounded">
+      </div>
+      <button class="w-full bg-slate-800 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        Run (upload)
+      </button>
+    </form>
+  </details>
 
   <div class="bg-black text-green-400 text-xs rounded-lg p-3 h-64 overflow-y-auto font-mono" id="log">
     {% for line in state.log %}{{ line }}<br>{% endfor %}
@@ -123,6 +148,42 @@ def index():
 @app.route("/status")
 def status():
     return jsonify(state)
+
+@app.route("/run-url", methods=["POST"])
+def run_url():
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    pdf_url = request.form.get("pdf_url", "").strip()
+    subject_code = request.form.get("subject_code", "").strip().upper()
+    page_offset = int(request.form.get("page_offset", -1))
+    if not pdf_url:
+        return "No URL provided", 400
+
+    def download_then_run():
+        try:
+            log(f"⬇️ Downloading PDF from link...")
+            fname = pdf_url.split("/")[-1].split("?")[0] or f"{subject_code}.pdf"
+            if not fname.lower().endswith(".pdf"):
+                fname += ".pdf"
+            pdf_path = UPLOAD_DIR / fname
+            r = requests.get(pdf_url, stream=True, timeout=120)
+            r.raise_for_status()
+            with open(pdf_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            log(f"✅ Downloaded {fname} ({pdf_path.stat().st_size // 1024} KB)")
+            run_pipeline_thread(subject_code, pdf_path, page_offset)
+        except Exception as e:
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = str(e)
+            log(f"❌ Download failed: {e}")
+
+    t = threading.Thread(target=download_then_run)
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
 
 @app.route("/run", methods=["POST"])
 def run():
