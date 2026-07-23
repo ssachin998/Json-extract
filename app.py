@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+Phone-friendly dashboard for the QBank pipeline.
+Upload a PDF (or paste a link), tap Run, watch progress, download results —
+all from a phone browser. No terminal/PC needed once this is deployed.
+
+This is just a thin UI wrapper. All the real extraction logic (watermark
+detection, Gemini vision calls, checkpointing, rate-limit handling) lives
+in qbank_pipeline.py — this file does not duplicate or replace any of that.
+"""
+
+import os
+import threading
+import zipfile
+from pathlib import Path
+
+from flask import Flask, render_template_string, request, redirect, url_for, send_file, jsonify
+
+import qbank_pipeline as pipeline
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB per PDF upload
+
+UPLOAD_DIR = Path("./pdfs")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+state_lock = threading.Lock()
+state = {"status": "idle", "log": [], "error": None}
+
+def log(msg):
+    with state_lock:
+        state["log"].append(msg)
+        if len(state["log"]) > 500:
+            state["log"].pop(0)
+
+def run_pipeline_thread(subject_code, pdf_path, page_offset):
+    with state_lock:
+        state["status"] = "processing"
+        state["error"] = None
+    try:
+        pipeline.PDFS[:] = [{"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}]
+        pipeline.main()
+        with state_lock:
+            state["status"] = "completed"
+        log("✅ Done (or paused at daily Gemini limit — tap Run again tomorrow to resume).")
+        make_zip()
+    except SystemExit:
+        with state_lock:
+            state["status"] = "paused"
+        log("⏸ Hit daily Gemini call limit — progress saved. Come back tomorrow and tap Run again.")
+        make_zip()
+    except Exception as e:
+        with state_lock:
+            state["status"] = "failed"
+            state["error"] = str(e)
+        log(f"❌ Error: {e}")
+
+def make_zip():
+    out = Path("qbank_output")
+    if not out.exists():
+        return
+    zpath = Path("output_results.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in out.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(out.parent))
+
+PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QBank Extractor</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 p-4">
+<div class="max-w-lg mx-auto space-y-4">
+  <h1 class="text-xl font-bold">QBank Extractor</h1>
+
+  <div class="bg-white rounded-lg shadow p-4">
+    <p class="text-sm mb-2">Status: <span class="font-semibold">{{ state.status }}</span></p>
+    {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
+    <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">Download results (.zip)</a>
+  </div>
+
+  <form action="/run" method="POST" enctype="multipart/form-data" class="bg-white rounded-lg shadow p-4 space-y-3">
+    <div>
+      <label class="block text-sm font-semibold mb-1">PDF file</label>
+      <input type="file" name="file" accept=".pdf" class="w-full text-sm border p-2 rounded">
+    </div>
+    <div>
+      <label class="block text-sm font-semibold mb-1">Subject code (3 letters)</label>
+      <input type="text" name="subject_code" maxlength="3" class="w-full text-sm border p-2 rounded uppercase" placeholder="PSY" required>
+    </div>
+    <div>
+      <label class="block text-sm font-semibold mb-1">Page offset</label>
+      <input type="number" name="page_offset" value="-1" class="w-full text-sm border p-2 rounded">
+    </div>
+    <button class="w-full bg-slate-800 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+      Run
+    </button>
+  </form>
+
+  <div class="bg-black text-green-400 text-xs rounded-lg p-3 h-64 overflow-y-auto font-mono" id="log">
+    {% for line in state.log %}{{ line }}<br>{% endfor %}
+  </div>
+</div>
+<script>
+setInterval(() => {
+  fetch('/status').then(r => r.json()).then(d => {
+    document.getElementById('log').innerHTML = d.log.join('<br>');
+  });
+}, 3000);
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(PAGE, state=state)
+
+@app.route("/status")
+def status():
+    return jsonify(state)
+
+@app.route("/run", methods=["POST"])
+def run():
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    f = request.files.get("file")
+    subject_code = request.form.get("subject_code", "").strip().upper()
+    page_offset = int(request.form.get("page_offset", -1))
+    if f and f.filename.lower().endswith(".pdf"):
+        pdf_path = UPLOAD_DIR / f.filename
+        f.save(pdf_path)
+    else:
+        # no new file uploaded -> reuse whatever PDF is already in ./pdfs
+        existing = list(UPLOAD_DIR.glob("*.pdf"))
+        if not existing:
+            return "No PDF uploaded and none found in ./pdfs", 400
+        pdf_path = existing[0]
+    t = threading.Thread(target=run_pipeline_thread, args=(subject_code, pdf_path, page_offset))
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
+
+@app.route("/download")
+def download():
+    if os.path.exists("output_results.zip"):
+        return send_file("output_results.zip", as_attachment=True)
+    return "No results yet", 404
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
