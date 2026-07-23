@@ -12,12 +12,10 @@ ENV PYTHONUNBUFFERED 1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     tesseract-ocr \
+    tesseract-ocr-eng \
     libtesseract-dev \
     libleptonica-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Tesseract language data (English)
-RUN apt-get install -y tesseract-ocr-eng
 
 # Set working directory
 WORKDIR /app
