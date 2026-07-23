@@ -5,12 +5,13 @@ import shutil
 import zipfile
 import threading
 import subprocess
+import requests
 from flask import Flask, render_template_string, request, redirect, url_for, send_file, jsonify
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = '.'
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB max limit
+app.config['MAX_CONTENT_LENGTH'] = 150 * 1024 * 1024  # 150 MB max limit
 
 # Global state to track processing
 state = {
@@ -43,23 +44,15 @@ def find_pdf_files():
     pdfs = []
     for f in os.listdir('.'):
         if f.lower().endswith('.pdf'):
-            # Ignore intermediate temp PDFs if any
+            # Ignore intermediate temp PDFs
             if not f.startswith('temp_') and os.path.isfile(f):
                 pdfs.append(f)
     return pdfs
 
-# Worker function to run the pipeline
-def run_pipeline_worker(pdf_path, subject_code):
+# Shared pipeline execution logic (runs qbank_pipeline.py as a subprocess)
+def run_pipeline_subprocess(pdf_path, subject_code):
     global state
-    with state_lock:
-        state['status'] = 'processing'
-        state['current_pdf'] = pdf_path
-        state['subject_code'] = subject_code
-        state['logs'] = [f"🚀 Starting pipeline for {pdf_path} with subject code {subject_code}...\n"]
-        state['error'] = None
-
     try:
-        # Run qbank_pipeline.py as a subprocess
         cmd = [sys.executable, 'qbank_pipeline.py', pdf_path, subject_code]
         process = subprocess.Popen(
             cmd,
@@ -73,7 +66,6 @@ def run_pipeline_worker(pdf_path, subject_code):
         for line in iter(process.stdout.readline, ''):
             with state_lock:
                 state['logs'].append(line)
-                # Keep logs bounded in memory if too large (e.g., last 2000 lines)
                 if len(state['logs']) > 2000:
                     state['logs'].pop(0)
 
@@ -84,7 +76,6 @@ def run_pipeline_worker(pdf_path, subject_code):
             if return_code == 0:
                 state['status'] = 'completed'
                 state['logs'].append("🎉 Pipeline completed successfully!\n")
-                # Create zip archive of results
                 create_results_zip()
             else:
                 state['status'] = 'failed'
@@ -97,9 +88,59 @@ def run_pipeline_worker(pdf_path, subject_code):
             state['error'] = str(e)
             state['logs'].append(f"❌ Exception occurred: {str(e)}\n")
 
+# Worker for local files (manual run or file upload)
+def run_pipeline_worker(pdf_path, subject_code):
+    global state
+    with state_lock:
+        state['status'] = 'processing'
+        state['current_pdf'] = pdf_path
+        state['subject_code'] = subject_code
+        state['logs'] = [f"🚀 Starting pipeline for {pdf_path} with subject code {subject_code}...\n"]
+        state['error'] = None
+
+    run_pipeline_subprocess(pdf_path, subject_code)
+
+# Worker for downloading from a URL
+def run_pipeline_url_worker(url, subject_code):
+    global state
+    with state_lock:
+        state['status'] = 'processing'
+        state['current_pdf'] = url
+        state['subject_code'] = subject_code
+        state['logs'] = [f"🌐 Fetching PDF from remote URL: {url}...\n"]
+        state['error'] = None
+
+    try:
+        local_filename = f"downloaded_{subject_code}.pdf"
+        if os.path.exists(local_filename):
+            try:
+                os.remove(local_filename)
+            except:
+                pass
+
+        # Download with streaming
+        response = requests.get(url, stream=True, timeout=120)
+        response.raise_for_status()
+        
+        with open(local_filename, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        with state_lock:
+            state['logs'].append(f"✅ Successfully downloaded PDF from URL (saved as {local_filename})!\n")
+            state['current_pdf'] = local_filename
+
+        run_pipeline_subprocess(local_filename, subject_code)
+
+    except Exception as e:
+        with state_lock:
+            state['status'] = 'failed'
+            state['error'] = f"Failed to download remote file: {str(e)}"
+            state['logs'].append(f"❌ Failed to download remote file: {str(e)}\n")
+
 def create_results_zip():
     zip_path = 'output_results.zip'
-    # Remove existing zip if any
     if os.path.exists(zip_path):
         try:
             os.remove(zip_path)
@@ -108,13 +149,11 @@ def create_results_zip():
 
     try:
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Zip data folder
             if os.path.exists('data'):
                 for root, dirs, files in os.walk('data'):
                     for file in files:
                         file_path = os.path.join(root, file)
                         zipf.write(file_path, os.path.relpath(file_path, '.'))
-            # Zip assets folder
             if os.path.exists('assets'):
                 for root, dirs, files in os.walk('assets'):
                     for file in files:
@@ -169,7 +208,7 @@ HTML_TEMPLATE = """
             {% if state.current_pdf %}
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-gray-50 p-4 rounded mb-4">
                 <div>
-                    <p class="text-sm text-gray-500">Processing PDF</p>
+                    <p class="text-sm text-gray-500">Processing PDF Source</p>
                     <p class="font-semibold text-lg break-all">{{ state.current_pdf }}</p>
                 </div>
                 <div>
@@ -200,12 +239,35 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Left Side: Source PDFs & Upload -->
+            <!-- Left Side: Source PDFs & Forms -->
             <div class="lg:col-span-1 space-y-6">
-                <!-- PDF Files List -->
+                
+                <!-- PDF URL Remote Fetch (Highly Stable!) -->
+                <div class="bg-white rounded-lg shadow p-6 border border-emerald-100 bg-emerald-50/20">
+                    <div class="flex items-center justify-between mb-2">
+                        <h3 class="text-lg font-bold text-emerald-800">⚡ Process from PDF Link</h3>
+                        <span class="bg-emerald-100 text-emerald-800 text-xs px-2 py-0.5 rounded font-bold">Recommended for Mobile</span>
+                    </div>
+                    <p class="text-xs text-gray-600 mb-4">Pasting a link downloads the PDF directly onto Railway. This is extremely fast and completely avoids mobile browser upload limits or file errors!</p>
+                    <form action="/download-url" method="POST" class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-semibold text-gray-700 mb-1">Direct PDF URL Link</label>
+                            <input type="url" name="url" class="w-full text-sm border p-2 rounded bg-white" placeholder="https://example.com/your_file.pdf" required>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-semibold text-gray-700 mb-1">Subject Code (3 letters)</label>
+                            <input type="text" name="subject_code" class="w-full text-sm border p-2 rounded uppercase bg-white" placeholder="e.g. PSY, BIO, CHE" maxlength="3">
+                        </div>
+                        <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2.5 px-4 rounded text-sm transition" {% if state.status == 'processing' %}disabled{% endif %}>
+                            Download & Process
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Detected PDF Files List -->
                 <div class="bg-white rounded-lg shadow p-6 border border-gray-100">
                     <h3 class="text-lg font-bold mb-3 text-gray-800">Detected PDF Files</h3>
-                    <p class="text-sm text-gray-500 mb-4">These are PDF files found in your workspace or GitHub repo. Click run to process them.</p>
+                    <p class="text-sm text-gray-500 mb-4">PDF files currently found in your workspace or GitHub repo.</p>
                     
                     {% if pdf_files %}
                     <div class="space-y-3">
@@ -215,7 +277,7 @@ HTML_TEMPLATE = """
                             <form action="/run" method="POST" class="flex gap-2">
                                 <input type="hidden" name="pdf_path" value="{{ pdf }}">
                                 <div class="flex-1">
-                                    <input type="text" name="subject_code" value="{{ detect_subject_code(pdf) }}" class="w-full text-xs border rounded px-2 py-1 uppercase" placeholder="SUB" max="3" required>
+                                    <input type="text" name="subject_code" value="{{ detect_subject_code(pdf) }}" class="w-full text-xs border rounded px-2 py-1 uppercase bg-white" placeholder="SUB" max="3" required>
                                 </div>
                                 <button type="submit" class="bg-blue-500 hover:bg-blue-600 text-white text-xs px-3 py-1 rounded font-semibold transition" {% if state.status == 'processing' %}disabled{% endif %}>
                                     Run
@@ -225,15 +287,15 @@ HTML_TEMPLATE = """
                         {% endfor %}
                     </div>
                     {% else %}
-                    <div class="text-center p-6 bg-gray-50 border border-dashed rounded text-gray-500">
-                        No PDF files found. Upload a PDF using the form below or commit a PDF to your GitHub repository!
+                    <div class="text-center p-6 bg-gray-50 border border-dashed rounded text-gray-500 text-sm">
+                        No local PDF files found.
                     </div>
                     {% endif %}
                 </div>
 
-                <!-- Manual Upload -->
+                <!-- Local File Upload -->
                 <div class="bg-white rounded-lg shadow p-6 border border-gray-100">
-                    <h3 class="text-lg font-bold mb-3 text-gray-800">Upload New PDF</h3>
+                    <h3 class="text-lg font-bold mb-3 text-gray-800">Upload Local PDF File</h3>
                     <form action="/upload" method="POST" enctype="multipart/form-data" class="space-y-4">
                         <div>
                             <label class="block text-sm font-semibold text-gray-600 mb-1">Select PDF File</label>
@@ -242,7 +304,6 @@ HTML_TEMPLATE = """
                         <div>
                             <label class="block text-sm font-semibold text-gray-600 mb-1">Subject Code (3 letters)</label>
                             <input type="text" name="subject_code" class="w-full text-sm border p-2 rounded uppercase" placeholder="e.g. PSY, BIO, CHE" maxlength="3">
-                            <p class="text-xs text-gray-400 mt-1">If blank, it will be automatically guessed from the file name.</p>
                         </div>
                         <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-2 px-4 rounded text-sm transition" {% if state.status == 'processing' %}disabled{% endif %}>
                             Upload and Run
@@ -261,7 +322,7 @@ HTML_TEMPLATE = """
                             <span class="text-xs text-gray-300 uppercase">{{ state.status }}</span>
                         </div>
                     </div>
-                    <div id="logs" class="terminal p-4 overflow-y-auto text-xs flex-1 h-[450px] whitespace-pre-wrap">{% for line in state.logs %}{{ line }}{% endfor %}</div>
+                    <div id="logs" class="terminal p-4 overflow-y-auto text-xs flex-1 h-[520px] whitespace-pre-wrap">{% for line in state.logs %}{{ line }}{% endfor %}</div>
                 </div>
             </div>
         </div>
@@ -337,7 +398,6 @@ def trigger_run():
     if not pdf_path or not os.path.exists(pdf_path):
         return redirect(url_for('index'))
 
-    # Start pipeline in a background thread
     t = threading.Thread(target=run_pipeline_worker, args=(pdf_path, subject_code))
     t.daemon = True
     t.start()
@@ -361,17 +421,37 @@ def upload_file():
         filename = secure_filename(file.filename)
         file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
         
-        # Determine subject code
         subject_code = request.form.get('subject_code')
         if not subject_code or len(subject_code.strip()) != 3:
             subject_code = detect_subject_code(filename)
         else:
             subject_code = subject_code.strip().upper()
 
-        # Automatically start processing
         t = threading.Thread(target=run_pipeline_worker, args=(filename, subject_code))
         t.daemon = True
         t.start()
+
+    return redirect(url_for('index'))
+
+@app.route('/download-url', methods=['POST'])
+def download_url():
+    global state
+    if state['status'] == 'processing':
+        return redirect(url_for('index'))
+
+    url = request.form.get('url').strip()
+    if not url:
+        return redirect(url_for('index'))
+
+    subject_code = request.form.get('subject_code', '').strip().upper()
+    if not subject_code or len(subject_code) != 3:
+        # Inferred from filename in URL
+        parsed_url = url.split('/')[-1].split('?')[0]
+        subject_code = detect_subject_code(parsed_url)
+
+    t = threading.Thread(target=run_pipeline_url_worker, args=(url, subject_code))
+    t.daemon = True
+    t.start()
 
     return redirect(url_for('index'))
 
@@ -392,7 +472,6 @@ def download_questions():
 @app.route('/download/zip')
 def download_zip():
     path = 'output_results.zip'
-    # Generate the zip file on demand if not already generated
     if not os.path.exists(path):
         create_results_zip()
     
@@ -402,14 +481,11 @@ def download_zip():
 
 # Background startup scanner
 def auto_start_scanner():
-    """Scans for PDF files on startup and runs processing automatically for the first one found."""
-    # Let the app initialize first
     import time
     time.sleep(2)
     
     pdfs = find_pdf_files()
     if pdfs and state['status'] == 'idle':
-        # Select the first PDF
         target_pdf = pdfs[0]
         code = detect_subject_code(target_pdf)
         print(f"📡 [Auto-Scanner] Automatically detected PDF file: {target_pdf}")
@@ -420,11 +496,9 @@ def auto_start_scanner():
         t.start()
 
 if __name__ == '__main__':
-    # Start auto-scanner in background thread
     t = threading.Thread(target=auto_start_scanner)
     t.daemon = True
     t.start()
 
-    # Get port from environment variable for Railway
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)

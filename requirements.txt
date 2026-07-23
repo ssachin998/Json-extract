@@ -13,6 +13,7 @@ pytesseract>=0.3.10
 # Web Server
 Flask>=2.0.0
 gunicorn>=20.1.0
+requests>=2.25.0
 
 # For potential future enhancements
 # camelot-py>=0.10.1  # For table extraction
