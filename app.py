@@ -141,6 +141,19 @@ setInterval(() => {
 </html>
 """
 
+import re as _re
+
+def resolve_download_url(url):
+    """Convert common share-link formats (Google Drive etc.) into a direct
+    download URL. Falls back to the original URL if it's not recognized."""
+    m = _re.search(r"drive\.google\.com/file/d/([a-zA-Z0-9_-]+)", url)
+    if not m:
+        m = _re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if m:
+        file_id = m.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    return url
+
 @app.route("/")
 def index():
     return render_template_string(PAGE, state=state)
@@ -153,7 +166,7 @@ def status():
 def run_url():
     if state["status"] == "processing":
         return redirect(url_for("index"))
-    pdf_url = request.form.get("pdf_url", "").strip()
+    pdf_url = resolve_download_url(request.form.get("pdf_url", "").strip())
     subject_code = request.form.get("subject_code", "").strip().upper()
     page_offset = int(request.form.get("page_offset", -1))
     if not pdf_url:
@@ -164,14 +177,44 @@ def run_url():
             log(f"⬇️ Downloading PDF from link...")
             fname = pdf_url.split("/")[-1].split("?")[0] or f"{subject_code}.pdf"
             if not fname.lower().endswith(".pdf"):
-                fname += ".pdf"
+                fname = f"{subject_code}.pdf"
             pdf_path = UPLOAD_DIR / fname
-            r = requests.get(pdf_url, stream=True, timeout=120)
+            r = requests.get(pdf_url, stream=True, timeout=120,
+                              headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
+
+            # Google Drive shows an interstitial "can't scan for viruses"
+            # confirm page for some files instead of the raw bytes -- detect
+            # that and follow the confirm link before saving.
+            content_type = r.headers.get("Content-Type", "")
+            if "text/html" in content_type:
+                text = r.text
+                confirm_match = _re.search(r'confirm=([0-9A-Za-z_-]+)', text)
+                if confirm_match:
+                    confirm_token = confirm_match.group(1)
+                    r = requests.get(f"{pdf_url}&confirm={confirm_token}",
+                                      stream=True, timeout=120,
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                    r.raise_for_status()
+
+            first_chunk = None
             with open(pdf_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
+                        if first_chunk is None:
+                            first_chunk = chunk
                         f.write(chunk)
+
+            if not first_chunk or not first_chunk.startswith(b"%PDF"):
+                pdf_path.unlink(missing_ok=True)
+                log("❌ The link didn't return a real PDF file (got a webpage instead). "
+                    "For Google Drive: right-click the file → Share → 'Anyone with the "
+                    "link' → copy that link, and make sure the file itself (not a folder) is shared.")
+                with state_lock:
+                    state["status"] = "failed"
+                    state["error"] = "Downloaded content is not a valid PDF"
+                return
+
             log(f"✅ Downloaded {fname} ({pdf_path.stat().st_size // 1024} KB)")
             run_pipeline_thread(subject_code, pdf_path, page_offset)
         except Exception as e:
