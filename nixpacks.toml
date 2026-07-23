@@ -1,8 +1,2 @@
 [phases.setup]
-aptPkgs = [
-    "poppler-utils",
-    "tesseract-ocr",
-    "tesseract-ocr-eng",
-    "libtesseract-dev",
-    "libleptonica-dev"
-]
+nixPkgs = ["poppler_utils", "tesseract"]
