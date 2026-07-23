@@ -1,0 +1,16 @@
+# QBank Pipeline Dependencies
+# ============================
+
+# PDF processing
+pypdf>=3.0.0
+
+# Image processing
+Pillow>=10.0.0
+
+# OCR
+pytesseract>=0.3.10
+
+# For potential future enhancements
+# camelot-py>=0.10.1  # For table extraction
+# pdfplumber>=0.10.3  # For PDF text extraction
+# numpy>=1.24.0
