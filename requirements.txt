@@ -10,6 +10,10 @@ Pillow>=10.0.0
 # OCR
 pytesseract>=0.3.10
 
+# Web Server
+Flask>=2.0.0
+gunicorn>=20.1.0
+
 # For potential future enhancements
 # camelot-py>=0.10.1  # For table extraction
 # pdfplumber>=0.10.3  # For PDF text extraction

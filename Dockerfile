@@ -1,6 +1,6 @@
 # QBank PDF → JSON Extraction Pipeline Dockerfile
 # ==============================================
-# Use this to deploy to Railway, Render, or any Docker-based platform
+# Deploys as a self-configuring Web Dashboard on Railway, Render, or any Docker-based platform
 
 FROM python:3.11-slim
 
@@ -19,19 +19,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Tesseract language data (English)
 RUN apt-get install -y tesseract-ocr-eng
 
+# Set working directory
+WORKDIR /app
+
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the pipeline script
+# Copy application code
 COPY qbank_pipeline.py .
+COPY app.py .
 
 # Create output directories
 RUN mkdir -p data assets/questions assets/options assets/solutions assets/tables
 
-# Set working directory
-WORKDIR /app
+# Expose Web Interface Port
+EXPOSE 8080
 
-# Default command (override with your PDF and subject code)
-# Example: docker run -v $(pwd):/app qbank-pipeline Psychology_QBank.pdf PSY
-CMD ["python", "qbank_pipeline.py", "input.pdf", "SUB"]
+# Default command starts the web dashboard
+CMD ["python", "app.py"]
