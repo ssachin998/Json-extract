@@ -95,7 +95,9 @@ def check_dependencies() -> bool:
     missing = []
     
     for tool in required:
-        success, _ = run_command([tool, '--version'])
+        # Poppler tools use '-v', Tesseract uses '--version'
+        flag = '--version' if tool == 'tesseract' else '-v'
+        success, _ = run_command([tool, flag])
         if not success:
             missing.append(tool)
     
