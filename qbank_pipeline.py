@@ -289,7 +289,7 @@ def rasterize_page(pdf_path: str, page_num: int, output_dir: str) -> Optional[st
     output_prefix = os.path.join(output_dir, f"page_{page_num:04d}")
     success, _ = run_command([
         'pdftoppm', '-jpeg', '-r', str(DPI), '-f', str(page_num), '-l', str(page_num),
-        pdf_path, output_prefix
+        '-singlefile', pdf_path, output_prefix
     ])
     
     if not success:
