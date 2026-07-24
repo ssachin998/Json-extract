@@ -29,6 +29,7 @@ state_lock = threading.Lock()
 state = {"status": "idle", "log": [], "error": None}
 
 def log(msg):
+    print(msg, flush=True)  # so it shows in Railway's Deploy Logs too, not just the dashboard box
     with state_lock:
         state["log"].append(msg)
         if len(state["log"]) > 500:
