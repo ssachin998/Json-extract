@@ -70,7 +70,7 @@ MAX_CALLS_PER_DAY = 95          # safety buffer under your 100/day cap
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # matches the model already working on your bot's key
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # confirmed working model from your bot's config
 
 IMG_PATH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}-\d{3}-\d{3}_[A-Z]+(_[A-Z])?_\d{2}\.webp$")
 
@@ -176,6 +176,10 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
     belongs to (Gemini's response should say which figure goes where).
     """
     reader = PdfReader(pdf_path)
+    if not (1 <= file_page <= len(reader.pages)):
+        print(f"  [WARN] extract_real_images: page {file_page} out of range "
+              f"(pdf has {len(reader.pages)} pages) -- skipping")
+        return []
     page = reader.pages[file_page - 1]
     res = page.get("/Resources")
     xobjs = res.get("/XObject") if res else None
@@ -375,9 +379,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
 
             chapter_records = merge_question_records(chapter_records, items)
 
-            # extract real (non-watermark) images from this batch's pages
+            # extract real (non-watermark) images from this batch's pages.
+            # pdftoppm names output files using the ACTUAL pdf page number
+            # (e.g. page-005.jpg for real page 5) -- read it directly from
+            # the filename, don't recompute it relative to ch["file_start"].
             for pf in batch:
-                file_page_num = ch["file_start"] + int(pf.stem.split("-")[-1]) - 1
+                file_page_num = int(pf.stem.split("-")[-1])
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
                 # NOTE: simple version -- attaches any image found on a page to
                 # whichever q_no Gemini flagged has_figure_in_question True and
