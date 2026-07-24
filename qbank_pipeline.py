@@ -31,6 +31,7 @@ automatically from state.json)
 """
 
 import base64
+import difflib
 import io
 import json
 import os
@@ -314,6 +315,24 @@ Rules:
   "q_no": null and the visible fragment under "solution_text"/"question_text".
   Never invent a question number -- the pipeline salvages these fragments for
   review instead of guessing.
+- CONTEXT HANDLING: a "CONTEXT FROM PREVIOUS BATCH" text block may precede
+  the page images (the Gemini API is stateless, so continuity context is
+  injected manually into every request). Use it ONLY to continue the
+  referenced item under its original q_no -- never output that context text
+  as a new item. Some leading page-images may be OVERLAP from the previous
+  batch, provided purely as continuity context: extract normally, and if an
+  item visibly SPANS from an overlap page into the new pages, combine both
+  sides into ONE complete item under its printed q_no.
+- BATCH META (required): after the last question object, append ONE extra
+  control object describing how the LAST page of this batch ends:
+  {"_batch_meta": {"last_q_no": <int or null>,
+                   "ends_mid_content": true|false,
+                   "cut_part": "question"|"options"|"solution"|null,
+                   "tail_text": "<verbatim last ~25 words at the bottom of
+                                 the last page, else empty string>"}}
+  ends_mid_content = true ONLY when the last question's text, options or
+  solution is visibly cut off at the bottom of the last page (must continue
+  on the following page).
 - Output ONLY the JSON array, no commentary, no markdown code fences.
 """
 
@@ -327,8 +346,10 @@ SAFETY_SETTINGS = [
 # explains this rape survivor's amnesia") -- BLOCK_ONLY_HIGH keeps obviously
 # harmful content blocked while allowing legitimate clinical material through.
 
-def call_gemini_on_pages(model, image_paths):
+def call_gemini_on_pages(model, image_paths, context=""):
     parts = [SCHEMA_PROMPT]
+    if context:
+        parts.append(context)  # carry-forward / overlap context (stateless API)
     for p in image_paths:
         parts.append(Image.open(p))
     resp = model.generate_content(
@@ -382,18 +403,176 @@ def retry_batch_page_by_page(model, batch, state):
     return items
 
 # ============================================================
+# FEATURE 2 — carry-forward context (Gemini's API is stateless:
+# continuity must be injected manually into every new request)
+# ============================================================
+
+def extract_batch_meta(items):
+    """Peel the {"_batch_meta": {...}} control object out of Gemini's array.
+    Returns (question_items, meta_dict). Meta of a failed/absent call = {}."""
+    questions, meta = [], {}
+    for it in items:
+        if isinstance(it, dict) and "_batch_meta" in it:
+            m = it.get("_batch_meta")
+            if isinstance(m, dict):
+                meta = m          # last one wins (single-page retries)
+            continue
+        questions.append(it)
+    return questions, meta
+
+def compute_carry(batch_meta, items, chapter_records, ending_page):
+    """Decide whether a batch ended mid-question and build the payload carried
+    into the NEXT request. Primary signal: Gemini's own _batch_meta (it can
+    see the page bottom). Fallback when no usable meta: the highest q_no from
+    this batch whose record has question text but no solution yet.
+    Stores: last_open_question, last_question_text, partial_solution,
+    partial_options, ending_page."""
+    have_meta = bool(batch_meta)
+    meta_says_open = bool(batch_meta.get("ends_mid_content")) if have_meta else False
+    last_qn = None
+    if have_meta:
+        try:
+            last_qn = int(batch_meta.get("last_q_no"))
+        except (TypeError, ValueError):
+            last_qn = None
+    cut_part = batch_meta.get("cut_part") or "unknown" if have_meta else "solution"
+
+    if meta_says_open and last_qn is None:
+        # model knows it's cut but can't see the number -- still carry the tail
+        return {"last_open_question": None, "last_question_text": None,
+                "partial_solution": batch_meta.get("tail_text") or None,
+                "partial_options": None, "ending_page": ending_page,
+                "cut_part": cut_part}
+    if not meta_says_open:
+        if have_meta:
+            return None              # model says the page ended cleanly
+        batch_qns = []
+        for it in items:
+            try:
+                batch_qns.append(int(it.get("q_no")))
+            except (TypeError, ValueError):
+                pass
+        if not batch_qns:
+            return None
+        candidate = max(batch_qns)
+        rec = chapter_records.get(candidate, {})
+        if rec.get("question_text") and not rec.get("solution_text"):
+            last_qn, cut_part = candidate, "solution"
+        else:
+            return None
+
+    rec = chapter_records.get(last_qn, {})
+    return {"last_open_question": last_qn,
+            "last_question_text": rec.get("question_text"),
+            "partial_solution": rec.get("solution_text") or batch_meta.get("tail_text") or None,
+            "partial_options": rec.get("options"),
+            "ending_page": ending_page,
+            "cut_part": cut_part}
+
+def build_carry_context(carry, overlap_pages):
+    """The actual text prepended to the next request."""
+    lines = []
+    if carry:
+        qn = carry["last_open_question"]
+        lines += [
+            "CONTEXT FROM PREVIOUS BATCH (continuity context only -- do NOT",
+            "output any of this text as a new item):",
+            "Previous batch ended with an incomplete question.",
+            f"Question Number: {qn if qn is not None else 'unknown'}",
+            f"Question: {(carry.get('last_question_text') or '')[:600]}",
+            f"Options seen so far: {json.dumps(carry.get('partial_options'), ensure_ascii=False)[:400]}",
+            f"Partial Solution: {(carry.get('partial_solution') or '')[:600]}",
+            f"(cut part: {carry.get('cut_part')}; ended at PDF page {carry.get('ending_page')})",
+            "If the first content in this batch belongs to this question,",
+            "CONTINUE it under the SAME q_no instead of creating a new question.",
+        ]
+    if overlap_pages:
+        lines.append(
+            f"The first {len(overlap_pages)} page image(s) (PDF page(s) "
+            f"{', '.join(map(str, overlap_pages))}) are OVERLAP from the previous "
+            "batch, provided as context only. Extract the new pages normally; if "
+            "an item spans an overlap page into the new pages, combine both "
+            "sides into ONE complete item under its printed q_no."
+        )
+    return "\n".join(lines)
+
+def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
+    """FEATURE 3 -- second-pass owner matching for q_no=null fragments.
+    Confidence rules, in order:
+      1. the carry-forward owner captured when the fragment arrived
+      2. the highest-numbered question from the SAME batch window is missing
+         exactly the field the orphan provides (solution/options/question)
+    Recovered content is APPENDED (existing text is never overwritten).
+    Whatever remains unmatched is returned for orphans.jsonl -- never
+    silently discarded."""
+    remaining = []
+    for orph in orphans:
+        item = orph["item"]
+        owner, reason = None, None
+        carry_qn = orph.get("carry_q_no")
+        if carry_qn is not None and carry_qn in chapter_records:
+            owner = carry_qn
+            reason = f"{orph.get('cut_part') or 'content'} continuation (carry-forward)"
+        else:
+            last_qn = orph.get("last_qn_in_batch")
+            rec = chapter_records.get(last_qn) if last_qn is not None else None
+            if rec:
+                if item.get("solution_text") and not rec.get("solution_text"):
+                    owner, reason = last_qn, "solution continuation"
+                elif item.get("options") and not rec.get("options"):
+                    owner, reason = last_qn, "options continuation"
+                elif item.get("question_text") and not rec.get("question_text"):
+                    owner, reason = last_qn, "question continuation"
+        page = (orph.get("new_pages") or orph.get("pdf_pages") or ["?"])[0]
+        if owner is None:
+            print(f"  [ORPHAN] Could not determine owner: page={page} kept in orphans.jsonl")
+            remaining.append(orph)
+            continue
+        rec = chapter_records[owner]
+        if item.get("solution_text"):
+            frag = item["solution_text"].strip()
+            if frag and frag not in (rec.get("solution_text") or ""):
+                rec["solution_text"] = ((rec.get("solution_text") or "") + " " + frag).strip()
+        if item.get("options"):
+            rec["options"] = rec["options"] or {}
+            for k, v in item["options"].items():
+                rec["options"].setdefault(str(k).strip().upper(), v)
+        if item.get("question_text") and not rec.get("question_text"):
+            rec["question_text"] = item["question_text"]
+        if item.get("correct_option") and not rec.get("correct_option"):
+            rec["correct_option"] = str(item["correct_option"]).strip().upper()
+        if item.get("tables"):
+            have = {t.get("markdown") for t in rec["tables"]}
+            for t in item["tables"]:
+                if t.get("markdown") not in have:
+                    rec["tables"].append(t)
+                    have.add(t.get("markdown"))
+        qid = f"{subject}-{chapter_no:03d}-{owner:03d}"
+        print(f"  [ORPHAN] Recovered orphan: page={page} assigned_to={qid} reason={reason}")
+        stats["orphans_recovered"] += 1
+        if "carry-forward" in reason:
+            stats["carry_merges"] += 1
+    return remaining
+
+# ============================================================
 # STEP 4: merge partial results (a question's text might be on one
 # page and its answer/solution on a later page) into final records
 # ============================================================
 
-def merge_question_records(existing, new_items):
+def merge_question_records(existing, new_items, stats=None):
     """existing: dict keyed by q_no -> record (in progress for current chapter).
+    stats: optional dict updated with "duplicates_merged"/"conflicts" counters.
 
+    Overlap-merge rules (sliding window re-extracts shared pages by design):
+    - same q_no + question text similarity >= 95%  -> genuine re-extraction:
+      merge fields (solutions/tables/options/images), count as duplicate.
+    - same q_no but VERY different text AND a different answer key -> almost
+      certainly a numbering collision: keep the first record, drop the item.
     Returns (existing, skipped): items with a missing/invalid q_no are NOT
-    merged (never invent a number -- handoff rule #3) but they ARE returned
-    to the caller, because they often carry real content (continuation
-    fragments of a solution split across a batch boundary -- see RC-2 in
-    ROOT_CAUSE_ANALYSIS.md). Callers persist them for review/recovery."""
+    merged (never invent a number -- handoff rule #3) but ARE returned to the
+    caller for orphan recovery (see ROOT_CAUSE_ANALYSIS.md RC-2)."""
+    if stats is None:
+        stats = {"duplicates_merged": 0, "conflicts": 0}
     skipped = []
     for item in new_items:
         raw_qn = item.get("q_no")
@@ -415,6 +594,21 @@ def merge_question_records(existing, new_items):
             "correct_option": None, "solution_text": None, "tables": [],
             "has_figure_in_question": False, "has_figure_in_solution": False,
         })
+        # ---- duplicate / conflict classification for overlap pages ----
+        old_q, new_q = rec.get("question_text"), item.get("question_text")
+        if old_q and new_q:
+            sim = difflib.SequenceMatcher(None, old_q, new_q).ratio()
+            if sim >= 0.95:
+                stats["duplicates_merged"] += 1   # expected overlap re-read
+            else:
+                a1, a2 = rec.get("correct_option"), item.get("correct_option")
+                stats["conflicts"] += 1
+                if a1 and a2 and a1 != a2:
+                    print(f"  [WARN] conflicting re-extraction for q{qn} "
+                          f"(similarity {sim:.2f}, answers {a1} vs {a2}) -- keeping first, dropping item")
+                    continue
+                print(f"  [WARN] question text for q{qn} differs between batches "
+                      f"(similarity {sim:.2f}) -- merging non-conflicting fields")
         for k in ["question_text", "solution_text"]:
             if item.get(k):
                 rec[k] = item[k]
@@ -562,10 +756,16 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         pages_imaged = set()       # overlap pages must not be image-extracted twice
         unmatched_images = []      # no claimant yet -- retried at chapter end
         orphans = []               # Gemini items with null/invalid q_no (RC-2)
+        stats = {"batches": 0, "duplicates_merged": 0, "conflicts": 0,
+                 "carry_used": 0, "carry_merges": 0,
+                 "orphans_recovered": 0, "orphans_buffered": 0, "orphans_remaining": 0}
+        carry_from_prev = None     # FEATURE 2 payload for the NEXT request
+        prev_window_last_page = None
 
-        batch_step = PAGES_PER_GEMINI_CALL - BATCH_OVERLAP_PAGES
+        overlap = max(0, min(BATCH_OVERLAP_PAGES, PAGES_PER_GEMINI_CALL - 1))
+        batch_step = PAGES_PER_GEMINI_CALL - overlap
         for batch_start in range(0, len(page_files), batch_step):
-            if batch_start and batch_start + BATCH_OVERLAP_PAGES >= len(page_files):
+            if batch_start and batch_start + overlap >= len(page_files):
                 break  # trailing window would contain ONLY overlap pages
                        # (nothing new) -- don't spend a quota call on it
             reset_daily_counter_if_needed(state)
@@ -575,8 +775,16 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 sys.exit(0)
 
             batch = page_files[batch_start:batch_start + PAGES_PER_GEMINI_CALL]
+            window_pages = [int(p.stem.split("-")[-1]) for p in batch]
+            overlap_pages = [pn for pn in window_pages
+                             if prev_window_last_page is not None and pn <= prev_window_last_page]
+            new_pages = [pn for pn in window_pages if pn not in overlap_pages]
+            carry_in = carry_from_prev                      # context for THIS call
+            context_str = build_carry_context(carry_in, overlap_pages)
+            if carry_in:
+                stats["carry_used"] += 1
             try:
-                items = call_gemini_on_pages(genai_model, batch)
+                raw_items = call_gemini_on_pages(genai_model, batch, context=context_str)
                 state["calls_today"] += 1
                 save_state(state)
             except Exception as e:
@@ -587,19 +795,42 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                     sys.exit(0)
                 print(f"  [WARN] Gemini call failed on {subject} ch{ch['chapter_no']} batch {batch_start}: {e}")
                 # don't lose the whole batch over one bad page
-                items = retry_batch_page_by_page(genai_model, batch, state)
-                if not items:
+                raw_items = retry_batch_page_by_page(genai_model, batch, state)
+                if not raw_items:
                     continue
 
-            chapter_records, skipped = merge_question_records(chapter_records, items)
+            items, batch_meta = extract_batch_meta(raw_items)
+            chapter_records, skipped = merge_question_records(chapter_records, items, stats)
+            try:
+                last_qn_in_batch = max(int(it.get("q_no")) for it in items
+                                       if it.get("q_no") is not None)
+            except (ValueError, TypeError):
+                last_qn_in_batch = None
             for it in skipped:
-                # RC-2 salvage: fragments (usually batch-boundary continuations)
-                # carry real content -- keep them with their exact provenance.
+                # RC-2 salvage buffer: fragments (usually batch-boundary
+                # continuations) carry real content -- keep with provenance
+                # for the second-pass recovery at chapter end.
                 orphans.append({
                     "chapter_id": chapter_id, "batch_start": batch_start,
-                    "pdf_pages": [int(p.stem.split("-")[-1]) for p in batch],
+                    "pdf_pages": window_pages, "new_pages": new_pages,
+                    "carry_q_no": carry_in["last_open_question"] if carry_in else None,
+                    "cut_part": carry_in.get("cut_part") if carry_in else None,
+                    "last_qn_in_batch": last_qn_in_batch,
                     "item": it,
                 })
+            stats["orphans_buffered"] += len(skipped)
+            stats["batches"] += 1
+            prev_window_last_page = max(window_pages)
+            carry_from_prev = compute_carry(batch_meta, items, chapter_records,
+                                            prev_window_last_page)
+            last_open = (f"q{carry_from_prev['last_open_question']}"
+                         if carry_from_prev and carry_from_prev["last_open_question"] is not None
+                         else ("open (no number)" if carry_from_prev else "-"))
+            print(f"  [GEMINI] pages {window_pages[0]}-{window_pages[-1]}"
+                  f" | overlap: {overlap_pages if overlap_pages else '-'}"
+                  f" | carry-in: {('q' + str(carry_in['last_open_question'])) if carry_in and carry_in['last_open_question'] is not None else '-'}"
+                  f" | last-open: {last_open}"
+                  f" | items: {len(items)} | orphans buffered: {len(skipped)}")
 
             # extract real (non-watermark) images from this batch's pages.
             # pdftoppm names output files using the ACTUAL pdf page number
@@ -618,24 +849,32 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                     print(f"  [INFO] Page {file_page_num}: image(s) {imgs} unclaimed for now "
                           f"-- will retry after all batches (owner may be in a later batch)")
 
+        # FEATURE 3 -- orphan recovery runs BEFORE image claiming and JSON
+        # writing: recovered fragments can complete solutions/options, and
+        # only genuinely ownerless orphans are persisted.
+        orphans = recover_orphans(orphans, chapter_records, subject, ch["chapter_no"], stats)
+        stats["orphans_remaining"] = len(orphans)
+        for orph in orphans:
+            _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
+
         # SECOND PASS image claiming: a figure can be extracted BEFORE the
         # batch that introduces its owning question (plate printed just before
         # the question text, or owner arrived via an overlap window). Chapter
         # records are complete now -- retry every leftover once.
+        n_unmatched = 0
         for um in unmatched_images:
             if claim_images_for_question(um["files"], subject, ch["chapter_no"], chapter_records, image_files_by_q):
                 print(f"  [INFO] second pass: page {um['page']} image(s) matched to a question")
                 um["matched"] = True
         for um in unmatched_images:
             if not um.get("matched"):
+                n_unmatched += 1
                 print(f"  [WARN] Page {um['page']}: extracted image(s) {um['files']} but no "
                       f"question/solution in this chapter claimed one -- left under its temp "
                       f"filename for manual review (see data/unmatched_images.jsonl).")
                 _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
                               {"subject": subject, "chapter_id": chapter_id,
                                "page": um["page"], "files": um["files"]})
-        for orph in orphans:
-            _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
 
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
@@ -658,6 +897,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         n_no_solution = sum(1 for r in chapter_records.values() if not r.get("solution_text"))
         print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> "
               f"{len(chapter_records)} questions ({n_no_answer} missing answer, {n_no_solution} missing solution)")
+        print(f"[{subject}]   batches: {stats['batches']} | duplicates merged: {stats['duplicates_merged']}"
+              f" | conflicts dropped: {stats['conflicts']} | carry-forward used: {stats['carry_used']}"
+              f" | carry merges: {stats['carry_merges']}"
+              f" | orphans: {stats['orphans_recovered']} recovered, {stats['orphans_remaining']} unresolved"
+              f" | unmatched images: {n_unmatched}")
 
 def main():
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
