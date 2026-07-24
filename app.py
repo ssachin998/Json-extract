@@ -11,6 +11,7 @@ in qbank_pipeline.py — this file does not duplicate or replace any of that.
 
 import os
 import threading
+import traceback
 import zipfile
 from pathlib import Path
 
@@ -56,6 +57,7 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
             state["status"] = "failed"
             state["error"] = str(e)
         log(f"❌ Error: {e}")
+        traceback.print_exc()  # full traceback with file/line -> Railway Deploy Logs
 
 def make_zip():
     out = Path("qbank_output")
@@ -223,6 +225,7 @@ def run_url():
                 state["status"] = "failed"
                 state["error"] = str(e)
             log(f"❌ Download failed: {e}")
+            traceback.print_exc()
 
     t = threading.Thread(target=download_then_run)
     t.daemon = True
