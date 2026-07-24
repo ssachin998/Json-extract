@@ -66,7 +66,7 @@ DATA_DIR = OUTPUT_ROOT / "data"
 ASSETS_DIR = OUTPUT_ROOT / "assets"
 STATE_FILE = OUTPUT_ROOT / "state.json"
 
-MAX_CALLS_PER_DAY = 95          # safety buffer under your 100/day cap
+MAX_CALLS_PER_DAY = 950         # safety buffer under your 1000/day cap
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
@@ -282,10 +282,18 @@ def call_gemini_on_pages(model, image_paths):
 def merge_question_records(existing, new_items):
     """existing: dict keyed by q_no -> record (in progress for current chapter)"""
     for item in new_items:
-        qn = int(item["q_no"])  # Gemini's JSON sometimes returns q_no as a
-                                 # string ("7") and sometimes as a number (7);
-                                 # force a consistent type so later sorting
-                                 # never compares int against str.
+        raw_qn = item.get("q_no")
+        if raw_qn is None:
+            print(f"  [WARN] Gemini returned an item with no q_no, skipping: {str(item)[:200]}")
+            continue
+        try:
+            qn = int(raw_qn)  # Gemini's JSON sometimes returns q_no as a
+                               # string ("7") and sometimes as a number (7);
+                               # force a consistent type so later sorting
+                               # never compares int against str.
+        except (TypeError, ValueError):
+            print(f"  [WARN] Gemini returned a non-numeric q_no ({raw_qn!r}), skipping")
+            continue
         rec = existing.setdefault(qn, {
             "q_no": qn, "question_text": None, "options": None,
             "correct_option": None, "solution_text": None, "tables": [],
