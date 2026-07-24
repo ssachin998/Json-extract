@@ -87,6 +87,16 @@ def save_state(state):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
+def write_chapters(path, chapters_out):
+    """Write chapters.json deduplicated by chapter_id (last entry wins).
+    Dedup matters when a chapter is re-processed after manual state surgery
+    (removing its id from chapters_done to force re-extraction): the id gets
+    appended again while an older entry is already in chapters.json."""
+    uniq = {}
+    for c in chapters_out:
+        uniq[c["chapter_id"]] = c
+    path.write_text(json.dumps(list(uniq.values()), indent=2, ensure_ascii=False))
+
 def today_stamp():
     return time.strftime("%Y-%m-%d")
 
@@ -213,11 +223,19 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
     page = reader.pages[file_page - 1]
     saved = []
     (out_dir / subject).mkdir(parents=True, exist_ok=True)
+    seen_ids = set()  # some PDFs alias the SAME image object under two XObject
+                       # names on one page -> would return the same path twice,
+                       # and the second rename in process_pdf crashes with
+                       # FileNotFoundError (observed in prod on PSY p264)
     for name, ref in _page_xobjects(page).items():
         obj = _resolve(ref)
         if obj.get("/Subtype") != "/Image":
             continue
         obj_id = getattr(ref, "idnum", None)
+        dedupe_key = obj_id if obj_id is not None else str(name)
+        if dedupe_key in seen_ids:
+            continue  # alias of an image already saved from this page
+        seen_ids.add(dedupe_key)
         if watermark_id is not None and obj_id == watermark_id:
             continue  # the watermark -- never save it as a question figure
         # Save exactly THIS image object. NOTE: don't shell out to
@@ -319,6 +337,37 @@ def call_gemini_on_pages(model, image_paths):
     text = resp.text.strip()
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     return json.loads(text)
+
+def retry_batch_page_by_page(model, batch, state):
+    """A whole-batch failure (RECITATION/safety finish_reason, token limit)
+    is usually caused by just ONE page in the batch. Retrying each page
+    alone isolates the bad page instead of losing the whole batch's worth
+    of questions/answers/solutions (seen in prod: finish_reason=4 killed a
+    6-page batch, wiping one chapter's answers and another's solutions).
+    Respects the same daily quota and exits cleanly if it's hit."""
+    print(f"  [INFO] retrying {len(batch)} pages one-by-one to isolate the failing page...")
+    items = []
+    recovered = 0
+    for pf in batch:
+        reset_daily_counter_if_needed(state)
+        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+            print("Daily Gemini call limit reached during single-page retry. Saving progress, exiting.")
+            save_state(state)
+            sys.exit(0)
+        try:
+            items.extend(call_gemini_on_pages(model, [pf]))
+            state["calls_today"] += 1
+            recovered += 1
+        except Exception as e2:
+            t2 = str(e2)
+            if "429" in t2 or "quota" in t2.lower():
+                print(f"  [QUOTA] Gemini quota exhausted during retry -- stopping run for now: {e2}")
+                save_state(state)
+                sys.exit(0)
+            print(f"  [WARN] page {pf.name} failed even alone ({e2}) -- skipping just this page")
+    save_state(state)
+    print(f"  [INFO] single-page retry: {recovered}/{len(batch)} pages recovered")
+    return items
 
 # ============================================================
 # STEP 4: merge partial results (a question's text might be on one
@@ -449,6 +498,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             batch = page_files[batch_start:batch_start + PAGES_PER_GEMINI_CALL]
             try:
                 items = call_gemini_on_pages(genai_model, batch)
+                state["calls_today"] += 1
+                save_state(state)
             except Exception as e:
                 err_text = str(e)
                 if "429" in err_text or "quota" in err_text.lower():
@@ -456,9 +507,10 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                     save_state(state)
                     sys.exit(0)
                 print(f"  [WARN] Gemini call failed on {subject} ch{ch['chapter_no']} batch {batch_start}: {e}")
-                continue
-            state["calls_today"] += 1
-            save_state(state)
+                # don't lose the whole batch over one bad page
+                items = retry_batch_page_by_page(genai_model, batch, state)
+                if not items:
+                    continue
 
             chapter_records = merge_question_records(chapter_records, items)
 
@@ -492,8 +544,14 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                     # assets/tables/ -- the app relies on this convention.
                     qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
                     renamed = []
-                    for idx, old_rel in enumerate(imgs, start=1):
+                    for old_rel in imgs:
                         old_path = ASSETS_DIR / "questions" / old_rel
+                        if not old_path.exists():
+                            # never let one bad path kill the whole run
+                            print(f"  [WARN] {old_rel} missing at rename time "
+                                  f"-- skipping (leftover alias/dup ref)")
+                            continue
+                        idx = len(renamed) + 1
                         new_name = f"{qid}_{kind}_{idx:02d}.webp"
                         new_rel = f"{subject}/{new_name}"
                         new_path = ASSETS_DIR / "questions" / subject / new_name
@@ -523,7 +581,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         # chapters are in chapters_done, the next run would skip them and
         # they'd be permanently missing from chapters.json.
         chapters_path = DATA_DIR / "chapters.json"
-        chapters_path.write_text(json.dumps(chapters_out, indent=2, ensure_ascii=False))
+        write_chapters(chapters_path, chapters_out)
         n_no_answer = sum(1 for r in chapter_records.values() if not r.get("correct_option"))
         n_no_solution = sum(1 for r in chapter_records.values() if not r.get("solution_text"))
         print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> "
@@ -547,7 +605,7 @@ def main():
         for pdf_cfg in PDFS:
             process_pdf(pdf_cfg, state, model, chapters_out, questions_fh)
 
-    chapters_path.write_text(json.dumps(chapters_out, indent=2, ensure_ascii=False))
+    write_chapters(chapters_path, chapters_out)
     save_state(state)
     print("All done (or paused at daily limit -- just re-run this script to resume).")
 
