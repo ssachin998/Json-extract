@@ -101,7 +101,7 @@ def reset_daily_counter_if_needed(state):
 # pdftotext even on PDFs where body-page text is broken/garbled)
 # ============================================================
 
-def extract_toc_chapters(pdf_path, toc_page_range=(2, 4)):
+def extract_toc_chapters(pdf_path, toc_page_range=(1, 3)):
     """
     Returns [{"chapter_no": int, "chapter_title": str, "start_printed_page": int}, ...]
     Adjust toc_page_range per PDF if the contents table spans more/fewer pages.
@@ -310,13 +310,20 @@ def merge_question_records(existing, new_items):
 
 def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
-    q_images = [{"type": "figure", "file": f} for f in image_files.get("question", [])]
-    sol_images = [{"type": "figure", "file": f} for f in image_files.get("solution", [])]
+
+    def valid_images(imgs, kind):
+        out = []
+        for f in imgs:
+            if IMG_PATH_RE.match(f):
+                out.append({"type": "figure", "file": f})
+            else:
+                print(f"  [WARN] Dropping malformed {kind} image path for {qid}: {f}")
+        return out
+
+    q_images = valid_images(image_files.get("question", []), "question")
+    sol_images = valid_images(image_files.get("solution", []), "solution")
     tables = [{"type": t.get("type", "table"), "markdown": t["markdown"], "file": None}
               for t in rec.get("tables", [])]
-
-    for img in q_images + sol_images:
-        assert IMG_PATH_RE.match(img["file"]), f"Bad image path generated: {img['file']}"
 
     return {
         "id": qid,
@@ -397,14 +404,25 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             for pf in batch:
                 file_page_num = int(pf.stem.split("-")[-1])
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
+                if not imgs:
+                    continue
                 # NOTE: simple version -- attaches any image found on a page to
                 # whichever q_no Gemini flagged has_figure_in_question True and
                 # doesn't have an image yet. Review this mapping manually for
                 # pages with multiple figures.
                 for qn, rec in chapter_records.items():
                     if rec.get("has_figure_in_question") and qn not in image_files_by_q:
-                        if imgs:
-                            image_files_by_q[qn] = {"question": imgs, "solution": []}
+                        qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
+                        renamed = []
+                        for idx, old_rel in enumerate(imgs, start=1):
+                            old_path = ASSETS_DIR / "questions" / old_rel
+                            new_name = f"{qid}_Q_{idx:02d}.webp"
+                            new_rel = f"{subject}/{new_name}"
+                            new_path = ASSETS_DIR / "questions" / subject / new_name
+                            old_path.rename(new_path)
+                            renamed.append(new_rel)
+                        image_files_by_q[qn] = {"question": renamed, "solution": []}
+                        break  # this page's image(s) assigned; don't also hand it to a later question
 
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
