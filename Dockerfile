@@ -15,6 +15,9 @@ COPY qbank_pipeline.py app.py ./
 
 # /data is where the Railway Volume will be mounted (persistent across restarts)
 ENV OUTPUT_DIR=/data/qbank_output
+# Flush every print() immediately, otherwise Docker block-buffers stdout and
+# pipeline progress never shows up in Railway's Deploy Logs in real time.
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 CMD ["python3", "app.py"]

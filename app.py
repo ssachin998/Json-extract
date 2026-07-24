@@ -61,7 +61,11 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         traceback.print_exc()  # full traceback with file/line -> Railway Deploy Logs
 
 def make_zip():
-    out = Path("qbank_output")
+    # Must mirror qbank_pipeline's OUTPUT_ROOT -- on Railway that's
+    # /data/qbank_output (the Volume), NOT the local ./qbank_output.
+    # (Hardcoding the relative path here meant the zip was never created
+    # on Railway, so /download always 404'd.)
+    out = Path(os.environ.get("OUTPUT_DIR", "./qbank_output"))
     if not out.exists():
         return
     zpath = Path("output_results.zip")
@@ -263,6 +267,9 @@ def run():
         if not existing:
             return "No PDF uploaded and none found in ./pdfs", 400
         pdf_path = existing[0]
+    # same double-tap guard as /run-url
+    with state_lock:
+        state["status"] = "processing"
     t = threading.Thread(target=run_pipeline_thread, args=(subject_code, pdf_path, page_offset))
     t.daemon = True
     t.start()
