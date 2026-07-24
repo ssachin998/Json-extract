@@ -15,7 +15,6 @@ COPY qbank_pipeline.py app.py ./
 
 # /data is where the Railway Volume will be mounted (persistent across restarts)
 ENV OUTPUT_DIR=/data/qbank_output
-ENV STATE_PATH=/data/qbank_output/state.json
 
 EXPOSE 8080
 CMD ["python3", "app.py"]

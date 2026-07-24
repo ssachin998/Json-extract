@@ -9,7 +9,7 @@ free-tier limit by checkpointing progress and resuming across multiple runs
 SETUP
 -----
 pip install pypdf pillow google-generativeai
-apt-get install poppler-utils        # gives you pdftoppm, pdfimages, pdftotext
+apt-get install poppler-utils        # gives you pdftoppm and pdftotext
 
 Set your key:
     export GEMINI_API_KEY="your-key-here"
@@ -147,19 +147,33 @@ def compute_page_ranges(chapters, page_offset, last_page_file):
 # excluded, or you'll extract the watermark instead of real figures)
 # ============================================================
 
+def _resolve(obj):
+    """Follow an IndirectObject reference; pass through anything else.
+    (Dictionary values in a PDF may be indirect references -- newer pypdf
+    resolves them for you in most accessors, but don't rely on it.)"""
+    return obj.get_object() if hasattr(obj, "get_object") else obj
+
+def _page_xobjects(page):
+    """Return the page's /Resources /XObject dict (resolved), or {}."""
+    res = _resolve(page.get("/Resources"))
+    if not res:
+        return {}
+    xobjs = _resolve(res.get("/XObject"))
+    return xobjs if xobjs else {}
+
 def find_watermark_object_id(pdf_path, sample_pages=30):
     reader = PdfReader(pdf_path)
     counts = {}
     n = min(sample_pages, len(reader.pages))
     for i in range(n):
-        res = reader.pages[i].get("/Resources")
-        xobjs = res.get("/XObject") if res else None
-        if not xobjs:
-            continue
-        for name, ref in xobjs.items():
-            obj = ref.get_object()
-            if obj.get("/Subtype") == "/Image":
-                counts[ref.idnum] = counts.get(ref.idnum, 0) + 1
+        for name, ref in _page_xobjects(reader.pages[i]).items():
+            obj = _resolve(ref)
+            if obj.get("/Subtype") != "/Image":
+                continue
+            obj_id = getattr(ref, "idnum", None)
+            if obj_id is None:
+                continue  # inline/direct image -- can't track by object id
+            counts[obj_id] = counts.get(obj_id, 0) + 1
     if not counts:
         return None
     # whichever object ID appears on (almost) every sampled page = watermark
@@ -168,10 +182,28 @@ def find_watermark_object_id(pdf_path, sample_pages=30):
         return None  # no dominant repeated image -> no watermark to exclude
     return watermark_id
 
+def _decode_image_fallback(obj):
+    """Best-effort decode of an image XObject using its raw stream.
+    Handles the common FlateDecode DeviceRGB/DeviceGray cases; returns
+    None for anything we can't decode ourselves."""
+    try:
+        w, h = int(obj["/Width"]), int(obj["/Height"])
+        mode = {"/DeviceRGB": "RGB", "/DeviceGray": "L"}.get(str(obj.get("/ColorSpace")))
+        if mode is None or w <= 0 or h <= 0:
+            return None
+        data = obj.get_data()  # pypdf applies filters (Flate etc.)
+        need = w * h * len(mode)
+        if isinstance(data, bytes) and len(data) >= need:
+            return Image.frombytes(mode, (w, h), data[:need])
+        return None
+    except Exception:
+        return None
+
 def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
     """
     Extracts every embedded image on file_page EXCEPT the watermark object.
-    Returns a list of saved relative paths ("SUBJECT/filename.webp").
+    Returns a list of saved relative paths ("SUBJECT/filename.webp") --
+    exactly one entry per saved file (no duplicates, no watermarks).
     Caller is responsible for deciding which question/option/solution each
     belongs to (Gemini's response should say which figure goes where).
     """
@@ -181,34 +213,35 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
               f"(pdf has {len(reader.pages)} pages) -- skipping")
         return []
     page = reader.pages[file_page - 1]
-    res = page.get("/Resources")
-    xobjs = res.get("/XObject") if res else None
     saved = []
-    if not xobjs:
-        return saved
     (out_dir / subject).mkdir(parents=True, exist_ok=True)
-    for name, ref in xobjs.items():
-        obj = ref.get_object()
-        if obj.get("/Subtype") != "/Image" or ref.idnum == watermark_id:
+    for name, ref in _page_xobjects(page).items():
+        obj = _resolve(ref)
+        if obj.get("/Subtype") != "/Image":
             continue
+        obj_id = getattr(ref, "idnum", None)
+        if watermark_id is not None and obj_id == watermark_id:
+            continue  # the watermark -- never save it as a question figure
+        # Save exactly THIS image object.
+        # NOTE: don't use `pdfimages -f P -l P` here -- it dumps EVERY image
+        # on the page (watermark included) under one prefix, so every loop
+        # iteration re-saved all page images to the same output filename
+        # (overwriting each other and returning duplicate paths).
         try:
-            img = page.images[name].image if hasattr(page, "images") else None
+            im = page.images[name].image
         except Exception:
-            img = None
-        # fall back to pdfimages CLI extraction (handles CMYK/odd encodings better)
-        tmp_prefix = f"/tmp/{subject}_p{file_page}_{ref.idnum}"
-        subprocess.run(
-            ["pdfimages", "-png", "-f", str(file_page), "-l", str(file_page), pdf_path, tmp_prefix],
-            capture_output=True
-        )
-        for f in sorted(Path("/tmp").glob(f"{Path(tmp_prefix).name}*.png")):
-            im = Image.open(f)
-            if im.size[0] * im.size[1] < 5000:
-                continue  # skip tiny noise images
-            fname = f"{subject}-p{file_page}-{ref.idnum}.webp"
-            rel_path = f"{subject}/{fname}"
-            im.convert("RGB").save(out_dir / subject / fname, "WEBP", quality=95)
-            saved.append(rel_path)
+            im = _decode_image_fallback(obj)
+        if im is None:
+            print(f"  [WARN] could not decode image {name} (obj {obj_id}) on "
+                  f"page {file_page} -- skipping")
+            continue
+        if im.size[0] * im.size[1] < 5000:
+            continue  # skip tiny noise images
+        stem = obj_id if obj_id is not None else str(name).strip("/")
+        fname = f"{subject}-p{file_page}-{stem}.webp"
+        rel_path = f"{subject}/{fname}"
+        im.convert("RGB").save(out_dir / subject / fname, "WEBP", quality=95)
+        saved.append(rel_path)
     return saved
 
 # ============================================================
@@ -434,6 +467,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
 
         progress["chapters_done"].append(chapter_id)
         save_state(state)
+        # Persist chapters.json incrementally too. main() also writes it at the
+        # end, but if we exit early (daily Gemini limit -> sys.exit, crash,
+        # redeploy) that final write never happens -- and since completed
+        # chapters are in chapters_done, the next run would skip them and
+        # they'd be permanently missing from chapters.json.
+        chapters_path = DATA_DIR / "chapters.json"
+        chapters_path.write_text(json.dumps(chapters_out, indent=2, ensure_ascii=False))
         print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> {len(chapter_records)} questions")
 
 def main():

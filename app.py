@@ -17,6 +17,7 @@ from pathlib import Path
 
 import requests
 from flask import Flask, render_template_string, request, redirect, url_for, send_file, jsonify
+from werkzeug.utils import secure_filename
 
 import qbank_pipeline as pipeline
 
@@ -165,20 +166,34 @@ def index():
 def status():
     return jsonify(state)
 
+def parse_page_offset():
+    """int() of "" or junk raises ValueError -> Flask 500 page. Be forgiving."""
+    try:
+        return int(request.form.get("page_offset") or -1)
+    except (TypeError, ValueError):
+        return -1
+
 @app.route("/run-url", methods=["POST"])
 def run_url():
     if state["status"] == "processing":
         return redirect(url_for("index"))
     pdf_url = resolve_download_url(request.form.get("pdf_url", "").strip())
     subject_code = request.form.get("subject_code", "").strip().upper()
-    page_offset = int(request.form.get("page_offset", -1))
+    page_offset = parse_page_offset()
     if not pdf_url:
         return "No URL provided", 400
+    # Mark busy NOW (before the background download starts) -- otherwise the
+    # status stays "idle" during the download and a second tap on Run starts
+    # a duplicate pipeline writing to the same output files.
+    with state_lock:
+        state["status"] = "processing"
 
     def download_then_run():
         try:
             log(f"⬇️ Downloading PDF from link...")
-            fname = pdf_url.split("/")[-1].split("?")[0] or f"{subject_code}.pdf"
+            # secure_filename: a hostile/odd URL tail like "../../x" must not
+            # be able to write outside ./pdfs
+            fname = secure_filename(pdf_url.split("/")[-1].split("?")[0]) or f"{subject_code}.pdf"
             if not fname.lower().endswith(".pdf"):
                 fname = f"{subject_code}.pdf"
             pdf_path = UPLOAD_DIR / fname
@@ -238,9 +253,9 @@ def run():
         return redirect(url_for("index"))
     f = request.files.get("file")
     subject_code = request.form.get("subject_code", "").strip().upper()
-    page_offset = int(request.form.get("page_offset", -1))
+    page_offset = parse_page_offset()
     if f and f.filename.lower().endswith(".pdf"):
-        pdf_path = UPLOAD_DIR / f.filename
+        pdf_path = UPLOAD_DIR / (secure_filename(f.filename) or f"{subject_code}.pdf")
         f.save(pdf_path)
     else:
         # no new file uploaded -> reuse whatever PDF is already in ./pdfs
