@@ -483,6 +483,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                     if not (needs_q_img or needs_sol_img):
                         continue
                     kind = "Q" if needs_q_img else "SOL"
+                    # LOCKED structure: ALL figure types live together in
+                    # assets/questions/{SUBJECT}/ -- one folder per subject,
+                    # type is told only by the filename suffix:
+                    #   {id}_Q_01.webp  {id}_SOL_01.webp
+                    #   {id}_OPT_A_01.webp  {id}_TABLE_01.webp
+                    # Do NOT create assets/solutions/, assets/options/ or
+                    # assets/tables/ -- the app relies on this convention.
                     qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
                     renamed = []
                     for idx, old_rel in enumerate(imgs, start=1):
@@ -510,6 +517,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
 
         progress["chapters_done"].append(chapter_id)
         save_state(state)
+        # Persist chapters.json incrementally too. main() also writes it at the
+        # end, but if we exit early (daily Gemini limit -> sys.exit, crash,
+        # redeploy) that final write never happens -- and since completed
+        # chapters are in chapters_done, the next run would skip them and
+        # they'd be permanently missing from chapters.json.
+        chapters_path = DATA_DIR / "chapters.json"
+        chapters_path.write_text(json.dumps(chapters_out, indent=2, ensure_ascii=False))
         n_no_answer = sum(1 for r in chapter_records.values() if not r.get("correct_option"))
         n_no_solution = sum(1 for r in chapter_records.values() if not r.get("solution_text"))
         print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> "
