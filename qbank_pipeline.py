@@ -70,7 +70,7 @@ MAX_CALLS_PER_DAY = 95          # safety buffer under your 100/day cap
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
-GEMINI_MODEL = "gemini-3.1-flash-lite"   # matches the model already working on your bot's key
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # matches the model already working on your bot's key
 
 IMG_PATH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}-\d{3}-\d{3}_[A-Z]+(_[A-Z])?_\d{2}\.webp$")
 
