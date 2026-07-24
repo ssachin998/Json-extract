@@ -70,7 +70,7 @@ MAX_CALLS_PER_DAY = 95          # safety buffer under your 100/day cap
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # match whatever your key has access to
+GEMINI_MODEL = "gemini-3.1-flash-lite"   # matches the model already working on your bot's key
 
 IMG_PATH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}-\d{3}-\d{3}_[A-Z]+(_[A-Z])?_\d{2}\.webp$")
 
@@ -237,11 +237,35 @@ Rules:
 - Output ONLY the JSON array, no commentary, no markdown code fences.
 """
 
+SAFETY_SETTINGS = [
+    {"category": c, "threshold": "BLOCK_ONLY_HIGH"}
+    for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+              "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
+]
+# Medical/psychiatry textbook content routinely covers violence, self-harm,
+# sexual assault etc. in a clinical context (e.g. "which defense mechanism
+# explains this rape survivor's amnesia") -- BLOCK_ONLY_HIGH keeps obviously
+# harmful content blocked while allowing legitimate clinical material through.
+
 def call_gemini_on_pages(model, image_paths):
     parts = [SCHEMA_PROMPT]
     for p in image_paths:
         parts.append(Image.open(p))
-    resp = model.generate_content(parts)
+    resp = model.generate_content(
+        parts,
+        safety_settings=SAFETY_SETTINGS,
+        request_options={"retry": None},
+    )
+
+    if not resp.candidates:
+        raise RuntimeError(f"Empty response (prompt blocked?). prompt_feedback={resp.prompt_feedback}")
+
+    candidate = resp.candidates[0]
+    finish_reason = getattr(candidate, "finish_reason", None)
+    if finish_reason and str(finish_reason) not in ("1", "STOP"):
+        raise RuntimeError(f"Response did not finish normally (finish_reason={finish_reason}). "
+                            f"Likely safety-blocked or hit token limit -- try fewer pages per call.")
+
     text = resp.text.strip()
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     return json.loads(text)
@@ -339,6 +363,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             try:
                 items = call_gemini_on_pages(genai_model, batch)
             except Exception as e:
+                err_text = str(e)
+                if "429" in err_text or "quota" in err_text.lower():
+                    print(f"  [QUOTA] Gemini quota exhausted -- stopping run for now: {e}")
+                    save_state(state)
+                    sys.exit(0)
                 print(f"  [WARN] Gemini call failed on {subject} ch{ch['chapter_no']} batch {batch_start}: {e}")
                 continue
             state["calls_today"] += 1
