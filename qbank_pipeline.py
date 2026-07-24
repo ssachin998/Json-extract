@@ -9,7 +9,7 @@ free-tier limit by checkpointing progress and resuming across multiple runs
 SETUP
 -----
 pip install pypdf pillow google-generativeai
-apt-get install poppler-utils        # gives you pdftoppm and pdftotext
+apt-get install poppler-utils        # gives you pdftoppm, pdfimages, pdftotext
 
 Set your key:
     export GEMINI_API_KEY="your-key-here"
@@ -148,9 +148,7 @@ def compute_page_ranges(chapters, page_offset, last_page_file):
 # ============================================================
 
 def _resolve(obj):
-    """Follow an IndirectObject reference; pass through anything else.
-    (Dictionary values in a PDF may be indirect references -- newer pypdf
-    resolves them for you in most accessors, but don't rely on it.)"""
+    """Follow an IndirectObject reference; pass through anything else."""
     return obj.get_object() if hasattr(obj, "get_object") else obj
 
 def _page_xobjects(page):
@@ -183,9 +181,9 @@ def find_watermark_object_id(pdf_path, sample_pages=30):
     return watermark_id
 
 def _decode_image_fallback(obj):
-    """Best-effort decode of an image XObject using its raw stream.
-    Handles the common FlateDecode DeviceRGB/DeviceGray cases; returns
-    None for anything we can't decode ourselves."""
+    """Best-effort decode of an image XObject using its raw stream, for
+    cases pypdf's own page.images accessor can't handle. Covers the common
+    FlateDecode DeviceRGB/DeviceGray case; returns None otherwise."""
     try:
         w, h = int(obj["/Width"]), int(obj["/Height"])
         mode = {"/DeviceRGB": "RGB", "/DeviceGray": "L"}.get(str(obj.get("/ColorSpace")))
@@ -222,11 +220,12 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
         obj_id = getattr(ref, "idnum", None)
         if watermark_id is not None and obj_id == watermark_id:
             continue  # the watermark -- never save it as a question figure
-        # Save exactly THIS image object.
-        # NOTE: don't use `pdfimages -f P -l P` here -- it dumps EVERY image
-        # on the page (watermark included) under one prefix, so every loop
-        # iteration re-saved all page images to the same output filename
-        # (overwriting each other and returning duplicate paths).
+        # Save exactly THIS image object. NOTE: don't shell out to
+        # `pdfimages -f P -l P` per object here -- it dumps EVERY image on
+        # the page (watermark included) under one prefix each time, so
+        # looping over N real images re-extracts the whole page N times
+        # and overwrites/duplicates output files. Decode this one object
+        # directly instead.
         try:
             im = page.images[name].image
         except Exception:
@@ -264,11 +263,25 @@ Return a JSON array. Each element is one question:
 
 Rules:
 - Preserve every word verbatim. Do NOT summarize or paraphrase.
-- If a page only contains an answer-key table (Q.No -> correct option) with
-  no other question text, still return entries for those q_no with only
-  "correct_option" filled and everything else null.
+- ANSWER KEY TABLES ARE CRITICAL -- READ THIS CAREFULLY: any table you see
+  with a "Question No." / "Q.No" column and a "Correct Option" / "Answer"
+  column, however many rows it has, MUST produce one JSON entry PER ROW.
+  Do not skip rows, do not summarize the table, do not describe it in prose.
+  Example: if the table shows
+      5 -> b
+      6 -> c
+      7 -> a
+  you must output all three as separate entries:
+      {"q_no": 5, "question_text": null, "options": null, "correct_option": "b", "solution_text": null, "tables": [], "has_figure_in_question": false, "has_figure_in_solution": false}
+      {"q_no": 6, ..., "correct_option": "c", ...}
+      {"q_no": 7, ..., "correct_option": "a", ...}
+  A table with 20 rows means 20 separate JSON entries, not one summary entry.
 - If a page only contains solutions, return entries with only "solution_text"
   (and "tables" if present) filled, matched to the right q_no.
+- If a question's options are split across two pages (e.g. A/B on this page,
+  C/D on the next), only include the options actually visible on THIS batch
+  of pages -- do not guess or invent the missing ones. They will be merged
+  with the other batch's output automatically.
 - Any table in the solution (e.g. stage/phase comparison tables) must be
   converted to a markdown table string in "tables", not skipped.
 - Output ONLY the JSON array, no commentary, no markdown code fences.
@@ -332,9 +345,28 @@ def merge_question_records(existing, new_items):
             "correct_option": None, "solution_text": None, "tables": [],
             "has_figure_in_question": False, "has_figure_in_solution": False,
         })
-        for k in ["question_text", "options", "correct_option", "solution_text"]:
+        for k in ["question_text", "solution_text"]:
             if item.get(k):
                 rec[k] = item[k]
+
+        # Options can arrive across TWO different batches when a question
+        # straddles a page break (e.g. options A/B on one page, C/D on the
+        # next). Merge by option letter instead of overwriting the whole
+        # dict, or the earlier batch's options get silently discarded.
+        # Also normalize every option letter to uppercase here, since Gemini
+        # (and the source PDF itself) mixes "a)" and "A." lettering -- if we
+        # don't normalize once, centrally, correct_options ("D") will fail
+        # to match options[].id ("d") later and the answer will look wrong
+        # in the app even though the data is technically all there.
+        if item.get("options"):
+            if rec["options"] is None:
+                rec["options"] = {}
+            for opt_id, opt_text in item["options"].items():
+                rec["options"][str(opt_id).strip().upper()] = opt_text
+
+        if item.get("correct_option"):
+            rec["correct_option"] = str(item["correct_option"]).strip().upper()
+
         if item.get("tables"):
             rec["tables"].extend(item["tables"])
         rec["has_figure_in_question"] = rec["has_figure_in_question"] or item.get("has_figure_in_question", False)
@@ -363,7 +395,7 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         "subject": subject,
         "chapter_id": chapter_id,
         "question": {"text": rec["question_text"], "images": q_images},
-        "options": [{"id": k, "text": v, "images": []} for k, v in (rec["options"] or {}).items()],
+        "options": [{"id": str(k).strip().upper(), "text": v, "images": []} for k, v in (rec["options"] or {}).items()],
         "correct_options": [rec["correct_option"]] if rec["correct_option"] else [],
         "solution": {"text": rec["solution_text"], "images": sol_images, "tables": tables},
         "tags": [],
@@ -440,22 +472,33 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 if not imgs:
                     continue
                 # NOTE: simple version -- attaches any image found on a page to
-                # whichever q_no Gemini flagged has_figure_in_question True and
-                # doesn't have an image yet. Review this mapping manually for
-                # pages with multiple figures.
+                # whichever q_no Gemini flagged as needing one (question OR
+                # solution figure) and doesn't have one of that kind yet.
+                # Review this mapping manually for pages with multiple figures.
+                assigned = False
                 for qn, rec in chapter_records.items():
-                    if rec.get("has_figure_in_question") and qn not in image_files_by_q:
-                        qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
-                        renamed = []
-                        for idx, old_rel in enumerate(imgs, start=1):
-                            old_path = ASSETS_DIR / "questions" / old_rel
-                            new_name = f"{qid}_Q_{idx:02d}.webp"
-                            new_rel = f"{subject}/{new_name}"
-                            new_path = ASSETS_DIR / "questions" / subject / new_name
-                            old_path.rename(new_path)
-                            renamed.append(new_rel)
-                        image_files_by_q[qn] = {"question": renamed, "solution": []}
-                        break  # this page's image(s) assigned; don't also hand it to a later question
+                    entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+                    needs_q_img = rec.get("has_figure_in_question") and not entry["question"]
+                    needs_sol_img = rec.get("has_figure_in_solution") and not entry["solution"]
+                    if not (needs_q_img or needs_sol_img):
+                        continue
+                    kind = "Q" if needs_q_img else "SOL"
+                    qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
+                    renamed = []
+                    for idx, old_rel in enumerate(imgs, start=1):
+                        old_path = ASSETS_DIR / "questions" / old_rel
+                        new_name = f"{qid}_{kind}_{idx:02d}.webp"
+                        new_rel = f"{subject}/{new_name}"
+                        new_path = ASSETS_DIR / "questions" / subject / new_name
+                        old_path.rename(new_path)
+                        renamed.append(new_rel)
+                    entry["question" if kind == "Q" else "solution"] = renamed
+                    assigned = True
+                    break  # this page's image(s) assigned; don't also hand it to a later question
+                if not assigned:
+                    print(f"  [WARN] Page {file_page_num}: extracted image(s) {imgs} but no "
+                          f"question/solution in this chapter claimed one -- left unmatched "
+                          f"under its temp filename for manual review.")
 
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
@@ -467,14 +510,10 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
 
         progress["chapters_done"].append(chapter_id)
         save_state(state)
-        # Persist chapters.json incrementally too. main() also writes it at the
-        # end, but if we exit early (daily Gemini limit -> sys.exit, crash,
-        # redeploy) that final write never happens -- and since completed
-        # chapters are in chapters_done, the next run would skip them and
-        # they'd be permanently missing from chapters.json.
-        chapters_path = DATA_DIR / "chapters.json"
-        chapters_path.write_text(json.dumps(chapters_out, indent=2, ensure_ascii=False))
-        print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> {len(chapter_records)} questions")
+        n_no_answer = sum(1 for r in chapter_records.values() if not r.get("correct_option"))
+        n_no_solution = sum(1 for r in chapter_records.values() if not r.get("solution_text"))
+        print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> "
+              f"{len(chapter_records)} questions ({n_no_answer} missing answer, {n_no_solution} missing solution)")
 
 def main():
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
