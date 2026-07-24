@@ -70,6 +70,12 @@ MAX_CALLS_PER_DAY = 950         # safety buffer under your 1000/day cap
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
+BATCH_OVERLAP_PAGES = 2         # consecutive batches share 2 pages, so a
+                                 # question/solution split across a batch
+                                 # boundary is seen WHOLE (with its q_no) in at
+                                 # least one call -- see ROOT_CAUSE_ANALYSIS.md
+                                 # RC-3. Step size = 6-2 = 4 new pages/call.
+                                 # Merge by q_no makes re-extraction idempotent.
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # confirmed working model from your bot's config
 
 IMG_PATH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}-\d{3}-\d{3}_[A-Z]+(_[A-Z])?_\d{2}\.webp$")
@@ -302,6 +308,12 @@ Rules:
   with the other batch's output automatically.
 - Any table in the solution (e.g. stage/phase comparison tables) must be
   converted to a markdown table string in "tables", not skipped.
+- If the text at the top of the FIRST page is clearly the continuation of a
+  question, options or a solution from BEFORE these pages (starts mid-sentence
+  and no question number is visible), STILL return it as one item with
+  "q_no": null and the visible fragment under "solution_text"/"question_text".
+  Never invent a question number -- the pipeline salvages these fragments for
+  review instead of guessing.
 - Output ONLY the JSON array, no commentary, no markdown code fences.
 """
 
@@ -375,11 +387,19 @@ def retry_batch_page_by_page(model, batch, state):
 # ============================================================
 
 def merge_question_records(existing, new_items):
-    """existing: dict keyed by q_no -> record (in progress for current chapter)"""
+    """existing: dict keyed by q_no -> record (in progress for current chapter).
+
+    Returns (existing, skipped): items with a missing/invalid q_no are NOT
+    merged (never invent a number -- handoff rule #3) but they ARE returned
+    to the caller, because they often carry real content (continuation
+    fragments of a solution split across a batch boundary -- see RC-2 in
+    ROOT_CAUSE_ANALYSIS.md). Callers persist them for review/recovery."""
+    skipped = []
     for item in new_items:
         raw_qn = item.get("q_no")
         if raw_qn is None:
             print(f"  [WARN] Gemini returned an item with no q_no, skipping: {str(item)[:200]}")
+            skipped.append(item)
             continue
         try:
             qn = int(raw_qn)  # Gemini's JSON sometimes returns q_no as a
@@ -388,6 +408,7 @@ def merge_question_records(existing, new_items):
                                # never compares int against str.
         except (TypeError, ValueError):
             print(f"  [WARN] Gemini returned a non-numeric q_no ({raw_qn!r}), skipping")
+            skipped.append(item)
             continue
         rec = existing.setdefault(qn, {
             "q_no": qn, "question_text": None, "options": None,
@@ -417,10 +438,16 @@ def merge_question_records(existing, new_items):
             rec["correct_option"] = str(item["correct_option"]).strip().upper()
 
         if item.get("tables"):
-            rec["tables"].extend(item["tables"])
+            # Dedupe by markdown: overlap pages (BATCH_OVERLAP_PAGES) are
+            # extracted twice, and blindly extending would duplicate tables.
+            have = {t.get("markdown") for t in rec["tables"]}
+            for t in item["tables"]:
+                if t.get("markdown") not in have:
+                    rec["tables"].append(t)
+                    have.add(t.get("markdown"))
         rec["has_figure_in_question"] = rec["has_figure_in_question"] or item.get("has_figure_in_question", False)
         rec["has_figure_in_solution"] = rec["has_figure_in_solution"] or item.get("has_figure_in_solution", False)
-    return existing
+    return existing, skipped
 
 def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
@@ -454,6 +481,51 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
 # MAIN DRIVER
 # ============================================================
 
+def claim_images_for_question(imgs, subject, chapter_no, chapter_records, image_files_by_q):
+    """Attach one page's extracted images to the first question Gemini flagged
+    as needing a figure (question OR solution) that doesn't have one of that
+    kind yet. Returns True if claimed.
+
+    NOTE: simple heuristic -- with multiple figures/flagged questions per page,
+    review the mapping manually.
+
+    LOCKED structure: ALL figure types live together in
+    assets/questions/{SUBJECT}/ -- one folder per subject, type is told only
+    by the filename suffix:
+      {id}_Q_01.webp  {id}_SOL_01.webp  {id}_OPT_A_01.webp  {id}_TABLE_01.webp
+    Do NOT create assets/solutions/, assets/options/ or assets/tables/ --
+    the app relies on this convention."""
+    for qn, rec in chapter_records.items():
+        entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+        needs_q_img = rec.get("has_figure_in_question") and not entry["question"]
+        needs_sol_img = rec.get("has_figure_in_solution") and not entry["solution"]
+        if not (needs_q_img or needs_sol_img):
+            continue
+        kind = "Q" if needs_q_img else "SOL"
+        qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
+        renamed = []
+        for old_rel in imgs:
+            old_path = ASSETS_DIR / "questions" / old_rel
+            if not old_path.exists():
+                # never let one bad path kill the whole run
+                print(f"  [WARN] {old_rel} missing at rename time "
+                      f"-- skipping (leftover alias/dup ref)")
+                continue
+            idx = len(renamed) + 1
+            new_name = f"{qid}_{kind}_{idx:02d}.webp"
+            new_rel = f"{subject}/{new_name}"
+            new_path = ASSETS_DIR / "questions" / subject / new_name
+            old_path.rename(new_path)
+            renamed.append(new_rel)
+        entry["question" if kind == "Q" else "solution"] = renamed
+        return True  # this page's image(s) assigned; don't hand to a later question
+    return False
+
+def _append_jsonl(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
 def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
     subject = pdf_cfg["subject"]
     pdf_path = pdf_cfg["path"]
@@ -486,9 +558,16 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         page_files = sorted(page_dir.glob("page-*.jpg"))
 
         chapter_records = {}
-        image_files_by_q = {}  # not tracked per-q here for simplicity; see NOTE below
+        image_files_by_q = {}
+        pages_imaged = set()       # overlap pages must not be image-extracted twice
+        unmatched_images = []      # no claimant yet -- retried at chapter end
+        orphans = []               # Gemini items with null/invalid q_no (RC-2)
 
-        for batch_start in range(0, len(page_files), PAGES_PER_GEMINI_CALL):
+        batch_step = PAGES_PER_GEMINI_CALL - BATCH_OVERLAP_PAGES
+        for batch_start in range(0, len(page_files), batch_step):
+            if batch_start and batch_start + BATCH_OVERLAP_PAGES >= len(page_files):
+                break  # trailing window would contain ONLY overlap pages
+                       # (nothing new) -- don't spend a quota call on it
             reset_daily_counter_if_needed(state)
             if state["calls_today"] >= MAX_CALLS_PER_DAY:
                 print("Daily Gemini call limit reached. Saving progress, exiting.")
@@ -512,7 +591,15 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 if not items:
                     continue
 
-            chapter_records = merge_question_records(chapter_records, items)
+            chapter_records, skipped = merge_question_records(chapter_records, items)
+            for it in skipped:
+                # RC-2 salvage: fragments (usually batch-boundary continuations)
+                # carry real content -- keep them with their exact provenance.
+                orphans.append({
+                    "chapter_id": chapter_id, "batch_start": batch_start,
+                    "pdf_pages": [int(p.stem.split("-")[-1]) for p in batch],
+                    "item": it,
+                })
 
             # extract real (non-watermark) images from this batch's pages.
             # pdftoppm names output files using the ACTUAL pdf page number
@@ -520,50 +607,35 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             # the filename, don't recompute it relative to ch["file_start"].
             for pf in batch:
                 file_page_num = int(pf.stem.split("-")[-1])
+                if file_page_num in pages_imaged:
+                    continue  # overlap page -- images already extracted once
+                pages_imaged.add(file_page_num)
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
                 if not imgs:
                     continue
-                # NOTE: simple version -- attaches any image found on a page to
-                # whichever q_no Gemini flagged as needing one (question OR
-                # solution figure) and doesn't have one of that kind yet.
-                # Review this mapping manually for pages with multiple figures.
-                assigned = False
-                for qn, rec in chapter_records.items():
-                    entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
-                    needs_q_img = rec.get("has_figure_in_question") and not entry["question"]
-                    needs_sol_img = rec.get("has_figure_in_solution") and not entry["solution"]
-                    if not (needs_q_img or needs_sol_img):
-                        continue
-                    kind = "Q" if needs_q_img else "SOL"
-                    # LOCKED structure: ALL figure types live together in
-                    # assets/questions/{SUBJECT}/ -- one folder per subject,
-                    # type is told only by the filename suffix:
-                    #   {id}_Q_01.webp  {id}_SOL_01.webp
-                    #   {id}_OPT_A_01.webp  {id}_TABLE_01.webp
-                    # Do NOT create assets/solutions/, assets/options/ or
-                    # assets/tables/ -- the app relies on this convention.
-                    qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
-                    renamed = []
-                    for old_rel in imgs:
-                        old_path = ASSETS_DIR / "questions" / old_rel
-                        if not old_path.exists():
-                            # never let one bad path kill the whole run
-                            print(f"  [WARN] {old_rel} missing at rename time "
-                                  f"-- skipping (leftover alias/dup ref)")
-                            continue
-                        idx = len(renamed) + 1
-                        new_name = f"{qid}_{kind}_{idx:02d}.webp"
-                        new_rel = f"{subject}/{new_name}"
-                        new_path = ASSETS_DIR / "questions" / subject / new_name
-                        old_path.rename(new_path)
-                        renamed.append(new_rel)
-                    entry["question" if kind == "Q" else "solution"] = renamed
-                    assigned = True
-                    break  # this page's image(s) assigned; don't also hand it to a later question
-                if not assigned:
-                    print(f"  [WARN] Page {file_page_num}: extracted image(s) {imgs} but no "
-                          f"question/solution in this chapter claimed one -- left unmatched "
-                          f"under its temp filename for manual review.")
+                if not claim_images_for_question(imgs, subject, ch["chapter_no"], chapter_records, image_files_by_q):
+                    unmatched_images.append({"page": file_page_num, "files": imgs})
+                    print(f"  [INFO] Page {file_page_num}: image(s) {imgs} unclaimed for now "
+                          f"-- will retry after all batches (owner may be in a later batch)")
+
+        # SECOND PASS image claiming: a figure can be extracted BEFORE the
+        # batch that introduces its owning question (plate printed just before
+        # the question text, or owner arrived via an overlap window). Chapter
+        # records are complete now -- retry every leftover once.
+        for um in unmatched_images:
+            if claim_images_for_question(um["files"], subject, ch["chapter_no"], chapter_records, image_files_by_q):
+                print(f"  [INFO] second pass: page {um['page']} image(s) matched to a question")
+                um["matched"] = True
+        for um in unmatched_images:
+            if not um.get("matched"):
+                print(f"  [WARN] Page {um['page']}: extracted image(s) {um['files']} but no "
+                      f"question/solution in this chapter claimed one -- left under its temp "
+                      f"filename for manual review (see data/unmatched_images.jsonl).")
+                _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
+                              {"subject": subject, "chapter_id": chapter_id,
+                               "page": um["page"], "files": um["files"]})
+        for orph in orphans:
+            _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
 
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
