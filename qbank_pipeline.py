@@ -282,7 +282,10 @@ def call_gemini_on_pages(model, image_paths):
 def merge_question_records(existing, new_items):
     """existing: dict keyed by q_no -> record (in progress for current chapter)"""
     for item in new_items:
-        qn = item["q_no"]
+        qn = int(item["q_no"])  # Gemini's JSON sometimes returns q_no as a
+                                 # string ("7") and sometimes as a number (7);
+                                 # force a consistent type so later sorting
+                                 # never compares int against str.
         rec = existing.setdefault(qn, {
             "q_no": qn, "question_text": None, "options": None,
             "correct_option": None, "solution_text": None, "tables": [],
@@ -395,7 +398,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                         if imgs:
                             image_files_by_q[qn] = {"question": imgs, "solution": []}
 
-        for qn, rec in sorted(chapter_records.items()):
+        for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
                 subject, chapter_id, ch["chapter_no"], qn, rec,
                 image_files_by_q.get(qn, {"question": [], "solution": []})
