@@ -44,6 +44,17 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
     try:
         pipeline.PDFS[:] = [{"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}]
         pipeline.main()
+        # zero-token deterministic validation right after every run -- the
+        # defect map (numbering gaps, RC-4-aware missing solutions, orphan /
+        # unmatched-image sidecars) lands in data/validation_report.json.
+        try:
+            import qbank_validator
+            rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False)
+            log(f"🧪 Validation: {rep['summary']['flags_total']} flag(s) across "
+                f"{rep['summary']['flagged_chapters']}/{rep['summary']['chapters']} chapters → "
+                f"see data/validation_report.json")
+        except Exception as ve:
+            log(f"⚠️ post-run validation report failed (extraction unaffected): {ve}")
         with state_lock:
             state["status"] = "completed"
         log("✅ Done (or paused at daily Gemini limit — tap Run again tomorrow to resume).")

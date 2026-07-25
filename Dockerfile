@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY qbank_pipeline.py app.py ./
+COPY qbank_pipeline.py qbank_validator.py app.py ./
 # PDFs get uploaded via the dashboard now, so no need to bake them into the image.
 # (If you'd rather pre-load them at build time, uncomment the next line and
 #  add a pdfs/ folder next to this Dockerfile.)

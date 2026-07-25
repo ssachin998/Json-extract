@@ -84,6 +84,16 @@ BATCH_OVERLAP_PAGES = 2         # consecutive batches share 2 pages, so a
 TARGETED_RETRY_MAX_ROUNDS = 2   # after a chapter's normal pass, up to this many
                                  # small focused re-asks for answer/options fields
                                  # still missing (merged from target_retry_patch.py)
+SOLUTION_GATE_MIN_SHARE = 0.6   # if >=60% of a chapter's questions already have
+                                 # solution text, the book DOES print explanations
+                                 # here -> remaining solution gaps are extraction
+                                 # losses and become retry-eligible. Replaces the
+                                 # blanket solution-exclusion (RC-4), which the
+                                 # 2026-07-25 run-2 log REFUTED: run-1's "answer-key
+                                 # only" chapters (ch4/ch6) came back 0-missing on
+                                 # the same pages, and ch11's count changed 5->8
+                                 # between runs -- proof of nondeterministic model
+                                 # drops, not absent print.
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # confirmed working model from your bot's config
 
 IMG_PATH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}-\d{3}-\d{3}_[A-Z]+(_[A-Z])?_\d{2}\.webp$")
@@ -378,13 +388,18 @@ def call_gemini_on_pages(model, image_paths, context=""):
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     return json.loads(text)
 
-def retry_batch_page_by_page(model, batch, state):
+def retry_batch_page_by_page(model, batch, state, ctx=None):
     """A whole-batch failure (RECITATION/safety finish_reason, token limit)
     is usually caused by just ONE page in the batch. Retrying each page
     alone isolates the bad page instead of losing the whole batch's worth
     of questions/answers/solutions (seen in prod: finish_reason=4 killed a
     6-page batch, wiping one chapter's answers and another's solutions).
-    Respects the same daily quota and exits cleanly if it's hit."""
+    Respects the same daily quota and exits cleanly if it's hit.
+
+    A page that fails EVEN ALONE (usually recitation-sensitive content) is
+    NO LONGER silently dropped: it is persisted to state["failed_pages"]
+    and gets a second-chance call at chapter end (drain_failed_pages) with
+    a different prompt framing -- run-2: page 217's skip cost 5 solutions."""
     print(f"  [INFO] retrying {len(batch)} pages one-by-one to isolate the failing page...")
     items = []
     recovered = 0
@@ -404,7 +419,13 @@ def retry_batch_page_by_page(model, batch, state):
                 print(f"  [QUOTA] Gemini quota exhausted during retry -- stopping run for now: {e2}")
                 save_state(state)
                 sys.exit(0)
-            print(f"  [WARN] page {pf.name} failed even alone ({e2}) -- skipping just this page")
+            print(f"  [WARN] page {pf.name} failed even alone ({e2}) -- queued for second-chance drain")
+            entry = {"page_file": pf.name, "true_page": int(pf.stem.split("-")[-1]),
+                     "reason": t2[:200], "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+            if ctx:
+                entry.update({"subject": ctx.get("subject"), "chapter_no": ctx.get("chapter_no"),
+                              "chapter_id": ctx.get("chapter_id")})
+            state.setdefault("failed_pages", []).append(entry)
     save_state(state)
     print(f"  [INFO] single-page retry: {recovered}/{len(batch)} pages recovered")
     return items
@@ -432,13 +453,15 @@ def find_incomplete_records(chapter_records):
     """
     Returns [(q_no, missing_fields), ...] for records worth retrying.
 
-    Deliberately does NOT flag a missing solution_text by itself as
-    retry-worthy: some MCQ books print an answer key with no explanation
-    for some questions (that's a source-content gap, not an extraction
-    bug) -- retrying those would waste calls chasing content that was
-    never there. Only "answer" and "options" are treated as near-certain
-    extraction misses, since every real MCQ has exactly 4 options and one
-    marked correct answer somewhere in the book.
+    "answer" and "options" gaps are always retry-worthy: every real MCQ has
+    4 options and one marked answer somewhere in the book.
+
+    "solution" gaps are retry-worthy only when chapter-internal evidence
+    says the book PRINTS explanations here (>=60% of questions already have
+    solution text -- SOLUTION_GATE_MIN_SHARE). Chapters where the book
+    genuinely prints no explanations (answer-key-only sections, RC-4) show
+    ~0% coverage and stay protected: no quota is wasted chasing content
+    that was never printed.
     """
     incomplete = []
     for qn, rec in chapter_records.items():
@@ -451,6 +474,18 @@ def find_incomplete_records(chapter_records):
             missing.append("options")
         if missing:
             incomplete.append((qn, missing))
+
+    n = len(chapter_records)
+    n_with_sol = sum(1 for r in chapter_records.values() if (r.get("solution_text") or "").strip())
+    book_prints_solutions = n > 0 and n_with_sol / n >= SOLUTION_GATE_MIN_SHARE
+    if book_prints_solutions:
+        by_qn = {qn: missing for qn, missing in incomplete}
+        for qn, rec in chapter_records.items():
+            if rec.get("question_text") and not (rec.get("solution_text") or "").strip():
+                if qn in by_qn:
+                    by_qn[qn].append("solution")
+                else:
+                    incomplete.append((qn, ["solution"]))
     return incomplete
 
 
@@ -463,9 +498,10 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
         "",
         "Return a JSON array. Each element:",
         '{"q_no": <int>, "correct_option": "A"|"B"|"C"|"D"|null, '
-        '"options": {"A":"...","B":"...","C":"...","D":"..."} | null}',
+        '"options": {"A":"...","B":"...","C":"...","D":"..."} | null, '
+        '"solution_text": "..." | null}',
         "Only fill the field(s) actually requested for that q_no; leave the "
-        "other field null. If you genuinely cannot find a piece anywhere in "
+        "other fields null. If you genuinely cannot find a piece anywhere in "
         "these pages, leave it null rather than guessing.",
         "",
         "MISSING PIECES TO FIND:",
@@ -486,6 +522,14 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
                 f"  - Find ALL 4 options (A/B/C/D) for question {qn}. "
                 f"Already captured: {have or 'none'}. Find the missing letter(s)."
             )
+        if "solution" in missing:
+            block.append(
+                f"  - Find the VERBATIM explanation/solution text printed for "
+                f"question {qn}. It may sit in a 'Solutions'/'Explanations' block "
+                f"near the questions, sometimes labelled 'Solution to Question "
+                f"{qn}:'. Return the FULL text exactly as printed; if the page "
+                f"genuinely shows none, leave it null."
+            )
         lines.append("\n".join(block))
     return "\n".join(lines)
 
@@ -501,10 +545,20 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
     Returns the total number of fields filled.
     """
     total_fixed = 0
+    first_check = True
     for round_no in range(1, max_rounds + 1):
         incomplete = find_incomplete_records(chapter_records)
         if not incomplete:
+            if first_check:
+                # never exit silently again (run-2 learning: "retry skipped"
+                # was really "nothing eligible") -- say WHY.
+                n_sol_gaps = sum(1 for r in chapter_records.values()
+                                 if r.get("question_text") and not (r.get("solution_text") or "").strip())
+                if n_sol_gaps:
+                    print(f"  [RETRY] nothing eligible: {n_sol_gaps} solution gap(s) suppressed by the "
+                          f"60% source-evidence gate (treated as book-printed answer-key-only)")
             break
+        first_check = False
 
         reset_daily_counter_if_needed(state)
         if state["calls_today"] >= MAX_CALLS_PER_DAY:
@@ -548,6 +602,9 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
             if fix.get("correct_option") and not rec.get("correct_option"):
                 rec["correct_option"] = str(fix["correct_option"]).strip().upper()
                 fixed_this_round += 1
+            if fix.get("solution_text") and not (rec.get("solution_text") or "").strip():
+                rec["solution_text"] = str(fix["solution_text"]).strip()
+                fixed_this_round += 1
             if fix.get("options"):
                 rec["options"] = rec.get("options") or {}
                 before = len(rec["options"])
@@ -576,6 +633,70 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
               f"{max_rounds} round(s) -- logged to still_incomplete_after_retry.jsonl")
 
     return total_fixed
+
+def pdftotext_page(pdf_path, true_page):
+    out = subprocess.run(["pdftotext", "-f", str(true_page), "-l", str(true_page),
+                          "-layout", str(pdf_path), "-"], capture_output=True, text=True)
+    return out.stdout or ""
+
+
+def qns_printed_on_page(pdf_path, true_page, chapter_records):
+    """Which of this chapter's q_nos are printed on this page, read from the
+    text layer (0 tokens). Conservative: a hit counts only if the number
+    appears at a question-stem position AND the q_no exists in the chapter.
+    Returns sorted unique list -- caller auto-attaches ONLY on exactly one."""
+    text = pdftotext_page(pdf_path, true_page)
+    if not text.strip():
+        return []
+    found = set()
+    for m in re.finditer(r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", text):
+        qn = int(m.group(1))
+        if qn in chapter_records:
+            found.add(qn)
+    return sorted(found)
+
+
+def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, pdf_path=None):
+    """Second-chance pass for pages that failed even alone (recitation-prone
+    content, run-2: PSY page 217 cost ch16 5 solutions). Called at chapter
+    end with the recovery framing -- a differently-phrased, focused
+    single-page ask often clears a recitation filter that fired on the
+    bulk prompt. Fill-only merge: never overwrites first-pass content.
+    Returns (chapter_records, new_orphans, healed_entries)."""
+    new_orphans = []
+    healed = []
+    for entry in entries:
+        reset_daily_counter_if_needed(state)
+        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+            print("Daily Gemini call limit reached during failed-page drain. Saving, exiting.")
+            save_state(state)
+            sys.exit(0)
+        pf = page_dir / entry["page_file"]
+        if not pf.exists() and pdf_path is not None:
+            # cross-day run: /tmp may be wiped -- re-render just this page.
+            subprocess.run(["pdftoppm", "-jpeg", "-r", "150",
+                            "-f", str(entry["true_page"]), "-l", str(entry["true_page"]),
+                            str(pdf_path), str(page_dir / "page")])
+        if not pf.exists():
+            print(f"  [DRAIN] {entry['page_file']} could not be re-rendered -- dropping from queue")
+            healed.append(entry)  # nothing more we can do; don't loop forever
+            continue
+        try:
+            raw = call_gemini_on_pages(model, [pf], context=RECOVERY_CONTEXT)
+            state["calls_today"] += 1
+            save_state(state)
+        except Exception as e:
+            print(f"  [DRAIN] {entry['page_file']} failed on second chance ({e}) -- kept in failed_pages queue")
+            continue
+        print(f"  [DRAIN] {entry['page_file']} recovered on second chance")
+        items, _meta = extract_batch_meta(raw)
+        chapter_records, skipped = merge_question_records(chapter_records, items, stats, fill_only=True)
+        for it in skipped:
+            new_orphans.append({"chapter_id": entry.get("chapter_id"), "batch_start": -1,
+                                "pdf_pages": [int(entry["true_page"])], "new_pages": [],
+                                "carry_q_no": None, "item": it})
+        healed.append(entry)
+    return chapter_records, new_orphans, healed
 
 # ============================================================
 # FEATURE 2 — carry-forward context (Gemini's API is stateless:
@@ -671,34 +792,91 @@ def build_carry_context(carry, overlap_pages):
         )
     return "\n".join(lines)
 
+ANSWER_KEY_ROW_RE = re.compile(r"\|\s*(\d{1,3})\s*\|\s*([A-Da-d])\s*\|")
+SOLUTION_TO_Q_RE = re.compile(r"Solution to Question\s+(\d{1,3})", re.IGNORECASE)
+
+
+def _frag_mostly_present(frag, existing, threshold=0.85):
+    """Token-overlap duplicate guard: substring checks miss near-dupes when
+    punctuation differs ('...target.' vs '...target for...'), which caused a
+    double-append in testing. True when >=threshold of frag's tokens already
+    appear in existing's token set."""
+    f = re.findall(r"\w+", (frag or "").lower())
+    e = set(re.findall(r"\w+", (existing or "").lower()))
+    if not f or not e:
+        return False
+    return sum(1 for t in f if t in e) / len(f) >= threshold
+
+
 def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
     """FEATURE 3 -- second-pass owner matching for q_no=null fragments.
     Confidence rules, in order:
-      1. the carry-forward owner captured when the fragment arrived
-      2. the highest-numbered question from the SAME batch window is missing
-         exactly the field the orphan provides (solution/options/question)
-    Recovered content is APPENDED (existing text is never overwritten).
-    Whatever remains unmatched is returned for orphans.jsonl -- never
-    silently discarded."""
+      0. ANSWER-KEY TABLE orphan (run-2 finding: pages 182/194/235/241 all
+         produced {'q_no': None, 'tables':[Answer Key]} orphans and the old
+         rules had NO handler for them -- a latent whole-chapter answer-loss
+         bug). Parse the markdown rows deterministically and fill missing
+         correct_options (fill-only, never overwrite).
+      1. owner printed INSIDE the fragment text ("Solution to Question 3:")
+         -- run-2: pages 85/159/273 all carried self-labeling fragments that
+         the old matcher never parsed (0/13 orphans recovered that run).
+      2. the carry-forward owner captured when the fragment arrived.
+      3. the highest-numbered question from the SAME batch window is missing
+         exactly the field the orphan provides (solution/options/question).
+         NEW: also attaches continuation fragments to PARTIAL owners
+         (half-solutions) via append, when the fragment leads NEW text.
+    Recovered content is APPENDED / fill-only (existing text is never
+    overwritten). Whatever remains unmatched is returned for orphans.jsonl
+    -- never silently discarded."""
     remaining = []
     for orph in orphans:
         item = orph["item"]
+        page = (orph.get("new_pages") or orph.get("pdf_pages") or ["?"])[0]
+
+        # ---- rule 0: answer-key table -> deterministic correct_option fills
+        filled_by_key = 0
+        for t in item.get("tables") or []:
+            if "answer" not in str(t.get("type", "")).lower() and "Correct Option" not in (t.get("markdown") or ""):
+                continue
+            for qn_s, letter in ANSWER_KEY_ROW_RE.findall(t.get("markdown") or ""):
+                kqn = int(qn_s)
+                rec = chapter_records.get(kqn)
+                if rec and not rec.get("correct_option"):
+                    rec["correct_option"] = letter.upper()
+                    filled_by_key += 1
+        if filled_by_key:
+            stats["orphans_recovered"] += 1
+            print(f"  [ORPHAN] Recovered orphan: page={page} answer-key table -> "
+                  f"{filled_by_key} answer(s) filled deterministically")
+            continue
+
         owner, reason = None, None
+        # ---- rule 1: owner self-labeled inside the fragment text
+        m = SOLUTION_TO_Q_RE.search(item.get("solution_text") or "")
+        if m:
+            hint_qn = int(m.group(1))
+            if hint_qn in chapter_records:
+                owner, reason = hint_qn, "self-labeled 'Solution to Question N' fragment"
+        # ---- rule 2: carry-forward owner
         carry_qn = orph.get("carry_q_no")
-        if carry_qn is not None and carry_qn in chapter_records:
+        if owner is None and carry_qn is not None and carry_qn in chapter_records:
             owner = carry_qn
             reason = f"{orph.get('cut_part') or 'content'} continuation (carry-forward)"
-        else:
+        # ---- rule 3: highest q_no of the same batch window missing that field
+        if owner is None:
             last_qn = orph.get("last_qn_in_batch")
             rec = chapter_records.get(last_qn) if last_qn is not None else None
             if rec:
-                if item.get("solution_text") and not rec.get("solution_text"):
+                frag = (item.get("solution_text") or "").strip()
+                existing = (rec.get("solution_text") or "").strip()
+                if item.get("solution_text") and not existing:
                     owner, reason = last_qn, "solution continuation"
+                elif (item.get("solution_text") and existing and frag
+                      and not _frag_mostly_present(frag, existing)):
+                    owner, reason = last_qn, "solution continuation (PARTIAL owner append)"
                 elif item.get("options") and not rec.get("options"):
                     owner, reason = last_qn, "options continuation"
                 elif item.get("question_text") and not rec.get("question_text"):
                     owner, reason = last_qn, "question continuation"
-        page = (orph.get("new_pages") or orph.get("pdf_pages") or ["?"])[0]
         if owner is None:
             print(f"  [ORPHAN] Could not determine owner: page={page} kept in orphans.jsonl")
             remaining.append(orph)
@@ -706,7 +884,7 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
         rec = chapter_records[owner]
         if item.get("solution_text"):
             frag = item["solution_text"].strip()
-            if frag and frag not in (rec.get("solution_text") or ""):
+            if frag and not _frag_mostly_present(frag, rec.get("solution_text") or ""):
                 rec["solution_text"] = ((rec.get("solution_text") or "") + " " + frag).strip()
         if item.get("options"):
             rec["options"] = rec["options"] or {}
@@ -780,8 +958,13 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                 stats["duplicates_merged"] += 1   # expected overlap re-read
             else:
                 a1, a2 = rec.get("correct_option"), item.get("correct_option")
-                stats["conflicts"] += 1
+                # normalize case BEFORE comparing: 'D' vs 'd' is the same
+                # answer, but the raw string compare called it a conflict and
+                # dropped the item (run-2 log 17:36:00, ch15 q1).
+                a1 = str(a1).strip().upper() if a1 else None
+                a2 = str(a2).strip().upper() if a2 else None
                 if a1 and a2 and a1 != a2:
+                    stats["conflicts"] += 1   # count only ACTUAL drops (matches "conflicts dropped" log label)
                     print(f"  [WARN] conflicting re-extraction for q{qn} "
                           f"(similarity {sim:.2f}, answers {a1} vs {a2}) -- keeping first, dropping item")
                     continue
@@ -993,13 +1176,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                             save_state(state)
                             sys.exit(0)
                         print(f"  [WARN] post-backoff call failed differently: {e2}")
-                        raw_items = retry_batch_page_by_page(genai_model, batch, state)
+                        raw_items = retry_batch_page_by_page(genai_model, batch, state, ctx={"subject": subject, "chapter_no": ch["chapter_no"], "chapter_id": chapter_id})
                         if not raw_items:
                             continue
                 else:
                     print(f"  [WARN] Gemini call failed on {subject} ch{ch['chapter_no']} batch {batch_start}: {e}")
                     # don't lose the whole batch over one bad page
-                    raw_items = retry_batch_page_by_page(genai_model, batch, state)
+                    raw_items = retry_batch_page_by_page(genai_model, batch, state, ctx={"subject": subject, "chapter_no": ch["chapter_no"], "chapter_id": chapter_id})
                     if not raw_items:
                         continue
 
@@ -1070,6 +1253,50 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             if claim_images_for_question(um["files"], subject, ch["chapter_no"], chapter_records, image_files_by_q):
                 print(f"  [INFO] second pass: page {um['page']} image(s) matched to a question")
                 um["matched"] = True
+                continue
+            # THIRD pass (0 tokens): Gemini never set has_figure flags, so
+            # the flag-only matcher can never fire (run-2: p127/128/188/295/
+            # 318). Read the page's printed question numbers via pdftotext --
+            # if EXACTLY ONE of this chapter's questions lives on the image's
+            # page, that question is the owner with high confidence. Zero or
+            # multiple candidates stay unmatched (evidence insufficient).
+            try:
+                qns = qns_printed_on_page(pdf_path, um["page"], chapter_records)
+            except Exception as e:
+                print(f"  [WARN] third-pass pdftotext failed for page {um['page']}: {e}")
+                qns = []
+            if len(qns) == 1:
+                qn = qns[0]
+                rec = chapter_records[qn]
+                entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+                qt, st = (rec.get("question_text") or "").lower(), (rec.get("solution_text") or "").lower()
+                side = "question" if ("fig" in qt or "diagram" in qt or not st) else "solution"
+                other = "solution" if side == "question" else "question"
+                kind = "Q" if side == "question" else "SOL"
+                if not entry[side]:
+                    qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
+                    renamed = []
+                    ok = True
+                    for i, old_rel in enumerate(um["files"], 1):
+                        old_path = ASSETS_DIR / "questions" / old_rel
+                        if not old_path.exists():
+                            ok = False
+                            break
+                        new_name = f"{qid}_{kind}_{i:02d}.webp"
+                        new_rel = f"{subject}/{new_name}"
+                        old_path.rename(ASSETS_DIR / "questions" / subject / new_name)
+                        renamed.append(new_rel)
+                    if ok and renamed:
+                        entry[side] = renamed
+                        um["matched"] = True
+                        print(f"  [INFO] third pass: page {um['page']} image(s) attached to {qid} "
+                              f"(sole printed question on that page, {side} side)")
+                    elif not ok:
+                        print(f"  [WARN] third pass: rename failed for page {um['page']} "
+                              f"-- left unmatched (file already moved earlier?)")
+            elif qns:
+                print(f"  [INFO] third pass: page {um['page']} has {len(qns)} printed questions "
+                      f"{qns} -- ambiguous owner, left for manual review")
         for um in unmatched_images:
             if not um.get("matched"):
                 n_unmatched += 1
@@ -1079,6 +1306,27 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
                               {"subject": subject, "chapter_id": chapter_id,
                                "page": um["page"], "files": um["files"]})
+
+        # FAILED-PAGE DRAIN: second chance for recitation-skipped pages
+        # BEFORE orphan recovery (drained fragments may join the orphan
+        # pool) and BEFORE targeted retry (so drained solutions count when
+        # the 60% book-prints-solutions gate is evaluated).
+        pending_failed = [e for e in state.get("failed_pages", [])
+                          if e.get("chapter_id") == chapter_id]
+        if pending_failed:
+            chapter_records, drain_orphans, healed = drain_failed_pages(
+                genai_model, pending_failed, page_dir, chapter_records, state, stats,
+                pdf_path=pdf_path)
+            orphans.extend(drain_orphans)
+            orphans = recover_orphans(orphans, chapter_records, subject, ch["chapter_no"], stats)
+            stats["orphans_remaining"] = len(orphans)
+            if healed:
+                healed_ids = {(e["subject"], e["chapter_no"], e["true_page"]) for e in healed}
+                state["failed_pages"] = [e for e in state.get("failed_pages", [])
+                                         if (e.get("subject"), e.get("chapter_no"), e.get("true_page"))
+                                         not in healed_ids]
+                save_state(state)
+            print(f"  [DRAIN] second chance: {len(healed)}/{len(pending_failed)} previously-failed page(s) recovered")
 
         # FEATURE: targeted gap-retry -- AFTER normal batches + orphan
         # recovery, BEFORE writing the chapter's questions to disk.
@@ -1108,6 +1356,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         n_no_solution = sum(1 for r in chapter_records.values() if not r.get("solution_text"))
         print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> "
               f"{len(chapter_records)} questions ({n_no_answer} missing answer, {n_no_solution} missing solution)")
+        if n_no_solution and chapter_records:
+            coverage = 1 - n_no_solution / len(chapter_records)
+            if coverage >= SOLUTION_GATE_MIN_SHARE:
+                print(f"  [WARN] {n_no_solution} solution(s) still missing although this chapter "
+                      f"prints explanations ({coverage:.0%} coverage) -- extraction loss, "
+                      f"see data/still_incomplete_after_retry.jsonl; re-run or --recover these pages")
         print(f"[{subject}]   batches: {stats['batches']} | duplicates merged: {stats['duplicates_merged']}"
               f" | conflicts dropped: {stats['conflicts']} | carry-forward used: {stats['carry_used']}"
               f" | carry merges: {stats['carry_merges']}"
