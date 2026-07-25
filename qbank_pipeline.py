@@ -559,9 +559,12 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
 # page and its answer/solution on a later page) into final records
 # ============================================================
 
-def merge_question_records(existing, new_items, stats=None):
+def merge_question_records(existing, new_items, stats=None, fill_only=False):
     """existing: dict keyed by q_no -> record (in progress for current chapter).
     stats: optional dict updated with "duplicates_merged"/"conflicts" counters.
+    fill_only: recovery mode -- never overwrite a field that already has
+    content; only fill what's missing (heals old rows without risking
+    re-extraction noise replacing good data).
 
     Overlap-merge rules (sliding window re-extracts shared pages by design):
     - same q_no + question text similarity >= 95%  -> genuine re-extraction:
@@ -611,6 +614,8 @@ def merge_question_records(existing, new_items, stats=None):
                       f"(similarity {sim:.2f}) -- merging non-conflicting fields")
         for k in ["question_text", "solution_text"]:
             if item.get(k):
+                if fill_only and rec.get(k):
+                    continue  # recovery: never overwrite existing content
                 rec[k] = item[k]
 
         # Options can arrive across TWO different batches when a question
@@ -626,10 +631,15 @@ def merge_question_records(existing, new_items, stats=None):
             if rec["options"] is None:
                 rec["options"] = {}
             for opt_id, opt_text in item["options"].items():
-                rec["options"][str(opt_id).strip().upper()] = opt_text
+                key = str(opt_id).strip().upper()
+                if fill_only:
+                    rec["options"].setdefault(key, opt_text)
+                else:
+                    rec["options"][key] = opt_text
 
         if item.get("correct_option"):
-            rec["correct_option"] = str(item["correct_option"]).strip().upper()
+            if not (fill_only and rec.get("correct_option")):
+                rec["correct_option"] = str(item["correct_option"]).strip().upper()
 
         if item.get("tables"):
             # Dedupe by markdown: overlap pages (BATCH_OVERLAP_PAGES) are
@@ -903,6 +913,156 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
               f" | orphans: {stats['orphans_recovered']} recovered, {stats['orphans_remaining']} unresolved"
               f" | unmatched images: {n_unmatched}")
 
+# ============================================================
+# TARGETED RECOVERY MODE (--recover plan.json)
+# Heals already-written questions.jsonl rows WITHOUT reprocessing whole
+# chapters and WITHOUT touching state.json / chapters_done.
+# plan.json shape:
+#   {"PSY-016": {"pages": [214, 217], "reason": "recitation batch loss"},
+#    "PSY-001": {"pages": [17],      "reason": "missing solution for q13"}}
+# Pages are TRUE PDF file page numbers (same numbering used by
+# orphans.jsonl / unmatched_images.jsonl / temp image filenames).
+# ============================================================
+
+def final_q_to_record(q):
+    """Reverse build_final_question: folded an existing JSONL row back into a
+    merge-ready record (+ its already-owned images for re-emission)."""
+    options = {o["id"]: o["text"] for o in (q.get("options") or [])} or None
+    correct = q.get("correct_options") or []
+    rec = {
+        "q_no": int(q["id"].rsplit("-", 1)[-1]),
+        "question_text": q["question"]["text"],
+        "options": options,
+        "correct_option": correct[0] if correct else None,
+        "solution_text": q["solution"]["text"],
+        "tables": [{"type": t.get("type", "table"), "markdown": t["markdown"]}
+                   for t in q["solution"].get("tables", [])],
+        "has_figure_in_question": bool(q["question"]["images"]),
+        "has_figure_in_solution": bool(q["solution"]["images"]),
+    }
+    owned = {"question": [i["file"] for i in q["question"]["images"]],
+             "solution": [i["file"] for i in q["solution"]["images"]]}
+    return rec, owned
+
+RECOVERY_CONTEXT = (
+    "RECOVERY NOTE: these are SELECTED pages from a single chapter, sent to "
+    "fill specific extraction gaps. Pages may be non-adjacent and each page "
+    "may begin or end mid-flow. Extract everything visible exactly as usual; "
+    "if a fragment at a page edge has no visible question number, return it "
+    'with "q_no": null as usual. Never invent numbers.'
+)
+
+def recover_pages(plan_path):
+    plan = json.loads(Path(plan_path).read_text())
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    questions_path = DATA_DIR / "questions.jsonl"
+    all_lines = [json.loads(l) for l in
+                 questions_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    for chapter_id, spec in plan.items():
+        pages = sorted(set(int(p) for p in spec["pages"]))
+        subject, chap_str = chapter_id.split("-", 1)
+        chapter_no = int(chap_str)
+        pdf_cfg = next((c for c in PDFS if c["subject"] == subject), None)
+        if not pdf_cfg:
+            print(f"[RECOVER] no PDF configured for {subject} -- skipping {chapter_id}")
+            continue
+        pdf_path = pdf_cfg["path"]
+        total_pages = len(PdfReader(pdf_path).pages)
+        watermark_id = find_watermark_object_id(pdf_path)
+
+        # rebuild existing chapter rows so recovery MERGES into them
+        chapter_lines = [q for q in all_lines if q.get("chapter_id") == chapter_id]
+        records, image_files_by_q = {}, {}
+        for q in chapter_lines:
+            rec, owned = final_q_to_record(q)
+            records[rec["q_no"]] = rec
+            image_files_by_q[rec["q_no"]] = owned
+        print(f"[RECOVER] {chapter_id}: {len(records)} existing rows; "
+              f"target pages {pages} ({spec.get('reason', 'no reason given')})")
+
+        # render targets +/- 1 neighbour (continuation context!) at higher DPI
+        neighbour = sorted({p for t in pages for p in (t - 1, t, t + 1)
+                            if 1 <= p <= total_pages})
+        rec_dir = Path(f"/tmp/{subject}_recover_{chapter_no:03d}")
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["pdftoppm", "-jpeg", "-r", "200",
+                        "-f", str(neighbour[0]), "-l", str(neighbour[-1]),
+                        pdf_path, str(rec_dir / "page")])
+        page_files = sorted(rec_dir.glob("page-*.jpg"))
+        pages_imaged = set()
+        stats = {"duplicates_merged": 0, "conflicts": 0,
+                 "carry_merges": 0, "orphans_recovered": 0}
+        orphans = []
+        unmatched_images = []
+
+        for win_start in range(0, len(page_files), PAGES_PER_GEMINI_CALL):
+            batch = page_files[win_start:win_start + PAGES_PER_GEMINI_CALL]
+            window_pages = [int(p.stem.split("-")[-1]) for p in batch]
+            try:
+                raw = call_gemini_on_pages(model, batch, context=RECOVERY_CONTEXT)
+            except Exception as e:
+                print(f"  [WARN] recovery call failed for {chapter_id} pages "
+                      f"{window_pages}: {e}")
+                raw = retry_batch_page_by_page(model, batch,
+                                               {"calls_today": 0, "day_stamp": ""})
+                if not raw:
+                    continue
+            items, _meta = extract_batch_meta(raw)
+            records, skipped = merge_question_records(records, items, stats, fill_only=True)
+            for it in skipped:
+                orphans.append({"chapter_id": chapter_id, "batch_start": win_start,
+                                "pdf_pages": window_pages, "new_pages": window_pages,
+                                "carry_q_no": None, "cut_part": None,
+                                "last_qn_in_batch": None, "item": it})
+            for pf in batch:
+                file_page_num = int(pf.stem.split("-")[-1])
+                if file_page_num in pages_imaged:
+                    continue
+                pages_imaged.add(file_page_num)
+                imgs = extract_real_images(pdf_path, file_page_num, watermark_id,
+                                           subject, ASSETS_DIR / "questions")
+                if imgs and not claim_images_for_question(imgs, subject, chapter_no,
+                                                          records, image_files_by_q):
+                    unmatched_images.append({"page": file_page_num, "files": imgs})
+
+        orphans = recover_orphans(orphans, records, subject, chapter_no, stats)
+        for orph in orphans:
+            _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
+        for um in unmatched_images:
+            if not claim_images_for_question(um["files"], subject, chapter_no,
+                                             records, image_files_by_q):
+                _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
+                              {"subject": subject, "chapter_id": chapter_id,
+                               "page": um["page"], "files": um["files"]})
+
+        # rewrite questions.jsonl: keep other chapters' rows, replace this one
+        others = [q for q in all_lines if q.get("chapter_id") != chapter_id]
+        emitted = [build_final_question(subject, chapter_id, chapter_no, qn, rec,
+                                        image_files_by_q.get(qn, {"question": [], "solution": []}))
+                   for qn, rec in sorted(records.items())]
+        out_ids = [q["id"] for q in emitted]
+        assert len(out_ids) == len(set(out_ids)), "duplicate ids after recovery"
+        with open(questions_path, "w", encoding="utf-8") as fh:
+            for q in others + emitted:
+                fh.write(json.dumps(q, ensure_ascii=False) + "\n")
+        all_lines = others + emitted  # next chapter's rebuild sees fresh rows
+
+        n_no_solution = sum(1 for r in records.values() if not r.get("solution_text"))
+        n_no_answer = sum(1 for r in records.values() if not r.get("correct_option"))
+        print(f"[RECOVER] {chapter_id} done -> {len(records)} questions "
+              f"({n_no_answer} missing answer, {n_no_solution} missing solution)"
+              f" | rows kept: {len(records) - len(chapter_lines) + len(chapter_lines)}"
+              f" | conflicts dropped: {stats['conflicts']}"
+              f" | orphans unresolved: {len(orphans)}"
+              f" | state.json untouched")
+
+    print("[RECOVER] all planned chapters processed.")
+
 def main():
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(GEMINI_MODEL)
@@ -926,4 +1086,9 @@ def main():
     print("All done (or paused at daily limit -- just re-run this script to resume).")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--recover":
+        # targeted healing of already-written rows, e.g.:
+        #   python3 qbank_pipeline.py --recover recovery_plan.json
+        recover_pages(sys.argv[2] if len(sys.argv) > 2 else "recovery_plan.json")
+    else:
+        main()
