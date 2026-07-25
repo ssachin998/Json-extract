@@ -67,7 +67,11 @@ DATA_DIR = OUTPUT_ROOT / "data"
 ASSETS_DIR = OUTPUT_ROOT / "assets"
 STATE_FILE = OUTPUT_ROOT / "state.json"
 
-MAX_CALLS_PER_DAY = 950         # safety buffer under your 1000/day cap
+MAX_CALLS_PER_DAY = 1400        # self-imposed brake with ~7% buffer under the
+                                 # free tier's 1500 requests/day (per project;
+                                 # buffer covers shared-key use by other bots,
+                                 # page-by-page retries, and quota-window vs
+                                 # server-date misalignment). NOT Google's limit.
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
@@ -800,14 +804,33 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             except Exception as e:
                 err_text = str(e)
                 if "429" in err_text or "quota" in err_text.lower():
-                    print(f"  [QUOTA] Gemini quota exhausted -- stopping run for now: {e}")
-                    save_state(state)
-                    sys.exit(0)
-                print(f"  [WARN] Gemini call failed on {subject} ch{ch['chapter_no']} batch {batch_start}: {e}")
-                # don't lose the whole batch over one bad page
-                raw_items = retry_batch_page_by_page(genai_model, batch, state)
-                if not raw_items:
-                    continue
+                    # Free tier = ~1500 req/day PER DAY but also capped PER MINUTE
+                    # (~15 RPM). A burst 429 is NOT the daily cap -- back off once
+                    # and retry before declaring the whole day over.
+                    print(f"  [429] rate limited on {subject} ch{ch['chapter_no']} batch {batch_start}"
+                          f" -- backing off 65s (could be the per-minute cap, not the daily one)")
+                    time.sleep(65)
+                    try:
+                        raw_items = call_gemini_on_pages(genai_model, batch, context=context_str)
+                        state["calls_today"] += 1
+                        save_state(state)
+                    except Exception as e2:
+                        t2 = str(e2)
+                        if "429" in t2 or "quota" in t2.lower():
+                            print(f"  [QUOTA] still limited after 65s backoff -- daily cap it is. "
+                                  f"Saving progress, exiting: {e2}")
+                            save_state(state)
+                            sys.exit(0)
+                        print(f"  [WARN] post-backoff call failed differently: {e2}")
+                        raw_items = retry_batch_page_by_page(genai_model, batch, state)
+                        if not raw_items:
+                            continue
+                else:
+                    print(f"  [WARN] Gemini call failed on {subject} ch{ch['chapter_no']} batch {batch_start}: {e}")
+                    # don't lose the whole batch over one bad page
+                    raw_items = retry_batch_page_by_page(genai_model, batch, state)
+                    if not raw_items:
+                        continue
 
             items, batch_meta = extract_batch_meta(raw_items)
             chapter_records, skipped = merge_question_records(chapter_records, items, stats)

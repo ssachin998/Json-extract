@@ -162,7 +162,9 @@ and content that simply has no owner (design gap = nowhere to file it).
 1. **2-page batch overlap** (`BATCH_OVERLAP_PAGES = 2`): windows step by 4, so
    every interior page appears in TWO calls with full context — any split ≤2
    pages is seen WHOLE in at least one call. Cost: ~+50% calls/book (~60→~90,
-   far under the 950/day cap). Not "just bigger batches": page count per call
+   far under the 1400/day self-brake; free tier is ~1500 RPD per project plus a
+   ~15 RPM per-minute cap, so burst 429s now get a 65s backoff retry before the
+   run is declared over). Not "just bigger batches": page count per call
    stays 6.
 2. **Idempotent merge for tables** (dedupe by markdown) — overlap re-extraction
    can no longer duplicate tables.
