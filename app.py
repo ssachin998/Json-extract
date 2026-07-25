@@ -134,6 +134,23 @@ PAGE = """
     </form>
   </details>
 
+  <details class="bg-white rounded-lg shadow p-4">
+    <summary class="text-sm font-semibold cursor-pointer">Recovery mode — heal specific pages (missing solutions etc.)</summary>
+    <form action="/recover" method="POST" class="space-y-3 mt-3">
+      <div>
+        <label class="block text-sm font-semibold mb-1">Recovery plan (JSON)</label>
+        <textarea name="plan" rows="6" class="w-full text-xs font-mono border p-2 rounded">{
+  "PSY-016": {"pages": [214, 217], "reason": "recitation batch loss"},
+  "PSY-001": {"pages": [17], "reason": "missing solution for q13"}
+}</textarea>
+        <p class="text-xs text-gray-500">Pages = true PDF file page numbers (see orphans.jsonl / unmatched image filenames). Renders ±1 neighbour page for context. Never overwrites existing text; only fills what is missing.</p>
+      </div>
+      <button class="w-full bg-indigo-600 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        Run recovery
+      </button>
+    </form>
+  </details>
+
   <div class="bg-black text-green-400 text-xs rounded-lg p-3 h-64 overflow-y-auto font-mono" id="log">
     {% for line in state.log %}{{ line }}<br>{% endfor %}
   </div>
@@ -271,6 +288,53 @@ def run():
     with state_lock:
         state["status"] = "processing"
     t = threading.Thread(target=run_pipeline_thread, args=(subject_code, pdf_path, page_offset))
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
+
+RECOVERY_PLAN_PATH = Path("./recovery_plan.json")
+
+@app.route("/recover", methods=["POST"])
+def recover():
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    plan_text = request.form.get("plan", "").strip()
+    if not plan_text:
+        return "No plan provided", 400
+    import json as _json
+    try:
+        plan = _json.loads(plan_text)
+        assert isinstance(plan, dict) and plan, "plan must be a non-empty object"
+        for cid, spec in plan.items():
+            assert isinstance(spec.get("pages"), list) and spec["pages"], \
+                f"{cid}: needs a non-empty 'pages' list"
+    except (ValueError, AssertionError) as e:
+        return f"Invalid plan JSON: {e}", 400
+    RECOVERY_PLAN_PATH.write_text(plan_text)
+    with state_lock:
+        state["status"] = "processing"
+
+    def _do_recover():
+        try:
+            log(f"🩹 Recovery started for: {', '.join(plan)}")
+            pipeline.recover_pages(str(RECOVERY_PLAN_PATH))
+            with state_lock:
+                state["status"] = "completed"
+            log("🩹 Recovery finished. Download zip to inspect healed rows.")
+            make_zip()
+        except SystemExit:
+            with state_lock:
+                state["status"] = "paused"
+            log("⏸ Recovery paused at Gemini daily limit -- run it again tomorrow.")
+            make_zip()
+        except Exception as e:
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = str(e)
+            log(f"❌ Recovery error: {e}")
+            traceback.print_exc()
+
+    t = threading.Thread(target=_do_recover)
     t.daemon = True
     t.start()
     return redirect(url_for("index"))
