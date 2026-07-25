@@ -81,6 +81,9 @@ BATCH_OVERLAP_PAGES = 2         # consecutive batches share 2 pages, so a
                                  # least one call -- see ROOT_CAUSE_ANALYSIS.md
                                  # RC-3. Step size = 6-2 = 4 new pages/call.
                                  # Merge by q_no makes re-extraction idempotent.
+TARGETED_RETRY_MAX_ROUNDS = 2   # after a chapter's normal pass, up to this many
+                                 # small focused re-asks for answer/options fields
+                                 # still missing (merged from target_retry_patch.py)
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # confirmed working model from your bot's config
 
 IMG_PATH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}-\d{3}-\d{3}_[A-Z]+(_[A-Z])?_\d{2}\.webp$")
@@ -405,6 +408,174 @@ def retry_batch_page_by_page(model, batch, state):
     save_state(state)
     print(f"  [INFO] single-page retry: {recovered}/{len(batch)} pages recovered")
     return items
+
+# ============================================================
+# FEATURE: targeted gap-retry (run AFTER normal batches + orphan
+# recovery, BEFORE writing the chapter's questions to disk)
+#
+# WHY: even with full page context in one call, Gemini sometimes drops a
+# few fields out of a large batch (proven: a 17-row answer-key table fully
+# visible in a single call still came back missing rows 9-13; a single
+# question's 4 options fully visible on one page came back with only 3).
+# This isn't a batching/context bug -- it's the model's own per-call error
+# rate on dense extraction tasks. The fix: after the normal pass, check
+# what's STILL missing and ask again with a MUCH smaller, narrowly-scoped
+# prompt (just the specific gaps) -- small focused asks are consistently
+# more accurate than "extract everything on these 6 pages at once".
+#
+# (Merged in from target_retry_patch.py: config TARGETED_RETRY_MAX_ROUNDS
+# sits beside the other constants; the call site is in process_pdf right
+# after orphan recovery and before the chapter write loop.)
+# ============================================================
+
+def find_incomplete_records(chapter_records):
+    """
+    Returns [(q_no, missing_fields), ...] for records worth retrying.
+
+    Deliberately does NOT flag a missing solution_text by itself as
+    retry-worthy: some MCQ books print an answer key with no explanation
+    for some questions (that's a source-content gap, not an extraction
+    bug) -- retrying those would waste calls chasing content that was
+    never there. Only "answer" and "options" are treated as near-certain
+    extraction misses, since every real MCQ has exactly 4 options and one
+    marked correct answer somewhere in the book.
+    """
+    incomplete = []
+    for qn, rec in chapter_records.items():
+        if not rec.get("question_text"):
+            continue  # nothing to anchor a retry to
+        missing = []
+        if not rec.get("correct_option"):
+            missing.append("answer")
+        if not rec.get("options") or len(rec["options"]) < 4:
+            missing.append("options")
+        if missing:
+            incomplete.append((qn, missing))
+    return incomplete
+
+
+def build_targeted_retry_prompt(incomplete_items, chapter_records):
+    lines = [
+        "You already extracted most of this chapter's questions from these "
+        "pages. A few specific pieces are still missing. Look at these SAME "
+        "pages again, very carefully, and find ONLY the missing pieces listed "
+        "below. Do not re-output anything else.",
+        "",
+        "Return a JSON array. Each element:",
+        '{"q_no": <int>, "correct_option": "A"|"B"|"C"|"D"|null, '
+        '"options": {"A":"...","B":"...","C":"...","D":"..."} | null}',
+        "Only fill the field(s) actually requested for that q_no; leave the "
+        "other field null. If you genuinely cannot find a piece anywhere in "
+        "these pages, leave it null rather than guessing.",
+        "",
+        "MISSING PIECES TO FIND:",
+    ]
+    for qn, missing in incomplete_items:
+        rec = chapter_records[qn]
+        qtext = (rec.get("question_text") or "")[:120]
+        block = [f"Question {qn} (\"{qtext}...\"):"]
+        if "answer" in missing:
+            block.append(
+                f"  - Find the CORRECT OPTION LETTER for question {qn}. Check "
+                f"any Answer Key table (a Question No. -> Correct Option table, "
+                f"which may span two pages) for the row matching {qn}."
+            )
+        if "options" in missing:
+            have = sorted((rec.get("options") or {}).keys())
+            block.append(
+                f"  - Find ALL 4 options (A/B/C/D) for question {qn}. "
+                f"Already captured: {have or 'none'}. Find the missing letter(s)."
+            )
+        lines.append("\n".join(block))
+    return "\n".join(lines)
+
+
+def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
+    """
+    Up to `max_rounds` small, focused re-asks for whatever answer/option
+    fields are still missing after normal processing. Sends the chapter's
+    full page set again each round (simple and robust -- we don't track
+    per-field page provenance) but with a MUCH smaller ask, which is what
+    actually improves accuracy, not the page count. Stops early if a round
+    makes no progress (no point burning quota repeating the same miss).
+    Returns the total number of fields filled.
+    """
+    total_fixed = 0
+    for round_no in range(1, max_rounds + 1):
+        incomplete = find_incomplete_records(chapter_records)
+        if not incomplete:
+            break
+
+        reset_daily_counter_if_needed(state)
+        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+            print("  [RETRY] daily call limit reached -- stopping retries for now")
+            break
+
+        preview = ", ".join(f"q{qn}" for qn, _ in incomplete[:10])
+        if len(incomplete) > 10:
+            preview += ", ..."
+        print(f"  [RETRY] round {round_no}: {len(incomplete)} question(s) still "
+              f"incomplete ({preview}) -- sending targeted re-ask")
+
+        prompt = build_targeted_retry_prompt(incomplete, chapter_records)
+        try:
+            parts = [prompt] + [Image.open(p) for p in page_files]
+            resp = model.generate_content(
+                parts, safety_settings=SAFETY_SETTINGS,
+                request_options={"retry": None},
+            )
+            state["calls_today"] += 1
+            save_state(state)
+            if not resp.candidates:
+                print("  [RETRY] empty/blocked response -- skipping this round")
+                continue
+            text = resp.text.strip()
+            text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
+            fixes = json.loads(text)
+        except Exception as e:
+            print(f"  [RETRY] call failed: {e} -- skipping this round")
+            continue
+
+        fixed_this_round = 0
+        for fix in fixes:
+            try:
+                qn = int(fix.get("q_no"))
+            except (TypeError, ValueError):
+                continue
+            rec = chapter_records.get(qn)
+            if rec is None:
+                continue
+            if fix.get("correct_option") and not rec.get("correct_option"):
+                rec["correct_option"] = str(fix["correct_option"]).strip().upper()
+                fixed_this_round += 1
+            if fix.get("options"):
+                rec["options"] = rec.get("options") or {}
+                before = len(rec["options"])
+                for k, v in fix["options"].items():
+                    if v:  # don't let a null/empty value overwrite nothing-useful
+                        rec["options"].setdefault(str(k).strip().upper(), v)
+                if len(rec["options"]) > before:
+                    fixed_this_round += 1
+
+        print(f"  [RETRY] round {round_no}: filled {fixed_this_round} field(s)")
+        total_fixed += fixed_this_round
+        if fixed_this_round == 0:
+            print("  [RETRY] no progress this round -- stopping (remaining gaps "
+                  "will be logged, not re-tried, to avoid wasting quota)")
+            break
+
+    # whatever's STILL missing after all rounds -- log it, don't hide it
+    still_incomplete = find_incomplete_records(chapter_records)
+    if still_incomplete:
+        path = DATA_DIR / "still_incomplete_after_retry.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)  # same guard as save_state/_append_jsonl (fresh volume)
+        with open(path, "a", encoding="utf-8") as f:
+            for qn, missing in still_incomplete:
+                f.write(json.dumps({"q_no": qn, "missing": missing}, ensure_ascii=False) + "\n")
+        print(f"  [RETRY] {len(still_incomplete)} question(s) still incomplete after "
+              f"{max_rounds} round(s) -- logged to still_incomplete_after_retry.jsonl")
+
+    return total_fixed
 
 # ============================================================
 # FEATURE 2 — carry-forward context (Gemini's API is stateless:
@@ -908,6 +1079,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
                               {"subject": subject, "chapter_id": chapter_id,
                                "page": um["page"], "files": um["files"]})
+
+        # FEATURE: targeted gap-retry -- AFTER normal batches + orphan
+        # recovery, BEFORE writing the chapter's questions to disk.
+        n_fixed = targeted_retry(genai_model, page_files, chapter_records,
+                                 state, max_rounds=TARGETED_RETRY_MAX_ROUNDS)
+        if n_fixed:
+            print(f"  [RETRY] closed {n_fixed} field(s) via targeted retry")
 
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
