@@ -37,6 +37,23 @@ def log(msg):
         if len(state["log"]) > 500:
             state["log"].pop(0)
 
+def run_validator_and_log():
+    """Zero-token deterministic validation; every flag printed to the
+    dashboard log box so no terminal is needed. Returns the report dict."""
+    import qbank_validator
+    rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False)
+    s = rep["summary"]
+    log(f"🧪 Validator: {s['flags_total']} flag(s) across "
+        f"{s['flagged_chapters']}/{s['chapters']} chapters ({s['questions']} questions)")
+    for kind, n in sorted(s.get("flags_by_kind", {}).items(), key=lambda kv: -kv[1]):
+        log(f"   • {kind}: {n}")
+    for cid, flags in (rep.get("chapters") or {}).items():
+        for f in flags:
+            log(f"   [{f.get('severity', '?')}] {cid} {f.get('q_no') or '-'} "
+                f"{f.get('kind')}: {str(f.get('detail', ''))[:100]}")
+    log("🧪 Full report -> data/validation_report.json (inside the zip)")
+    return rep
+
 def run_pipeline_thread(subject_code, pdf_path, page_offset):
     with state_lock:
         state["status"] = "processing"
@@ -101,6 +118,21 @@ PAGE = """
     <p class="text-sm mb-2">Status: <span class="font-semibold">{{ state.status }}</span></p>
     {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
     <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">Download results (.zip)</a>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-2 border-amber-400 space-y-2">
+    <p class="text-xs font-bold text-amber-700 uppercase">Maintenance — no terminal needed</p>
+    <form action="/fix" method="POST">
+      <button class="w-full bg-amber-500 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        🩹 Fix data (heal known defects)
+      </button>
+    </form>
+    <form action="/validate" method="POST">
+      <button class="w-full bg-sky-600 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        🔍 Check data (validator report)
+      </button>
+    </form>
+    <p class="text-xs text-gray-500">Tap <b>Fix</b> first (auto backup, safe to tap again), then <b>Check</b>. Every flag appears in the black log box below — screenshot it and send it.</p>
   </div>
 
   <div class="bg-white rounded-lg shadow p-4 border-2 border-emerald-500 space-y-3">
@@ -346,6 +378,92 @@ def recover():
             traceback.print_exc()
 
     t = threading.Thread(target=_do_recover)
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
+
+@app.route("/fix", methods=["POST"])
+def fix():
+    """Button-only heal of known run-4 defects (fix_output.patch_all).
+    Evidence-gated + idempotent, timestamped backup + archive before write."""
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    with state_lock:
+        state["status"] = "processing"
+
+    def _do_fix():
+        try:
+            import json as _json
+            import time as _time
+            import fix_output
+            q = fix_output.QUESTIONS
+            if not q.exists():
+                log(f"❌ {q} not found on the Volume -- nothing to fix")
+                with state_lock:
+                    state["status"] = "failed"
+                    state["error"] = "questions.jsonl not found"
+                return
+            rows = [_json.loads(l) for l in q.read_text(encoding="utf-8").splitlines() if l.strip()]
+            log(f"🩹 Fix pass on {len(rows)} questions ...")
+            assets_q = fix_output.OUTPUT_ROOT / "assets" / "questions"
+            rows, actions, archive = fix_output.patch_all(rows, assets_q)
+            n_apply = 0
+            for pid, st, detail in actions:
+                if st == "APPLY":
+                    n_apply += 1
+                log(f"   [{st}] {pid}: {detail}")
+            if n_apply:
+                backup = q.with_suffix(f".bak-{_time.strftime('%Y%m%d-%H%M%S')}")
+                backup.write_text(q.read_text(encoding="utf-8"), encoding="utf-8")
+                tmp = q.with_suffix(".tmp")
+                tmp.write_text("\n".join(_json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                               encoding="utf-8")
+                os.replace(tmp, q)
+                if archive:
+                    with open(fix_output.ARCHIVE_LOG, "a", encoding="utf-8") as fh:
+                        for a in archive:
+                            fh.write(_json.dumps(a, ensure_ascii=False) + "\n")
+                log(f"✅ {n_apply} heal(s) written. Backup -> {backup.name}, "
+                    f"original fragments archived.")
+            else:
+                log("✅ Nothing to heal -- data already clean (all patches skipped).")
+            run_validator_and_log()
+            with state_lock:
+                state["status"] = "completed"
+            make_zip()
+        except Exception as e:
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = str(e)
+            log(f"❌ Fix error: {e}")
+            traceback.print_exc()
+
+    t = threading.Thread(target=_do_fix)
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
+
+@app.route("/validate", methods=["POST"])
+def validate():
+    """Button-only re-check: fresh validation_report.json + flags in the log."""
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    with state_lock:
+        state["status"] = "processing"
+
+    def _do_validate():
+        try:
+            run_validator_and_log()
+            with state_lock:
+                state["status"] = "completed"
+        except Exception as e:
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = str(e)
+            log(f"❌ Validate error: {e}")
+            traceback.print_exc()
+
+    t = threading.Thread(target=_do_validate)
     t.daemon = True
     t.start()
     return redirect(url_for("index"))
