@@ -30,9 +30,7 @@ python3 qbank_pipeline.py
 automatically from state.json)
 """
 
-import base64
 import difflib
-import io
 import json
 import os
 import re
@@ -675,7 +673,7 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
 
 
 def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
-                   force_solution_qns=None):
+                   force_solution_qns=None, chapter_id=None):
     """
     Up to `max_rounds` small, focused re-asks for whatever answer/option
     fields are still missing after normal processing. Sends the chapter's
@@ -785,7 +783,8 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
         path.parent.mkdir(parents=True, exist_ok=True)  # same guard as save_state/_append_jsonl (fresh volume)
         with open(path, "a", encoding="utf-8") as f:
             for qn, missing in still_incomplete:
-                f.write(json.dumps({"q_no": qn, "missing": missing}, ensure_ascii=False) + "\n")
+                f.write(json.dumps({"q_no": qn, "missing": missing, "chapter_id": chapter_id},
+                                   ensure_ascii=False) + "\n")
         print(f"  [RETRY] {len(still_incomplete)} question(s) still incomplete after "
               f"{max_rounds} round(s) -- logged to still_incomplete_after_retry.jsonl")
 
@@ -1353,8 +1352,14 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                       f"{filled_by_key} answer(s) filled, {len(key_rows) - filled_by_key - len(unknown_qn)} "
                       f"row(s) verified against existing answers -- consumed")
                 continue
+            # ENTIRELY foreign key (every row references another chapter's
+            # q_nos): STOP here. Falling through to rules 1-4 would let this
+            # key's table glue onto a local record via carry/last-qn merge.
             print(f"  [ORPHAN] answer-key table references q_nos outside this chapter "
-                  f"({unknown_qn}) -- kept for review")
+                  f"({unknown_qn}) -- kept for review, NOT merged anywhere")
+            remaining.append({**orph, "blocked_reason": "foreign answer key (all rows "
+                              "reference q_nos not in this chapter)"})
+            continue
 
         # ---- rule 0b: duplicate scrap consume (run-4 audit: both content
         # orphans in PSY-006 were re-extractions of records that ALREADY
@@ -2147,11 +2152,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
 
         # FEATURE 3 -- orphan recovery runs BEFORE image claiming and JSON
         # writing: recovered fragments can complete solutions/options, and
-        # only genuinely ownerless orphans are persisted.
+        # only genuinely ownerless orphans are persisted (after the drain's
+        # second recovery -- persisting early wrote "unresolved" entries for
+        # fragments the drain later healed).
         orphans = recover_orphans(orphans, chapter_records, subject, ch["chapter_no"], stats)
         stats["orphans_remaining"] = len(orphans)
-        for orph in orphans:
-            _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
 
         # SECOND PASS image claiming: a figure can be extracted BEFORE the
         # batch that introduces its owning question (plate printed just before
@@ -2184,27 +2189,30 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
                 qt, st = (rec.get("question_text") or "").lower(), (rec.get("solution_text") or "").lower()
                 side = "question" if ("fig" in qt or "diagram" in qt or not st) else "solution"
-                other = "solution" if side == "question" else "question"
-                kind = "Q" if side == "question" else "SOL"
                 if not entry[side]:
                     qid = f"{subject}-{ch['chapter_no']:03d}-{qn:03d}"
-                    renamed = []
-                    ok = True
-                    for i, old_rel in enumerate(um["files"], 1):
-                        old_path = ASSETS_DIR / "questions" / old_rel
-                        if not old_path.exists():
-                            ok = False
-                            break
-                        new_name = f"{qid}_{kind}_{i:02d}.webp"
-                        new_rel = f"{subject}/{new_name}"
-                        old_path.rename(ASSETS_DIR / "questions" / subject / new_name)
-                        renamed.append(new_rel)
-                    if ok and renamed:
-                        entry[side] = renamed
-                        um["matched"] = True
-                        print(f"  [INFO] third pass: page {um['page']} image(s) attached to {qid} "
-                              f"(sole printed question on that page, {side} side)")
-                    elif not ok:
+                    # _rename_for_slot: collision-proof suffixing (two pages can
+                    # print the same q_no across a page break), the
+                    # MAX_QUESTION_IMAGES cap, and the tiny-crop guard -- the old
+                    # hand-rolled rename here bypassed all three (overwrite risk).
+                    consumed = []  # (old_rel, new_rel)
+                    for old_rel in list(um["files"]):
+                        new_rel = _rename_for_slot(old_rel, qn, side, subject,
+                                                   ch["chapter_no"], image_files_by_q)
+                        if new_rel:
+                            consumed.append((old_rel, new_rel))
+                    if consumed:
+                        entry[side].extend(nr for _, nr in consumed)
+                        done = {o for o, _ in consumed}
+                        um["files"] = [f for f in um["files"] if f not in done]
+                        um["matched"] = not um["files"]
+                        if um["matched"]:
+                            print(f"  [INFO] third pass: page {um['page']} image(s) attached to {qid} "
+                                  f"(sole printed question on that page, {side} side)")
+                        else:
+                            print(f"  [INFO] third pass: page {um['page']}: {len(consumed)} image(s) "
+                                  f"attached to {qid}; rest refused by guards -- left for review")
+                    else:
                         print(f"  [WARN] third pass: rename failed for page {um['page']} "
                               f"-- left unmatched (file already moved earlier?)")
             elif qns:
@@ -2294,6 +2302,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 save_state(state)
             print(f"  [DRAIN] second chance: {len(healed)}/{len(pending_failed)} previously-failed page(s) recovered")
 
+        # persist only the FINAL unresolved orphans (after the drain's second
+        # recovery pass) -- never ledger entries the drain later healed.
+        for orph in orphans:
+            _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
+
         # INTEGRITY SWEEP: zero-token deterministic proofs (run-4 audit RCA:
         # duplicated wrong-owner stems, foreign 'Option' heads, truncated
         # solutions, over-attributed images) BEFORE targeted retry, so
@@ -2305,7 +2318,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         # recovery, BEFORE writing the chapter's questions to disk.
         n_fixed = targeted_retry(genai_model, page_files, chapter_records,
                                  state, max_rounds=TARGETED_RETRY_MAX_ROUNDS,
-                                 force_solution_qns=forced_solution_qns)
+                                 force_solution_qns=forced_solution_qns,
+                                 chapter_id=chapter_id)
         if n_fixed:
             print(f"  [RETRY] closed {n_fixed} field(s) via targeted retry")
 
@@ -2434,8 +2448,18 @@ def recover_pages(plan_path):
         for win_start in range(0, len(page_files), PAGES_PER_GEMINI_CALL):
             batch = page_files[win_start:win_start + PAGES_PER_GEMINI_CALL]
             window_pages = [int(p.stem.split("-")[-1]) for p in batch]
+            reset_daily_counter_if_needed(state)
+            if state["calls_today"] >= MAX_CALLS_PER_DAY:
+                print("Daily Gemini call limit reached during recovery. Saving, exiting.")
+                save_state(state)
+                sys.exit(0)
             try:
                 raw = call_gemini_on_pages(model, batch, context=RECOVERY_CONTEXT)
+                # quota accounting: recovery's direct calls used to bypass
+                # calls_today (only the fallback retries counted) -- a long
+                # recovery could overshoot the per-day cap blind.
+                state["calls_today"] += 1
+                save_state(state)
             except Exception as e:
                 print(f"  [WARN] recovery call failed for {chapter_id} pages "
                       f"{window_pages}: {e}")
@@ -2486,6 +2510,18 @@ def recover_pages(plan_path):
         orphans = recover_orphans(orphans, records, subject, chapter_no, stats)
         for orph in orphans:
             _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
+
+        # Close the healing loop: without this, a recovery could never fix a
+        # TRUNCATED solution (merges are fill-only, and production's sweep-
+        # forced re-ask lives only in process_pdf). Detection only -- the
+        # sweep's destructive parts are skipped here because the recovery
+        # page window is narrower than a full chapter pass.
+        forced = {qn for qn, r in records.items()
+                  if (r.get("solution_text") or "").strip()
+                  and looks_truncated_solution(r["solution_text"],
+                                               has_tables=bool(r.get("tables")))}
+        targeted_retry(model, page_files, records, state,
+                       force_solution_qns=forced, chapter_id=chapter_id)
         for um in unmatched_images:
             rec_leftover = claim_page_images_one_to_one(um["files"], pdf_path, um["page"],
                                                         subject, chapter_no,
@@ -2511,10 +2547,8 @@ def recover_pages(plan_path):
         n_no_answer = sum(1 for r in records.values() if not r.get("correct_option"))
         print(f"[RECOVER] {chapter_id} done -> {len(records)} questions "
               f"({n_no_answer} missing answer, {n_no_solution} missing solution)"
-              f" | rows kept: {len(records) - len(chapter_lines) + len(chapter_lines)}"
               f" | conflicts dropped: {stats['conflicts']}"
-              f" | orphans unresolved: {len(orphans)}"
-              f" | state.json untouched")
+              f" | orphans unresolved: {len(orphans)}")
 
     print("[RECOVER] all planned chapters processed.")
 

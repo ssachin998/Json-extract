@@ -300,7 +300,7 @@ def run_url():
 
     def download_then_run():
         try:
-            log(f"⬇️ Downloading PDF from link...")
+            log("⬇️ Downloading PDF from link...")
             # secure_filename: a hostile/odd URL tail like "../../x" must not
             # be able to write outside ./pdfs
             fname = secure_filename(pdf_url.split("/")[-1].split("?")[0]) or f"{subject_code}.pdf"
@@ -622,7 +622,7 @@ def restore_drive():
         try:
             import html as _html
             out = Path(OUTPUT_ROOT_ENV)
-            log(f"♻️ Restore started -- reading Drive folder listing ...")
+            log("♻️ Restore started -- reading Drive folder listing ...")
             lst = requests.get(f"https://drive.google.com/embeddedfolderview?id={folder_id}#list",
                                timeout=60, headers={"User-Agent": "Mozilla/5.0"})
             lst.raise_for_status()
