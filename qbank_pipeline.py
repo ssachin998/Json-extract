@@ -465,8 +465,15 @@ def find_incomplete_records(chapter_records):
     """
     incomplete = []
     for qn, rec in chapter_records.items():
-        if not rec.get("question_text"):
-            continue  # nothing to anchor a retry to
+        if not (rec.get("question_text") or "").strip():
+            # Stem-less records USED to be skipped here ("nothing to anchor a
+            # retry to") -- wrong: a present solution_text/correct_option IS
+            # the anchor. The stem and its own solution never share lexical
+            # overlap, but the solution names the question it explains, and
+            # Gemini can walk back from it (Gap-1: PSY-001-003).
+            if (rec.get("solution_text") or "").strip() or rec.get("correct_option"):
+                incomplete.append((qn, ["question"]))
+            continue  # truly anchorless scraps stay ineligible
         missing = []
         if not rec.get("correct_option"):
             missing.append("answer")
@@ -497,7 +504,7 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
         "below. Do not re-output anything else.",
         "",
         "Return a JSON array. Each element:",
-        '{"q_no": <int>, "correct_option": "A"|"B"|"C"|"D"|null, '
+        '{"q_no": <int>, "question_text": "..."|null, "correct_option": "A"|"B"|"C"|"D"|null, '
         '"options": {"A":"...","B":"...","C":"...","D":"..."} | null, '
         '"solution_text": "..." | null}',
         "Only fill the field(s) actually requested for that q_no; leave the "
@@ -510,6 +517,16 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
         rec = chapter_records[qn]
         qtext = (rec.get("question_text") or "")[:120]
         block = [f"Question {qn} (\"{qtext}...\"):"]
+        if "question" in missing:
+            sol_anchor = (rec.get("solution_text") or "")[:150]
+            ans_anchor = rec.get("correct_option")
+            anchor_desc = (f'its printed solution begins "{sol_anchor}..."' if sol_anchor
+                           else f"its marked correct option is {ans_anchor}")
+            block.append(
+                f"  - Find the FULL VERBATIM question stem AND all 4 options "
+                f"(A/B/C/D) for question {qn}. Anchor: {anchor_desc}. Locate "
+                f"the question that solution belongs to, on these SAME pages."
+            )
         if "answer" in missing:
             block.append(
                 f"  - Find the CORRECT OPTION LETTER for question {qn}. Check "
@@ -599,6 +616,9 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
             rec = chapter_records.get(qn)
             if rec is None:
                 continue
+            if fix.get("question_text") and not (rec.get("question_text") or "").strip():
+                rec["question_text"] = str(fix["question_text"]).strip()
+                fixed_this_round += 1
             if fix.get("correct_option") and not rec.get("correct_option"):
                 rec["correct_option"] = str(fix["correct_option"]).strip().upper()
                 fixed_this_round += 1
@@ -877,6 +897,18 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                     owner, reason = last_qn, "options continuation"
                 elif item.get("question_text") and not rec.get("question_text"):
                     owner, reason = last_qn, "question continuation"
+        # ---- rule 4: positional certainty (Gap-1). An orphan carrying the
+        # STEM (+options) can only belong to a record that is MISSING its
+        # stem. Text-similarity between a stem and its own solution is
+        # always ~0 (they never overlap lexically), so similarity-based
+        # matching provably fails here (prod: PSY-001-003 stayed stemless
+        # with answer+solution intact). When the chapter has EXACTLY ONE
+        # stem-less record, position alone is the proof.
+        if owner is None and item.get("question_text") and item.get("options"):
+            stemless = [qn for qn, r in chapter_records.items()
+                        if not (r.get("question_text") or "").strip()]
+            if len(stemless) == 1:
+                owner, reason = stemless[0], "question+options fallback (chapter's sole stem-less record)"
         if owner is None:
             print(f"  [ORPHAN] Could not determine owner: page={page} kept in orphans.jsonl")
             remaining.append(orph)
@@ -906,6 +938,61 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
         if "carry-forward" in reason:
             stats["carry_merges"] += 1
     return remaining
+
+IMAGE_ATTRIBUTION_PROMPT = """This image was extracted from one page of a medical MCQ chapter.
+
+The chapter's questions are listed below (q_no: first words of stem):
+{Q_LIST}
+
+Look at the image and decide: does it BELONG to one of these questions
+(a figure, diagram, chart, table, or clinical image that the question or
+its solution refers to)?
+
+Return ONE JSON object only:
+{"q_no": <int>|null, "slot": "question"|"solution"|null, "decorative": true|false}
+- q_no: the question this image belongs to. null if it belongs to none.
+- slot: "question" if the figure appears with/above the stem, "solution" if
+  it appears in the explanation region. null if q_no is null.
+- decorative: true ONLY if you are confident this is decoration/unrelated to
+  any question (portrait, logo, ornament, watermark, cover art, chapter icon).
+Never guess a number. When unsure between decorative and a weak match,
+prefer {"q_no": null, "decorative": true}.
+"""
+
+
+def attribute_orphan_image(model, rel_path, chapter_records, state):
+    """FINAL safety net (Gap-2): one image, one call, one verdict. Never
+    grouped -- a single image per call removes cross-image confusion.
+    Returns (verdict_dict | None). Quota-brake-safe: returns
+    {"decorative": "brake"} when the daily limit is hit so the caller can
+    stop and persist instead of guessing."""
+    reset_daily_counter_if_needed(state)
+    if state["calls_today"] >= MAX_CALLS_PER_DAY:
+        print("  [IMG] daily call limit reached during image attribution -- leftovers stay queued")
+        return {"decorative": "brake"}
+    q_list = "\n".join(
+        f"q{qn}: {(chapter_records[qn].get('question_text') or '')[:80]}"
+        for qn in sorted(chapter_records)
+    ) or "(no question text available)"
+    prompt = IMAGE_ATTRIBUTION_PROMPT.replace("{Q_LIST}", q_list)
+    img_file = ASSETS_DIR / "questions" / rel_path
+    try:
+        resp = model.generate_content(
+            [prompt, Image.open(img_file)],
+            safety_settings=SAFETY_SETTINGS,
+            request_options={"retry": None},
+        )
+        state["calls_today"] += 1
+        save_state(state)
+        if not resp.candidates:
+            return None
+        text = resp.text.strip()
+        text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"  [IMG] attribution call failed for {rel_path}: {e}")
+        return None
+
 
 # ============================================================
 # STEP 4: merge partial results (a question's text might be on one
@@ -1043,45 +1130,164 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
 # MAIN DRIVER
 # ============================================================
 
-def claim_images_for_question(imgs, subject, chapter_no, chapter_records, image_files_by_q):
-    """Attach one page's extracted images to the first question Gemini flagged
-    as needing a figure (question OR solution) that doesn't have one of that
-    kind yet. Returns True if claimed.
+def _mat_mult(m1, m2):
+    """2D affine composition CTM' = M1 x M2 (PDF row-vector convention)."""
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return (a1 * a2 + b1 * c2, a1 * b2 + b1 * d2,
+            c1 * a2 + d1 * c2, c1 * b2 + d1 * d2,
+            e1 * a2 + f1 * c2 + e2, e1 * b2 + f1 * d2 + f2)
 
-    NOTE: simple heuristic -- with multiple figures/flagged questions per page,
-    review the mapping manually.
 
-    LOCKED structure: ALL figure types live together in
-    assets/questions/{SUBJECT}/ -- one folder per subject, type is told only
-    by the filename suffix:
-      {id}_Q_01.webp  {id}_SOL_01.webp  {id}_OPT_A_01.webp  {id}_TABLE_01.webp
-    Do NOT create assets/solutions/, assets/options/ or assets/tables/ --
-    the app relies on this convention."""
-    for qn, rec in chapter_records.items():
+def image_positions_on_page(pdf_path, file_page):
+    """Best-effort map {image object idnum -> (y, draw_index)} for every
+    image XObject drawn on a page, by walking the content stream and
+    tracking the cm matrix before each `Do`. y = height from page bottom
+    (PDF origin), so LARGER y == HIGHER on the page. Returns {} on any
+    parse hiccup -- callers then fall back to plain reading order."""
+    positions = {}
+    try:
+        page = PdfReader(pdf_path).pages[file_page - 1]
+        xobjs = _page_xobjects(page)
+        names = {str(name): ref for name, ref in xobjs.items()}
+        contents = page.get_contents()
+        if contents is None:
+            return {}
+        data = contents.get_data() if hasattr(contents, "get_data") else None
+        if not data:
+            return {}
+        import zlib
+        try:
+            data = zlib.decompress(data)
+        except Exception:
+            pass
+        # tokenize the small subset we care about: q, Q, cm, Do
+        tokens = re.findall(rb"/[^\s\[\]()<>{}/%]+|\([^)]*\)|\[[^\]]*\]|"
+                            rb"[-+]?\d*\.?\d+|[A-Za-z'\"]+", data)
+        ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        stack = []
+        num_buf = []
+        draw_idx = 0
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t == b"q":
+                stack.append(ctm)
+            elif t == b"Q":
+                ctm = stack.pop() if stack else ctm
+            elif t == b"cm" and len(num_buf) >= 6:
+                m = tuple(float(x) for x in num_buf[-6:])
+                ctm = _mat_mult(m, ctm)
+                num_buf = []
+            elif t == b"Do" and num_buf:
+                name = num_buf[-1].decode("latin-1")
+                if name in names:
+                    obj = _resolve(names[name])
+                    if obj.get("/Subtype") == "/Image":
+                        oid = getattr(names[name], "idnum", None)
+                        key = oid if oid is not None else name
+                        positions[key] = (ctm[5], draw_idx)
+                        draw_idx += 1
+                num_buf = []
+            i += 1
+            if t not in (b"q", b"Q", b"cm", b"Do"):
+                if t.startswith(b"/") or re.fullmatch(rb"[-+]?\d*\.?\d+", t):
+                    num_buf.append(t)
+                else:
+                    num_buf = []
+        return positions
+    except Exception:
+        return {}
+
+
+def pending_image_slots(chapter_records, image_files_by_q):
+    """Chapter's needy image slots in APPEARANCE order: q_no ascending, and
+    within one question its question-side figure precedes its solution-side
+    figure (that's the physical reading order in MCQ books)."""
+    slots = []
+    for qn in sorted(chapter_records):
+        rec = chapter_records[qn]
         entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
-        needs_q_img = rec.get("has_figure_in_question") and not entry["question"]
-        needs_sol_img = rec.get("has_figure_in_solution") and not entry["solution"]
-        if not (needs_q_img or needs_sol_img):
+        if rec.get("has_figure_in_question") and not entry["question"]:
+            slots.append((qn, "question"))
+        if rec.get("has_figure_in_solution") and not entry["solution"]:
+            slots.append((qn, "solution"))
+    return slots
+
+
+def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q):
+    """Rename one extracted temp image into the locked convention for the
+    given (q_no, "question"|"solution") slot. kind letter: Q or SOL.
+    Returns the new rel path or None."""
+    old_path = ASSETS_DIR / "questions" / rel
+    if not old_path.exists():
+        print(f"  [WARN] {rel} missing at rename time -- skipping (alias/dup ref)")
+        return None
+    qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
+    entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+    letter = "Q" if kind == "question" else "SOL"
+    idx = len(entry[kind]) + 1
+    new_name = f"{qid}_{letter}_{idx:02d}.webp"
+    new_rel = f"{subject}/{new_name}"
+    old_path.rename(ASSETS_DIR / "questions" / subject / new_name)
+    return new_rel
+
+
+def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
+                                 chapter_records, image_files_by_q):
+    """Gap-2 core matcher: distribute one page's N extracted images across
+    the chapter's needy slots ONE-TO-ONE, in reading order: images sorted
+    top->bottom by their drawn y-position (positions parsed from the PDF
+    content stream; falls back to resource order), slots in appearance order
+    (pending_image_slots). Returns the list of files STILL unclaimed.
+    With 0 or 1 needy slot, degenerates to the old greedy behavior (all
+    page images go to that one slot) -- which is correct for a page whose
+    images all belong to a single question."""
+    slots = pending_image_slots(chapter_records, image_files_by_q)
+    if not slots:
+        return list(imgs)
+    if len(slots) == 1 or len(imgs) == 1:
+        qn, kind = slots[0]
+        entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+        leftover = []
+        for rel in imgs:
+            # append IMMEDIATELY after each rename: _rename_for_slot derives
+            # the _01/_02/... suffix from len(entry[kind]), so deferring the
+            # append would hand the same filename to every image on this
+            # page and silently overwrite them (caught by tests).
+            new_rel = _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q)
+            if new_rel:
+                entry[kind].append(new_rel)
+            else:
+                leftover.append(rel)
+        return leftover
+    # N images, M>=2 slots: position-ordered one-to-one
+    pos = image_positions_on_page(pdf_path, file_page)
+
+    def order_key(rel):
+        try:
+            oid = int(Path(rel).stem.rsplit("-", 1)[-1])
+        except (ValueError, IndexError):
+            oid = None
+        y, didx = pos.get(oid, (None, 10**6))
+        return (-(y if y is not None else float("-inf")), didx)
+
+    ordered_imgs = sorted(imgs, key=order_key)
+    leftover = []
+    for i, rel in enumerate(ordered_imgs):
+        if i >= len(slots):
+            leftover.append(rel)
             continue
-        kind = "Q" if needs_q_img else "SOL"
-        qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
-        renamed = []
-        for old_rel in imgs:
-            old_path = ASSETS_DIR / "questions" / old_rel
-            if not old_path.exists():
-                # never let one bad path kill the whole run
-                print(f"  [WARN] {old_rel} missing at rename time "
-                      f"-- skipping (leftover alias/dup ref)")
-                continue
-            idx = len(renamed) + 1
-            new_name = f"{qid}_{kind}_{idx:02d}.webp"
-            new_rel = f"{subject}/{new_name}"
-            new_path = ASSETS_DIR / "questions" / subject / new_name
-            old_path.rename(new_path)
-            renamed.append(new_rel)
-        entry["question" if kind == "Q" else "solution"] = renamed
-        return True  # this page's image(s) assigned; don't hand to a later question
-    return False
+        qn, kind = slots[i]
+        new_rel = _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q)
+        if new_rel:
+            image_files_by_q.setdefault(qn, {"question": [], "solution": []})[kind].append(new_rel)
+            qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
+            print(f"  [IMG] one-to-one: {rel} -> {qid} ({kind} slot #{i + 1})")
+        else:
+            leftover.append(rel)
+    return leftover
+
 
 def _append_jsonl(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1231,9 +1437,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
                 if not imgs:
                     continue
-                if not claim_images_for_question(imgs, subject, ch["chapter_no"], chapter_records, image_files_by_q):
-                    unmatched_images.append({"page": file_page_num, "files": imgs})
-                    print(f"  [INFO] Page {file_page_num}: image(s) {imgs} unclaimed for now "
+                leftover = claim_page_images_one_to_one(imgs, pdf_path, file_page_num, subject,
+                                                        ch["chapter_no"], chapter_records, image_files_by_q)
+                if leftover:
+                    unmatched_images.append({"page": file_page_num, "files": leftover})
+                    print(f"  [INFO] Page {file_page_num}: image(s) {leftover} unclaimed for now "
                           f"-- will retry after all batches (owner may be in a later batch)")
 
         # FEATURE 3 -- orphan recovery runs BEFORE image claiming and JSON
@@ -1250,7 +1458,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         # records are complete now -- retry every leftover once.
         n_unmatched = 0
         for um in unmatched_images:
-            if claim_images_for_question(um["files"], subject, ch["chapter_no"], chapter_records, image_files_by_q):
+            leftover2 = claim_page_images_one_to_one(um["files"], pdf_path, um["page"],
+                                                     subject, ch["chapter_no"],
+                                                     chapter_records, image_files_by_q)
+            um["files"] = leftover2
+            if not leftover2:
                 print(f"  [INFO] second pass: page {um['page']} image(s) matched to a question")
                 um["matched"] = True
                 continue
@@ -1297,6 +1509,59 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             elif qns:
                 print(f"  [INFO] third pass: page {um['page']} has {len(qns)} printed questions "
                       f"{qns} -- ambiguous owner, left for manual review")
+        # FOURTH pass (Gemini, ONE image per call, never grouped): the final
+        # safety net (Gap-2). The model attributes each leftover image to a
+        # printed q_no (with a question/solution slot), or confidently marks
+        # it decorative. Only files the model could not decide on (call
+        # failure / null verdict / number not in this chapter) -- or files
+        # left when the daily quota brake fires -- stay unmatched.
+        for um in unmatched_images:
+            if um.get("matched"):
+                continue
+            still, brake_hit = [], False
+            for rel in um["files"]:
+                if brake_hit:
+                    still.append(rel)
+                    continue
+                verdict = attribute_orphan_image(genai_model, rel, chapter_records, state)
+                if verdict and verdict.get("decorative") == "brake":
+                    brake_hit = True
+                    still.append(rel)
+                    continue
+                if not verdict:
+                    still.append(rel)   # undecided / call failed -> manual review
+                    continue
+                if verdict.get("decorative") is True:
+                    print(f"  [IMG] fourth pass: page {um['page']} {rel} is decorative/unrelated "
+                          f"(model-confirmed) -- logged to decorative_images.jsonl")
+                    _append_jsonl(DATA_DIR / "decorative_images.jsonl",
+                                  {"subject": subject, "chapter_id": chapter_id,
+                                   "page": um["page"], "file": rel,
+                                   "reason": "model-confirmed decorative/unrelated"})
+                    continue
+                qn_attr = verdict.get("q_no")
+                if isinstance(qn_attr, bool) or not isinstance(qn_attr, int) \
+                        or qn_attr not in chapter_records:
+                    still.append(rel)   # weak/no match the model wouldn't stand behind
+                    continue
+                slot = verdict.get("slot")
+                if slot not in ("question", "solution"):
+                    slot = "question"
+                new_rel = _rename_for_slot(rel, qn_attr, slot, subject, ch["chapter_no"],
+                                           image_files_by_q)
+                if new_rel:
+                    image_files_by_q.setdefault(qn_attr, {"question": [], "solution": []})[slot].append(new_rel)
+                    qid = f"{subject}-{ch['chapter_no']:03d}-{qn_attr:03d}"
+                    print(f"  [IMG] fourth pass: page {um['page']} {rel} -> {qid} "
+                          f"({slot} side, model-attributed)")
+                else:
+                    still.append(rel)
+            um["files"] = still
+            if not still:
+                um["matched"] = True
+            elif brake_hit:
+                print(f"  [WARN] image attribution stopped early (daily quota) -- "
+                      f"{len(still)} file(s) from page {um['page']} stay queued")
         for um in unmatched_images:
             if not um.get("matched"):
                 n_unmatched += 1
@@ -1481,19 +1746,24 @@ def recover_pages(plan_path):
                 pages_imaged.add(file_page_num)
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id,
                                            subject, ASSETS_DIR / "questions")
-                if imgs and not claim_images_for_question(imgs, subject, chapter_no,
-                                                          records, image_files_by_q):
-                    unmatched_images.append({"page": file_page_num, "files": imgs})
+                if imgs:
+                    rec_leftover = claim_page_images_one_to_one(imgs, pdf_path, file_page_num,
+                                                                subject, chapter_no,
+                                                                records, image_files_by_q)
+                    if rec_leftover:
+                        unmatched_images.append({"page": file_page_num, "files": rec_leftover})
 
         orphans = recover_orphans(orphans, records, subject, chapter_no, stats)
         for orph in orphans:
             _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
         for um in unmatched_images:
-            if not claim_images_for_question(um["files"], subject, chapter_no,
-                                             records, image_files_by_q):
+            rec_leftover = claim_page_images_one_to_one(um["files"], pdf_path, um["page"],
+                                                        subject, chapter_no,
+                                                        records, image_files_by_q)
+            if rec_leftover:
                 _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
                               {"subject": subject, "chapter_id": chapter_id,
-                               "page": um["page"], "files": um["files"]})
+                               "page": um["page"], "files": rec_leftover})
 
         # rewrite questions.jsonl: keep other chapters' rows, replace this one
         others = [q for q in all_lines if q.get("chapter_id") != chapter_id]
