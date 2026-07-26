@@ -183,3 +183,100 @@ Recovery path for the already-damaged chapters (needs state surgery, do after
 the book finishes): remove PSY-001/004/012/016 (and 006/011/032 ONLY if the
 visual RC-4 check shows explanations DO exist) from `chapters_done`, delete their
 lines from questions.jsonl, re-run. The new code re-extracts with overlap+retry.
+
+--------------------------------------------------------------------------------
+## Run-4 audit RCA (2026-07-26 full-output audit) — wrong-owner, truncation,
+## image & orphan classes; fixes shipped in this changeset
+
+Evidence: final questions.jsonl (434 rows), validation_report.json (63 flags),
+orphans.jsonl (7), run-4 log. Every class below now has a deterministic
+PREVENTION in the pipeline and/or a DETECTOR in the validator.
+
+### A4-1 — Wrong-owner stem (PSY-012-001 carried PSY-012-013's chart stem) **[PROVEN]**
+Two batches extracted q1 with different stems (log: "question text for q1 differs
+between batches (similarity 0.25)"); the merge let LAST WRITE WIN silently. The
+record's own solution described a different (mania) patient -> duplicate_text
+flag (similarity 1.000) and a confusing same-stem/two-answers pair.
+**Fix:** merge-time STEM CONFLICT resolver -- keeps the variant whose text
+coheres with the record's OWN options+solution (_stem_payload_coherence);
+undecidable conflicts keep the first variant AND both variants go to
+data/stem_conflicts.jsonl (never a silent pick again). fill_only mode never
+overwrites. Plus chapter_integrity_sweep strips a provably-wrong duplicate stem
+pre-retry so targeted retry (Gap-1 anchor) refills it in the SAME run.
+Validator duplicate_text now reports suspect_id via the same coherence score.
+
+### A4-2 — Foreign "Option X:" fragment glued onto a solution head (PSY-009-007) **[PROVEN]**
+An orphan fragment beginning "Option C: Catharsis is..." (belonging to
+PSY-009-006's explanation tail) was appended to PSY-009-007's solution by the
+carry-forward owner rule. Owner option C is "Dementia with Lewy bodies" -- the
+fragment provably cannot belong.
+**Fix:** _foreign_option_line guard in recover_orphans: an "Option X:"-headed
+solution fragment only merges when the owner's option X text appears in the
+fragment head; blocked fragments stay in orphans.jsonl with blocked_reason.
+Sweep additionally strips such a head when the SAME line exists verbatim on
+another record of the chapter (stray-duplicate proof); otherwise it flags for
+review and destroys nothing. Validator: foreign_option_head (HIGH).
+
+### A4-3 — Truncated solutions (PSY-023-007 mid-word "• During ", PSY-006-009 "criteria:") **[PROVEN]**
+**Fix:** looks_truncated_solution (dangling connector/colon, raw trailing
+space after a word = mid-flow cut, short-and-bare) drives the integrity sweep's
+forced re-ask list; targeted_retry REPLACES a forced record's solution only
+with a LONGER verbatim re-ask; the still-incomplete log re-judges live (a
+healed record is not logged as missing). The validator's noisy
+"ends-without-terminal-punctuation" heuristic (53/55 false positives against
+this book's bullet endings) is replaced by the same strict patterns, and now
+also catches short_bare_solution (LOW), solution_header_furniture (LOW,
+"Solution to Question N:" leading), solution_recitation_dump (HIGH).
+
+### A4-4 — Options polluted by neighbouring explanation prose (PSY-008-007) **[PROVEN]**
+Options A/B/D held CAGE/CHAT/GAD explanation sentences; the real options are
+visible in the record's own solution option-lines. **Fix:** validator
+option_solution_disagree (HIGH): a solution "Option X" line whose following
+segment shares no tokens with the row's option X text. fix_output.py P2 heals
+the shipped row from its own solution lines (verbatim).
+
+### A4-5 — Recitation-block dumps inside a solution (PSY-032-003; header leaks 032-001/002) **[PROVEN]**
+**Fix:** sanitize_solution_text at build_final_question: strips leading
+"Solution to Question N:" furniture and truncates an embedded header ONLY
+when the chunk immediately after it restates this solution's own earlier
+content (dump proof); anything else is kept and reported, never destroyed.
+Validator flags both kinds.
+
+### A4-6 — Broken/tiny figures shipped (PSY-003-014_Q_01 = 414 bytes) **[PROVEN]**
+A sub-1.5KB webp cannot hold a real MCQ figure. **Fix:** _rename_for_slot
+refuses auto-claim of < MIN_IMAGE_BYTES (the leftover goes to the model
+fourth-pass, which decides on actual content); build_final_question drops
+missing/tiny refs so a broken figure can never ship. Validator:
+suspicious_tiny_image (HIGH).
+
+### A4-7 — Over-attributed images (PSY-022-003: SEVEN question-side figures) **[PROVEN]**
+Each individual model attribution was reasonable; the SUM was nonsense.
+**Fix:** MAX_QUESTION_IMAGES=3 cap inside _rename_for_slot (covers the greedy,
+one-to-one, third-pass and fourth-pass paths at one choke point); the sweep
+trims older rows' excess to unmatched_images.jsonl. Validator:
+over_attributed_images (LOW).
+
+### A4-8 — Duplicate tables inside one solution (PSY-012-008 x2, PSY-009-005 x3) **[PROVEN]**
+Overlap re-reads with squished source whitespace bypassed the exact-key
+dedupe. **Fix:** build_final_question dedupes by whitespace-insensitive
+markdown key; validator duplicate_table (LOW).
+
+### A4-9 — Orphan ledger noise (5 answer-key tables + 2 duplicate scraps) **[REFUTED as data loss]**
+All 7 run-4 orphans were benign: five printed answer keys whose rows were
+already filled (73/73 rows across 11 key-checked chapters matched the output),
+one stem dup of PSY-006-013, one options dup of PSY-006-007.
+**Fix:** recover_orphans consumes fully-verified keys (0 new fills) instead of
+persisting them, consumes verbatim duplicate scraps, and writes
+answer_key_disagrees rows to data/integrity_flags.jsonl (free wrong-answer
+alarm). Keys referencing q_nos outside the chapter are still kept.
+
+### A4-10 — Answer-key table parked in a random question's solution (cosmetic)
+005-014, 009-001, 011-030, 017-001, 021-001, 030-001. Harmless (it is the
+book's printed key; we used it as ground truth). Validator:
+stray_answer_key_table (LOW, informational).
+
+### Page-by-page PDF-vs-JSON QA (user request)
+The hybrid validator's stage-2 witness (--audit) enumerates every printed
+question/component per chapter pages and CODE diffs it against the JSONL --
+that IS the page-by-page comparison; it now also diffs the figure component
+(a figure the witness saw but JSON lacks -> audit_component_missing).

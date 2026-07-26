@@ -58,6 +58,30 @@ SUSPECT_DENSITY_MULT = 3.0       # ...or 3x book median, whichever triggers firs
 
 HIGH, LOW = "high", "low"
 
+# run-4 audit mirrors of the pipeline guards (kept module-local: this file is
+# deliberately isolated from qbank_pipeline's import graph).
+MIN_IMAGE_BYTES = 1500        # <1.5KB webp = broken crop (PSY-003-014 shipped 414B)
+MAX_QUESTION_IMAGES = 3       # >3 question-side figures = over-attribution suspect
+DANGLING_END_RE = re.compile(r"(:|\u2014|\u2013|\u2022)\s*$")
+TERMINAL_PUNCT = ".!?)\"'\u201d\u00bb"
+OPTION_LINE_START_RE = re.compile(r"^\s*Option\s+([A-D])\b\s*[:.)]\s*", re.IGNORECASE)
+OPTION_LINE_ANY_RE = re.compile(r"Option\s+([A-D])\b\s*[:.)]", re.IGNORECASE)
+SOLUTION_TO_Q_RE = re.compile(r"Solution\s+to\s+Question\s+(\d{1,3})", re.IGNORECASE)
+
+
+def _payload_coherence(stem, row):
+    """Share of stem tokens present in the row's own options+solution (which
+    side of a duplicate pair owns the stem). Mirrors the pipeline resolver."""
+    toks = [t for t in re.findall(r"\w+", (stem or "").lower()) if len(t) > 2]
+    payload = " ".join(filter(None, [
+        (row.get("solution") or {}).get("text") or "",
+        " ".join(str(o.get("text") or "") for o in row.get("options") or []),
+    ]))
+    ptoks = set(re.findall(r"\w+", payload.lower()))
+    if not toks or not ptoks:
+        return 0.0
+    return sum(1 for t in toks if t in ptoks) / len(toks)
+
 
 # ============================================================
 # small helpers
@@ -138,23 +162,112 @@ def check_row(row, assets_questions):
     elif any(str(c).strip().upper() not in opt_ids for c in correct):
         flags.append(flag(cid, "answer_mismatch",
                           f"{row.get('id')}: correct option {correct} not among option ids {sorted(opt_ids)}", qn))
-    sol_text = (sol.get("text") or "").strip()
-    if not sol_text:
+    sol_text = (sol.get("text") or "")
+    sol_strip = sol_text.strip()
+    if not sol_strip:
         flags.append(flag(cid, "missing_solution", f"{row.get('id')}: empty solution text", qn))
     else:
         s = sol_text.rstrip()
-        # weak truncation heuristic: ends mid-flow (no terminal punctuation)
-        # and no table/figure carries the explanation.
-        if s[-1] not in ".!?)\"'”»:" and not sol.get("tables") and not sol.get("images"):
+        # REAL truncation only (run-4 audit: the old 'no terminal punctuation'
+        # heuristic produced ~53 false positives against this book's
+        # bullet-list endings; only 2 of 55 flags were real). Patterns kept:
+        # dangling connector ends ('...criteria:', '...--'), raw trailing
+        # space after a word (stream cut mid-flow: '...• During ').
+        if DANGLING_END_RE.search(s):
             flags.append(flag(cid, "truncated_solution",
-                              f"{row.get('id')}: solution ends without terminal punctuation (...{s[-40:]!r})",
+                              f"{row.get('id')}: solution ends on a dangling connector (...{s[-50:]!r})", qn))
+        elif sol_text != s and re.search(r"[A-Za-z0-9]$", s) and s[-1] not in TERMINAL_PUNCT:
+            flags.append(flag(cid, "truncated_solution",
+                              f"{row.get('id')}: solution cut mid-flow (ends ...{s[-50:]!r} + trailing space)", qn))
+        elif len(s) < 60 and s[-1] not in TERMINAL_PUNCT \
+                and not sol.get("tables") and not sol.get("images"):
+            flags.append(flag(cid, "short_bare_solution",
+                              f"{row.get('id')}: very short solution, no table/figure (...{s[-40:]!r})",
                               qn, LOW))
+        # print-furniture / recitation dumps (PSY-032-001/002/003)
+        m_hd = SOLUTION_TO_Q_RE.search(sol_text)
+        if m_hd:
+            if m_hd.start() <= 2:
+                flags.append(flag(cid, "solution_header_furniture",
+                                  f"{row.get('id')}: solution begins with 'Solution to Question N' header",
+                                  qn, LOW))
+            else:
+                flags.append(flag(cid, "solution_recitation_dump",
+                                  f"{row.get('id')}: embedded 'Solution to Question {m_hd.group(1)}' "
+                                  f"header mid-solution -- possible whole-block dump", qn))
+        # foreign 'Option X:' head (PSY-009-007): the line cannot belong to
+        # this row's own options.
+        m_opt = OPTION_LINE_START_RE.match(sol_strip)
+        opt_map = {str(o.get("id", "")).strip().upper(): str(o.get("text") or "") for o in opts}
+        if m_opt:
+            o_text = opt_map.get(m_opt.group(1).upper())
+            if o_text is not None:
+                otoks = [t for t in re.findall(r"\w+", o_text.lower()) if len(t) > 2]
+                if otoks:
+                    head = " ".join(re.findall(r"\w+", sol_strip.lower())[:25])
+                    if sum(1 for t in otoks[:6] if t in head) == 0:
+                        flags.append(flag(cid, "foreign_option_head",
+                                          f"{row.get('id')}: solution starts with an 'Option "
+                                          f"{m_opt.group(1).upper()}' line that does not match its own "
+                                          f"option ({o_text[:60]!r}) -- wrong-owner fragment", qn))
+        # option<->solution disagreement (PSY-008-007): the solution explains
+        # 'Option X' with content that never matches the row's option X text
+        # (row options polluted by neighboring explanations).
+        disagree = []
+        for m in OPTION_LINE_ANY_RE.finditer(sol_text):
+            letter = m.group(1).upper()
+            o_text = opt_map.get(letter)
+            if not o_text:
+                continue
+            otoks = [t for t in re.findall(r"\w+", o_text.lower()) if len(t) > 2]
+            if len(otoks) < 3:
+                continue
+            seg = sol_text[m.end():m.end() + 200].lower()
+            if sum(1 for t in otoks[:6] if t in seg) == 0:
+                disagree.append(letter)
+        if disagree:
+            flags.append(flag(cid, "option_solution_disagree",
+                              f"{row.get('id')}: solution's 'Option {sorted(set(disagree))}' lines do not "
+                              f"describe the row's own option texts -- options likely polluted", qn))
+    # image refs: missing, or suspiciously tiny (broken crop shipped)
     for side in ("question", "solution"):
         for img in (row.get(side) or {}).get("images") or []:
             fpath = (img or {}).get("file")
-            if fpath and not (Path(assets_questions) / fpath).exists():
+            if not fpath:
+                continue
+            fobj = Path(assets_questions) / fpath
+            if not fobj.exists():
                 flags.append(flag(cid, "image_ref_missing",
                                   f"{row.get('id')}: {side} image not on disk: {fpath}", qn))
+            elif fobj.stat().st_size < MIN_IMAGE_BYTES:
+                flags.append(flag(cid, "suspicious_tiny_image",
+                                  f"{row.get('id')}: {side} image only {fobj.stat().st_size}B "
+                                  f"(< {MIN_IMAGE_BYTES}) -- likely a broken crop: {fpath}", qn))
+    if len((row.get("question") or {}).get("images") or []) > MAX_QUESTION_IMAGES:
+        flags.append(flag(cid, "over_attributed_images",
+                          f"{row.get('id')}: {len(row['question']['images'])} question-side images "
+                          f"(> {MAX_QUESTION_IMAGES}) -- over-attribution suspect", qn, LOW))
+    # duplicate tables inside one solution (PSY-012-008/009-005)
+    tbls = sol.get("tables") or []
+    seen_tbl, dup_tbl = set(), 0
+    for t in tbls:
+        key = re.sub(r"\s+", "", str(t.get("markdown") or "").lower())
+        if key and key in seen_tbl:
+            dup_tbl += 1
+        if key:
+            seen_tbl.add(key)
+    if dup_tbl:
+        flags.append(flag(cid, "duplicate_table",
+                          f"{row.get('id')}: {dup_tbl} duplicate table(s) inside one solution", qn, LOW))
+    # stray printed answer-key table parked in a random solution (info only;
+    # harmless but useful ground truth for key cross-checks)
+    for t in tbls:
+        md = str(t.get("markdown") or "")
+        if "answer" in str(t.get("type", "")).lower() and "Correct Option" in md:
+            flags.append(flag(cid, "stray_answer_key_table",
+                              f"{row.get('id')}: solution embeds the printed Answer Key table "
+                              f"(informational; used for key cross-checks)", qn, LOW))
+            break
     return flags
 
 
@@ -181,9 +294,20 @@ def check_chapter(chapter_id, rows):
                 continue  # real duplicates are near-equal length
             sim = SequenceMatcher(None, t_a[:400], t_b[:400]).ratio()
             if sim >= 0.95:
+                row_a = next((r for r in rows if r.get("id") == id_a), {})
+                row_b = next((r for r in rows if r.get("id") == id_b), {})
+                ca, cb = _payload_coherence(t_a, row_a), _payload_coherence(t_b, row_b)
+                # the wrong-owner copy is the side whose OTHER payload
+                # (solution/options/answer) never mentions the shared stem
+                # (run-4: PSY-012-001 carried 012-013's stem with a mania
+                # solution -- coherence 0 vs the true owner).
+                suspect = id_a if ca < cb else id_b
                 flags.append(flag(chapter_id, "duplicate_text",
-                                  f"{id_a} ~ {id_b} (similarity {sim:.3f})",
-                                  _as_int(id_b.rsplit("-", 1)[-1]), similarity=round(sim, 3)))
+                                  f"{id_a} ~ {id_b} (similarity {sim:.3f}); "
+                                  f"payload coherence {ca:.2f} vs {cb:.2f} -- {suspect} is the "
+                                  f"wrong-owner suspect (its solution describes a different stem)",
+                                  _as_int(suspect.rsplit("-", 1)[-1]), similarity=round(sim, 3),
+                                  suspect_id=suspect))
 
     qns = sorted({q_no_of(r) for r in rows if q_no_of(r) is not None})
     if qns:
@@ -345,6 +469,10 @@ def diff_witness(witness, rows, suppress_components=()):
             flags.append(flag(cid, "audit_component_missing",
                               f"witness saw 4 options for q{n}; JSON has {len(row.get('options') or [])}",
                               n, source="audit"))
+        if c.get("figure") and not (row.get("question") or {}).get("images") \
+                and not (row.get("solution") or {}).get("images"):
+            flags.append(flag(cid, "audit_component_missing",
+                              f"witness saw a figure for q{n}; JSON has no image attached", n, source="audit"))
     return flags
 
 

@@ -449,9 +449,128 @@ def retry_batch_page_by_page(model, batch, state, ctx=None):
 # after orphan recovery and before the chapter write loop.)
 # ============================================================
 
-def find_incomplete_records(chapter_records):
+def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_no, stats):
+    """Zero-token deterministic pre-retry sweep (run-4 audit RCA classes).
+    Runs BEFORE targeted retry so provably-wrong/provably-incomplete fields
+    are re-asked in the SAME run instead of shipping. Never destroys content
+    without a deterministic proof; every action is written to
+    data/integrity_flags.jsonl. Returns the set of q_nos whose solutions
+    look truncated (handed to the retry as forced solution re-asks)."""
+    forced_solution, flags = set(), []
+
+    def iflag(kind, qn, detail, matched=True, **extra):
+        entry = {"kind": kind, "q_no": qn, "chapter_id": f"{subject}-{chapter_no:03d}",
+                 "detail": detail, "matched": matched}
+        entry.update(extra)
+        flags.append(entry)
+        _append_jsonl(DATA_DIR / "integrity_flags.jsonl", entry)
+
+    # 1. duplicate-stem pairs (012-001 class): identical/near-identical stems
+    #    on two records of one chapter. The record whose stem does NOT cohere
+    #    with its own payload is the wrong-owner copy -- strip its stem so
+    #    the retry's Gap-1 anchor refills it from the pages.
+    qns = sorted(chapter_records)
+    stems = {qn: (chapter_records[qn].get("question_text") or "").strip() for qn in qns}
+    for i, qa in enumerate(qns):
+        for qb in qns[i + 1:]:
+            ta, tb = stems.get(qa) or "", stems.get(qb) or ""
+            if not ta or not tb or min(len(ta), len(tb)) < 80:
+                continue
+            sim = difflib.SequenceMatcher(None, ta[:400], tb[:400]).ratio()
+            if sim < 0.95:
+                continue
+            ca = _stem_payload_coherence(ta, chapter_records[qa])
+            cb = _stem_payload_coherence(tb, chapter_records[qb])
+            if abs(ca - cb) >= STEM_COHERENCE_MARGIN:
+                loser, winner = (qa, qb) if ca < cb else (qb, qa)
+                chapter_records[loser]["question_text"] = None
+                stems[loser] = ""
+                stats["dup_stems_stripped"] = stats.get("dup_stems_stripped", 0) + 1
+                iflag("duplicate_stem_stripped", loser,
+                      f"stem duplicated q{winner} (sim {sim:.2f}) but coherence "
+                      f"{min(ca, cb):.2f} vs winner {max(ca, cb):.2f} -- stripped, retry refills",
+                      winner=winner, similarity=round(sim, 3))
+                print(f"  [SWEEP] q{loser}: stem duplicated q{winner} with worse "
+                      f"payload coherence -- stripped for same-run retry")
+            else:
+                iflag("duplicate_stem_review", qb,
+                      f"stem near-duplicates q{qa} (sim {sim:.2f}); coherence tie "
+                      f"({ca:.2f} vs {cb:.2f}) -- needs review", matched=False)
+                print(f"  [WARN] [SWEEP] q{qa}~q{qb}: near-duplicate stems, coherence "
+                      f"undecidable -- logged for review, no data touched")
+
+    # 2. foreign 'Option X:' line glued at a solution's head (009-007 class):
+    #    strip it ONLY when the same line already exists verbatim on another
+    #    record of this chapter (proves it is a stray duplicate, not content
+    #    this question alone owns). Otherwise flag, keep text, retry nothing.
+    for qn in qns:
+        sol = (chapter_records[qn].get("solution_text") or "").strip()
+        if not _foreign_option_line(sol, chapter_records[qn]):
+            continue
+        head_line = sol.splitlines()[0].strip()
+        dup_elsewhere = any(other != qn and head_line
+                            and head_line in (chapter_records[other].get("solution_text") or "")
+                            for other in qns)
+        if dup_elsewhere:
+            chapter_records[qn]["solution_text"] = sol[len(sol.splitlines()[0]):].lstrip("\n ")
+            stats["foreign_heads_stripped"] = stats.get("foreign_heads_stripped", 0) + 1
+            iflag("foreign_option_head_stripped", qn,
+                  f"solution began with a foreign 'Option' line that exists verbatim "
+                  f"on another record -- stripped: {head_line[:120]!r}")
+            print(f"  [SWEEP] q{qn}: stripped foreign 'Option' head (verbatim dup elsewhere)")
+        else:
+            iflag("foreign_option_head_review", qn,
+                  f"solution begins with an 'Option' line its own options cannot own "
+                  f"-- kept (unique), needs review: {head_line[:120]!r}", matched=False)
+            print(f"  [WARN] [SWEEP] q{qn}: foreign 'Option' head but no verbatim donor "
+                  f"-- kept, logged for review")
+
+    # 3. truncated-solution suspects (023-007/006-009 class): deterministic
+    #    dangling-end / mid-flow-cut patterns -- re-ask the FULL solution.
+    for qn in qns:
+        rec = chapter_records[qn]
+        sol = (rec.get("solution_text") or "")
+        if not sol.strip():
+            continue
+        entry = image_files_by_q.get(qn, {"question": [], "solution": []})
+        if looks_truncated_solution(sol, has_tables=bool(rec.get("tables")),
+                                    has_images=bool(entry.get("solution"))):
+            forced_solution.add(qn)
+            iflag("truncated_solution_retry", qn,
+                  f"solution looks truncated (...{sol.rstrip()[-50:]!r}) -- forced re-ask")
+            print(f"  [SWEEP] q{qn}: solution looks truncated -- targeted retry will re-ask it")
+
+    # 4. over-attributed question images (022-003 class, rows healed by the
+    #    recovery path where the rename-time cap never ran).
+    for qn in qns:
+        entry = image_files_by_q.get(qn)
+        if not entry or len(entry.get("question") or []) <= MAX_QUESTION_IMAGES:
+            continue
+        extras = entry["question"][MAX_QUESTION_IMAGES:]
+        del entry["question"][MAX_QUESTION_IMAGES:]
+        _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
+                      {"subject": subject, "chapter_id": f"{subject}-{chapter_no:03d}",
+                       "page": None, "files": extras,
+                       "reason": f"over-attribution sweep (> {MAX_QUESTION_IMAGES} question "
+                                 f"images on one question) -- de-referenced for review"})
+        iflag("question_images_trimmed", qn,
+              f"had {len(extras) + MAX_QUESTION_IMAGES} question images; kept first "
+              f"{MAX_QUESTION_IMAGES}, de-referenced {len(extras)}")
+        print(f"  [SWEEP] q{qn}: de-referenced {len(extras)} over-attributed question "
+              f"image(s) -- logged to unmatched_images.jsonl")
+
+    if flags:
+        stats["integrity_flags"] = stats.get("integrity_flags", 0) + len(flags)
+    return forced_solution
+
+
+def find_incomplete_records(chapter_records, force_solution_qns=()):
     """
     Returns [(q_no, missing_fields), ...] for records worth retrying.
+
+    force_solution_qns: q_nos whose non-empty solutions the integrity sweep
+    judged truncated -- re-asked like a missing solution regardless of the
+    60% gate (the book provably printed SOMETHING here; we hold a fragment).
 
     "answer" and "options" gaps are always retry-worthy: every real MCQ has
     4 options and one marked answer somewhere in the book.
@@ -485,12 +604,16 @@ def find_incomplete_records(chapter_records):
     n = len(chapter_records)
     n_with_sol = sum(1 for r in chapter_records.values() if (r.get("solution_text") or "").strip())
     book_prints_solutions = n > 0 and n_with_sol / n >= SOLUTION_GATE_MIN_SHARE
-    if book_prints_solutions:
+    forced = set(force_solution_qns or ())
+    if book_prints_solutions or forced:
         by_qn = {qn: missing for qn, missing in incomplete}
         for qn, rec in chapter_records.items():
-            if rec.get("question_text") and not (rec.get("solution_text") or "").strip():
+            truncated = qn in forced and (rec.get("solution_text") or "").strip()
+            if rec.get("question_text") and (not (rec.get("solution_text") or "").strip()
+                                             and book_prints_solutions or truncated):
                 if qn in by_qn:
-                    by_qn[qn].append("solution")
+                    if "solution" not in by_qn[qn]:
+                        by_qn[qn].append("solution")
                 else:
                     incomplete.append((qn, ["solution"]))
     return incomplete
@@ -551,7 +674,8 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
     return "\n".join(lines)
 
 
-def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
+def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
+                   force_solution_qns=None):
     """
     Up to `max_rounds` small, focused re-asks for whatever answer/option
     fields are still missing after normal processing. Sends the chapter's
@@ -559,12 +683,15 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
     per-field page provenance) but with a MUCH smaller ask, which is what
     actually improves accuracy, not the page count. Stops early if a round
     makes no progress (no point burning quota repeating the same miss).
+    force_solution_qns: integrity-sweep verdicts -- those records' non-empty
+    solutions are REPLACED by a longer verbatim re-ask (truncated heal).
     Returns the total number of fields filled.
     """
     total_fixed = 0
     first_check = True
+    forced = set(force_solution_qns or ())
     for round_no in range(1, max_rounds + 1):
-        incomplete = find_incomplete_records(chapter_records)
+        incomplete = find_incomplete_records(chapter_records, force_solution_qns=forced)
         if not incomplete:
             if first_check:
                 # never exit silently again (run-2 learning: "retry skipped"
@@ -620,7 +747,11 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
             if fix.get("correct_option") and not rec.get("correct_option"):
                 rec["correct_option"] = str(fix["correct_option"]).strip().upper()
                 fixed_this_round += 1
-            if fix.get("solution_text") and not (rec.get("solution_text") or "").strip():
+            sol_existing = (rec.get("solution_text") or "").strip()
+            if fix.get("solution_text") and (
+                    not sol_existing
+                    or (qn in forced
+                        and len(str(fix["solution_text"]).strip()) > len(sol_existing))):
                 rec["solution_text"] = str(fix["solution_text"]).strip()
                 fixed_this_round += 1
             if fix.get("options"):
@@ -639,8 +770,16 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
                   "will be logged, not re-tried, to avoid wasting quota)")
             break
 
-    # whatever's STILL missing after all rounds -- log it, don't hide it
-    still_incomplete = find_incomplete_records(chapter_records)
+    # whatever's STILL missing after all rounds -- log it, don't hide it.
+    # Forced (truncated) items are re-judged LIVE here: a healed solution
+    # must not stay logged as missing just because the sweep's verdict came
+    # before this round's fix landed.
+    live_forced = {qn for qn in forced
+                   if qn in chapter_records
+                   and looks_truncated_solution(
+                       (chapter_records[qn].get("solution_text") or ""),
+                       has_tables=bool(chapter_records[qn].get("tables")))}
+    still_incomplete = find_incomplete_records(chapter_records, force_solution_qns=live_forced)
     if still_incomplete:
         path = DATA_DIR / "still_incomplete_after_retry.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)  # same guard as save_state/_append_jsonl (fresh volume)
@@ -986,6 +1125,79 @@ SECTION_HEADING_RE = re.compile(
     r"(detailed\s+explanations?|answer\s*keys?|answers?\s+(?:and|&)\s+explanations?|"
     r"explanations?|answers?)\s*[.:\-–]?\s*$", re.IGNORECASE)
 
+# --- run-4 audit RCA guards (2026-07-26 full-output audit; see
+# ROOT_CAUSE_ANALYSIS.md "Run-4 audit" section). Deterministic, zero-token:
+MAX_QUESTION_IMAGES = 3       # >3 question-side figures on ONE question is almost
+                              # certainly wrong-owner attribution (PSY-022-003
+                              # collected SEVEN via repeated model-confirmed passes).
+MIN_IMAGE_BYTES = 1500        # <1.5 KB webp is virtually always an empty/broken crop
+                              # (PSY-003-014_Q_01 was 414 bytes of nothing and shipped).
+STEM_COHERENCE_MARGIN = 0.15  # stem-conflict resolver: stem<->payload coherence scores
+                              # must differ by at least this to decide automatically;
+                              # below it both variants are logged for review (no silent picks).
+DANGLING_END_RE = re.compile(r"(:|\u2014|\u2013|\u2022)\s*$")   # ends ':' / em/en-dash / bullet
+OPTION_LINE_START_RE = re.compile(r"^\s*Option\s+([A-D])\b\s*[:.)]\s*", re.IGNORECASE)
+
+TERMINAL_PUNCT = ".!?)\"'\u201d\u00bb"
+
+
+def looks_truncated_solution(text, has_tables=False, has_images=False):
+    """REAL truncation patterns only (replaces the weak 'no terminal punct'
+    heuristic that produced ~53 false positives against this book's
+    bullet-list endings). Detects:
+      - dangling connector endings  ('...criteria:', '...given below --')
+      - raw trailing space after a word (stream cut mid-flow: '...• During ')
+      - suspiciously short AND bare (no table/figure carrying the rest)
+    """
+    t = (text or "")
+    s = t.rstrip()
+    if not s:
+        return False
+    if DANGLING_END_RE.search(s):
+        return True
+    if t != s and re.search(r"[A-Za-z0-9]$", s) and s[-1] not in TERMINAL_PUNCT:
+        return True
+    if len(s) < 60 and s[-1] not in TERMINAL_PUNCT and not (has_tables or has_images):
+        return True
+    return False
+
+
+def _stem_payload_coherence(stem, rec):
+    """Share of stem word-tokens present in the record's OWN options+solution.
+    A stem is explained by its own solution, so the right stem for a record
+    coheres with the record's payload (run-4: PSY-012-001 kept PSY-012-013's
+    chart stem while its solution described a mania vignette -- coherence
+    0 vs the real stem)."""
+    toks = [t for t in re.findall(r"\w+", (stem or "").lower()) if len(t) > 2]
+    payload = " ".join(filter(None, [
+        rec.get("solution_text") or "",
+        " ".join(str(v) for v in (rec.get("options") or {}).values()),
+    ]))
+    ptoks = set(re.findall(r"\w+", payload.lower()))
+    if not toks or not ptoks:
+        return 0.0
+    return sum(1 for t in toks if t in ptoks) / len(toks)
+
+
+def _foreign_option_line(frag, rec):
+    """Wrong-owner guard for solution fragments that BEGIN with an
+    'Option X:' explanation (run-4: PSY-009-007 got PSY-009-006's
+    'Option C: Catharsis...' line glued on top). A legitimate
+    'Option X:' continuation names the OWNER's option X content; a
+    foreign one does not."""
+    m = OPTION_LINE_START_RE.match(frag or "")
+    if not m:
+        return False
+    letter = m.group(1).upper()
+    opt_text = (rec.get("options") or {}).get(letter)
+    if opt_text is None:
+        return True   # owner has no such option -> provably foreign
+    otoks = [t for t in re.findall(r"\w+", str(opt_text).lower()) if len(t) > 2]
+    if not otoks:
+        return False
+    head = " ".join(re.findall(r"\w+", (frag or "").lower())[:25])
+    return sum(1 for t in otoks[:6] if t in head) == 0
+
 
 def looks_like_solution_style_stem(text):
     """True when a would-be question_text is really solution prose
@@ -1107,21 +1319,70 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
         page = (orph.get("new_pages") or orph.get("pdf_pages") or ["?"])[0]
 
         # ---- rule 0: answer-key table -> deterministic correct_option fills
-        filled_by_key = 0
+        # Upgraded (run-4 audit): a key whose rows ALL match existing answers
+        # is CONSUMED as "verified" instead of lingering in orphans.jsonl as
+        # noise (5 such orphans in the PSY run), and any DISAGREEING row is
+        # written to data/integrity_flags.jsonl -- a free wrong-answer alarm.
+        key_rows = []
         for t in item.get("tables") or []:
             if "answer" not in str(t.get("type", "")).lower() and "Correct Option" not in (t.get("markdown") or ""):
                 continue
             for qn_s, letter in ANSWER_KEY_ROW_RE.findall(t.get("markdown") or ""):
-                kqn = int(qn_s)
+                key_rows.append((int(qn_s), letter.upper()))
+        if key_rows:
+            filled_by_key, disagreed, unknown_qn = 0, [], []
+            for kqn, letter in key_rows:
                 rec = chapter_records.get(kqn)
-                if rec and not rec.get("correct_option"):
-                    rec["correct_option"] = letter.upper()
+                if rec is None:
+                    unknown_qn.append(kqn)
+                elif rec.get("correct_option"):
+                    if str(rec["correct_option"]).strip().upper() != letter:
+                        disagreed.append({"q_no": kqn, "record": rec["correct_option"], "key": letter})
+                else:
+                    rec["correct_option"] = letter
                     filled_by_key += 1
-        if filled_by_key:
-            stats["orphans_recovered"] += 1
-            print(f"  [ORPHAN] Recovered orphan: page={page} answer-key table -> "
-                  f"{filled_by_key} answer(s) filled deterministically")
-            continue
+            if disagreed:
+                _append_jsonl(DATA_DIR / "integrity_flags.jsonl",
+                              {"kind": "answer_key_disagrees", "page": page,
+                               "chapter_id": stats.get("chapter_id"), "rows": disagreed})
+                print(f"  [WARN] [ORPHAN] answer-key table DISAGREES with extracted answers on "
+                      f"{len(disagreed)} row(s) -- logged to integrity_flags.jsonl")
+            if filled_by_key or not unknown_qn:
+                stats["orphans_recovered"] += 1
+                print(f"  [ORPHAN] Recovered orphan: page={page} answer-key table -> "
+                      f"{filled_by_key} answer(s) filled, {len(key_rows) - filled_by_key - len(unknown_qn)} "
+                      f"row(s) verified against existing answers -- consumed")
+                continue
+            print(f"  [ORPHAN] answer-key table references q_nos outside this chapter "
+                  f"({unknown_qn}) -- kept for review")
+
+        # ---- rule 0b: duplicate scrap consume (run-4 audit: both content
+        # orphans in PSY-006 were re-extractions of records that ALREADY
+        # exist complete -- a stem identical to some record's stem, or bare
+        # options identical to that record's options). Consume them instead
+        # of re-merging (idempotent) or persisting as noise.
+        if not item.get("tables") and not item.get("solution_text"):
+            itxt = (item.get("question_text") or "").strip()
+            if itxt:
+                dup = any((r2.get("question_text") or "").strip()
+                          and _frag_mostly_present(itxt, r2["question_text"], 0.9)
+                          and _frag_mostly_present(r2["question_text"], itxt, 0.9)
+                          for r2 in chapter_records.values())
+                if dup:
+                    stats["orphans_recovered"] += 1
+                    print(f"  [ORPHAN] Consumed orphan: page={page} stem already present "
+                          f"verbatim in this chapter (duplicate re-extraction scrap)")
+                    continue
+            elif item.get("options"):
+                cand = chapter_records.get(orph.get("last_qn_in_batch"))
+                c_opts = {str(k).strip().upper(): str(v) for k, v in (cand or {}).get("options", {}).items()}
+                if cand and all(str(k).strip().upper() in c_opts
+                                and _frag_mostly_present(str(v), c_opts[str(k).strip().upper()], 0.9)
+                                for k, v in item["options"].items()):
+                    stats["orphans_recovered"] += 1
+                    print(f"  [ORPHAN] Consumed orphan: page={page} options fragment already "
+                          f"present on q{orph.get('last_qn_in_batch')} (duplicate scrap)")
+                    continue
 
         owner, reason = None, None
         # ---- rule 1: owner self-labeled inside the fragment text
@@ -1168,7 +1429,21 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
             remaining.append(orph)
             continue
         rec = chapter_records[owner]
-        if item.get("solution_text"):
+        # Wrong-owner guard (run-4: PSY-009-007): an orphan solution fragment
+        # that BEGINS with an 'Option X:' explanation of an option the owner
+        # does not have belongs to a DIFFERENT question -- never glue it on.
+        # Other fields still merge; the blocked fragment stays visible.
+        blocked_sol = bool(item.get("solution_text")
+                           and _foreign_option_line(item["solution_text"].strip(), rec))
+        if blocked_sol:
+            stats["foreign_fragments_blocked"] = stats.get("foreign_fragments_blocked", 0) + 1
+            print(f"  [WARN] [ORPHAN] blocked foreign solution fragment for q{owner} "
+                  f"(starts with 'Option' line the owner cannot own) -- fragment kept in "
+                  f"orphans.jsonl, other fields still merge")
+            remaining.append({**orph, "blocked_reason":
+                              "foreign Option-line head (wrong-owner guard); "
+                              f"suspected owner differs from q{owner}"})
+        if item.get("solution_text") and not blocked_sol:
             frag = item["solution_text"].strip()
             if frag and not _frag_mostly_present(frag, rec.get("solution_text") or ""):
                 rec["solution_text"] = ((rec.get("solution_text") or "") + " " + frag).strip()
@@ -1187,10 +1462,18 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                     rec["tables"].append(t)
                     have.add(t.get("markdown"))
         qid = f"{subject}-{chapter_no:03d}-{owner:03d}"
-        print(f"  [ORPHAN] Recovered orphan: page={page} assigned_to={qid} reason={reason}")
-        stats["orphans_recovered"] += 1
-        if "carry-forward" in reason:
-            stats["carry_merges"] += 1
+        merged_something = bool(
+            item.get("options") or item.get("question_text") or item.get("correct_option")
+            or item.get("tables") or (item.get("solution_text") and not blocked_sol))
+        if merged_something:
+            note = " (+ a foreign solution fragment was blocked, kept aside)" if blocked_sol else ""
+            print(f"  [ORPHAN] Recovered orphan: page={page} assigned_to={qid} reason={reason}{note}")
+            stats["orphans_recovered"] += 1
+            if "carry-forward" in reason:
+                stats["carry_merges"] = stats.get("carry_merges", 0) + 1
+        elif blocked_sol:
+            print(f"  [ORPHAN] owner q{owner} identified but the fragment added nothing new "
+                  f"(foreign head) -- review the kept orphan entry")
     return remaining
 
 IMAGE_ATTRIBUTION_PROMPT = """This image was extracted from one page of a medical MCQ chapter.
@@ -1325,8 +1608,38 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                     print(f"  [WARN] conflicting re-extraction for q{qn} "
                           f"(similarity {sim:.2f}, answers {a1} vs {a2}) -- keeping first, dropping item")
                     continue
-                print(f"  [WARN] question text for q{qn} differs between batches "
-                      f"(similarity {sim:.2f}) -- merging non-conflicting fields")
+                # STEM CONFLICT (run-4: PSY-012-001 silently got PSY-012-013's
+                # stem, similarity 0.25 in the log, wrong stem won by write
+                # order). A stem coheres with its OWN options+solution; pick
+                # the variant that matches the record's payload. When the
+                # scores can't decide, keep the first and log BOTH variants to
+                # data/stem_conflicts.jsonl -- never silently guess again.
+                # fill_only (recovery) mode never overwrites an existing stem:
+                # the existing row keeps its text, only the ledger note is written.
+                if fill_only:
+                    # recovery mode never overwrites an existing stem; log only.
+                    stats["stem_conflicts"] = stats.get("stem_conflicts", 0) + 1
+                    _append_jsonl(DATA_DIR / "stem_conflicts.jsonl", {
+                        "q_no": qn, "chapter_id": stats.get("chapter_id"),
+                        "similarity": round(sim, 3), "verdict": "fill-only kept-existing",
+                        "old_stem": old_q[:600], "new_stem": new_q[:600]})
+                else:
+                    co, cn = _stem_payload_coherence(old_q, rec), _stem_payload_coherence(new_q, rec)
+                    if abs(co - cn) >= STEM_COHERENCE_MARGIN and max(co, cn) > 0:
+                        keep, verdict = (old_q, "kept-old") if co > cn else (new_q, "kept-new")
+                    else:
+                        keep, verdict = old_q, "kept-old (undecidable -- review logged)"
+                    stats["stem_conflicts"] = stats.get("stem_conflicts", 0) + 1
+                    _append_jsonl(DATA_DIR / "stem_conflicts.jsonl", {
+                        "q_no": qn, "chapter_id": stats.get("chapter_id"),
+                        "similarity": round(sim, 3),
+                        "coherence_old": round(co, 3), "coherence_new": round(cn, 3),
+                        "verdict": verdict, "old_stem": old_q[:600], "new_stem": new_q[:600]})
+                    print(f"  [WARN] stem conflict for q{qn} (similarity {sim:.2f}, "
+                          f"coherence {co:.2f} vs {cn:.2f}) -- {verdict}; "
+                          f"both variants logged to stem_conflicts.jsonl")
+                    rec["question_text"] = keep
+                item = {**item, "question_text": None}  # block the generic loop below
         for k in ["question_text", "solution_text"]:
             if item.get(k):
                 if fill_only and rec.get(k):
@@ -1368,22 +1681,87 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
         rec["has_figure_in_solution"] = rec["has_figure_in_solution"] or item.get("has_figure_in_solution", False)
     return existing, skipped
 
+def sanitize_solution_text(text, own_qn=None):
+    """Strip print furniture that leaks into solution text (run-4 audit):
+      1. leading verbatim book headers  ("Solution to Question 2:") that the
+         model carried over (PSY-032-001/002 shipped with them on).
+      2. an EMBEDDED later "Solution to Question N:" header whose tail is a
+         duplicate of what already precedes it -- the model dumped the whole
+         recitation block into one question (PSY-032-003 carried its own
+         solution twice plus Q4/Q5 inline). Non-duplicate tails (possibly the
+         neighbor's real content) are LEFT intact and reported, never cut.
+    Returns (cleaned_text, notes)."""
+    notes = []
+    s = text or ""
+    if not s.strip():
+        return s, notes
+    while True:
+        m = re.match(r"\s*Solution\s+to\s+Question\s+\d{1,3}\s*[:.\-]?\s*", s, re.IGNORECASE)
+        if not m:
+            break
+        s = s[m.end():]
+        notes.append("stripped leading 'Solution to Question N' header")
+    m = SOLUTION_TO_Q_RE.search(s)
+    if m and m.start() > 0:
+        head = s[:m.start()].rstrip()
+        tail = s[m.end():].lstrip(" :\n")
+        # The precise dump proof: the chunk IMMEDIATELY after the header
+        # restates THIS solution's own earlier content (the model re-recited
+        # this question before dumping its neighbours). Neighbour content
+        # further down the tail is never judged -- only the first line.
+        tail_first = tail.split("\n", 1)[0][:150]
+        if head and tail_first and _frag_mostly_present(tail_first, head, 0.8):
+            s = head
+            notes.append(f"truncated duplicated 'Solution to Question {m.group(1)}' dump")
+        else:
+            notes.append(f"embedded 'Solution to Question {m.group(1)}' header kept "
+                         f"(tail not a duplicate -- needs model/review)")
+    return s, notes
+
+
+def _dedupe_tables(tables):
+    """Drop duplicate tables by whitespace-insensitive markdown key (run-4:
+    PSY-012-008 carried the same table twice, PSY-009-005 three times --
+    overlap re-reads with squished spaces bypassed the exact-key dedupe)."""
+    seen, out = set(), []
+    for t in tables or []:
+        key = re.sub(r"\s+", "", (t.get("markdown") or "").lower())
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(t)
+    return out
+
+
 def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
 
     def valid_images(imgs, kind):
         out = []
         for f in imgs:
-            if IMG_PATH_RE.match(f):
-                out.append({"type": "figure", "file": f})
-            else:
+            if not IMG_PATH_RE.match(f):
                 print(f"  [WARN] Dropping malformed {kind} image path for {qid}: {f}")
+                continue
+            p = ASSETS_DIR / "questions" / f
+            if not p.exists():
+                print(f"  [WARN] Dropping missing {kind} image ref for {qid}: {f}")
+                continue
+            size = p.stat().st_size
+            if size < MIN_IMAGE_BYTES:
+                print(f"  [WARN] Dropping suspicious-tiny ({size}B) {kind} image ref for "
+                      f"{qid}: {f} -- broken-crop guard (never ship a broken figure)")
+                continue
+            out.append({"type": "figure", "file": f})
         return out
 
     q_images = valid_images(image_files.get("question", []), "question")
     sol_images = valid_images(image_files.get("solution", []), "solution")
+    sol_text, sanitize_notes = sanitize_solution_text(rec.get("solution_text"), own_qn=q_no)
+    for note in sanitize_notes:
+        print(f"  [SANITIZE] {qid}: {note}")
     tables = [{"type": t.get("type", "table"), "markdown": t["markdown"], "file": None}
-              for t in rec.get("tables", [])]
+              for t in _dedupe_tables(rec.get("tables", []))]
 
     return {
         "id": qid,
@@ -1392,7 +1770,7 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         "question": {"text": rec["question_text"], "images": q_images},
         "options": [{"id": str(k).strip().upper(), "text": v, "images": []} for k, v in (rec["options"] or {}).items()],
         "correct_options": [rec["correct_option"]] if rec["correct_option"] else [],
-        "solution": {"text": rec["solution_text"], "images": sol_images, "tables": tables},
+        "solution": {"text": sol_text, "images": sol_images, "tables": tables},
         "tags": [],
     }
 
@@ -1495,6 +1873,23 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q):
         return None
     qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
     entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+    # Broken-crop guard (run-4: PSY-003-014_Q_01 was 414 bytes): a sub-1.5KB
+    # webp cannot hold a real MCQ figure. Do NOT auto-claim it -- the caller's
+    # leftover path hands it to the model fourth-pass / manual review, which
+    # decides on ACTUAL content instead of position.
+    size = old_path.stat().st_size
+    if size < MIN_IMAGE_BYTES:
+        print(f"  [WARN] {rel} is only {size}B (< {MIN_IMAGE_BYTES}) -- refusing auto-claim "
+              f"(broken-crop guard); left for model/manual review")
+        return None
+    # Over-attribution guard (run-4: PSY-022-003 collected 7 question-side
+    # images through repeated model-confirmed passes -- every pass was
+    # individually reasonable, the SUM was nonsense). One question in this
+    # book never legitimately cites >3 figures.
+    if kind == "question" and len(entry["question"]) >= MAX_QUESTION_IMAGES:
+        print(f"  [WARN] over-attribution guard: {qid} already has {MAX_QUESTION_IMAGES} "
+              f"question images -- refusing {rel}; left for model/manual review")
+        return None
     letter = "Q" if kind == "question" else "SOL"
     idx = len(entry[kind]) + 1
     new_name = f"{qid}_{letter}_{idx:02d}.webp"
@@ -1602,7 +1997,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
         orphans = []               # Gemini items with null/invalid q_no (RC-2)
         stats = {"batches": 0, "duplicates_merged": 0, "conflicts": 0,
                  "carry_used": 0, "carry_merges": 0,
-                 "orphans_recovered": 0, "orphans_buffered": 0, "orphans_remaining": 0}
+                 "orphans_recovered": 0, "orphans_buffered": 0, "orphans_remaining": 0,
+                 "chapter_id": chapter_id}
         carry_from_prev = None     # FEATURE 2 payload for the NEXT request
         carry_tracker = {}         # q_no -> batch-seq its UNRESOLVED carry opened
         carry_banned = set()       # expired q_nos: never respawn a carry this chapter
@@ -1886,10 +2282,18 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                 save_state(state)
             print(f"  [DRAIN] second chance: {len(healed)}/{len(pending_failed)} previously-failed page(s) recovered")
 
+        # INTEGRITY SWEEP: zero-token deterministic proofs (run-4 audit RCA:
+        # duplicated wrong-owner stems, foreign 'Option' heads, truncated
+        # solutions, over-attributed images) BEFORE targeted retry, so
+        # stripped/provably-incomplete fields are re-asked in the SAME run.
+        forced_solution_qns = chapter_integrity_sweep(
+            chapter_records, image_files_by_q, subject, ch["chapter_no"], stats)
+
         # FEATURE: targeted gap-retry -- AFTER normal batches + orphan
         # recovery, BEFORE writing the chapter's questions to disk.
         n_fixed = targeted_retry(genai_model, page_files, chapter_records,
-                                 state, max_rounds=TARGETED_RETRY_MAX_ROUNDS)
+                                 state, max_rounds=TARGETED_RETRY_MAX_ROUNDS,
+                                 force_solution_qns=forced_solution_qns)
         if n_fixed:
             print(f"  [RETRY] closed {n_fixed} field(s) via targeted retry")
 
@@ -2010,7 +2414,8 @@ def recover_pages(plan_path):
         page_files = sorted(rec_dir.glob("page-*.jpg"))
         pages_imaged = set()
         stats = {"duplicates_merged": 0, "conflicts": 0,
-                 "carry_merges": 0, "orphans_recovered": 0}
+                 "carry_merges": 0, "orphans_recovered": 0,
+                 "chapter_id": f"{subject}-{chapter_no:03d}"}
         orphans = []
         unmatched_images = []
 
