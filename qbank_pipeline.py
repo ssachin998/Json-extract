@@ -1734,6 +1734,17 @@ def _dedupe_tables(tables):
     return out
 
 
+def _is_printed_answer_key(t):
+    """The book's printed Answer Key grid is never solution content --
+    when the model inline-reads the answers page it rides into solutions
+    (zip-8: 39 stray-key flags across 18 chapters). Strip at the source
+    so future books never carry them; fix_output.py P10 heals old files."""
+    ty = str(t.get("type") or "").strip().lower().replace("_", " ")
+    md = (t.get("markdown") or "")
+    head = md.lstrip().splitlines()[0] if md.strip() else ""
+    return ty == "answer key" or ("Question No." in head and "Correct Option" in head)
+
+
 def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
 
@@ -1761,7 +1772,8 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
     for note in sanitize_notes:
         print(f"  [SANITIZE] {qid}: {note}")
     tables = [{"type": t.get("type", "table"), "markdown": t["markdown"], "file": None}
-              for t in _dedupe_tables(rec.get("tables", []))]
+              for t in _dedupe_tables(rec.get("tables", []))
+              if not _is_printed_answer_key(t)]
 
     return {
         "id": qid,

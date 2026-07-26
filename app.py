@@ -55,6 +55,17 @@ def run_validator_and_log():
     return rep
 
 def run_pipeline_thread(subject_code, pdf_path, page_offset):
+    if VOLUME_WARN:
+        # HARD BLOCK: extraction without a mounted Volume = the whole output
+        # silently evaporates on the next redeploy (burned once already).
+        # Refuse to burn a single Gemini call in that state.
+        with state_lock:
+            state["status"] = "failed"
+            state["error"] = "Volume not attached at /data"
+        log("❌ RUN BLOCKED: Volume /data pe attach nahi hai -- is run ka data "
+            "redeploy pe udd jayega. Railway → Service → Settings → Volumes → "
+            "New Volume (Mount Path: /data) lagao, phir Run dabao.")
+        return
     with state_lock:
         state["status"] = "processing"
         state["error"] = None
@@ -374,6 +385,9 @@ RECOVERY_PLAN_PATH = Path("./recovery_plan.json")
 
 @app.route("/recover", methods=["POST"])
 def recover():
+    if VOLUME_WARN:
+        return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
+                "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
     if state["status"] == "processing":
         return redirect(url_for("index"))
     plan_text = request.form.get("plan", "").strip()
@@ -421,6 +435,9 @@ def recover():
 def fix():
     """Button-only heal of known run-4 defects (fix_output.patch_all).
     Evidence-gated + idempotent, timestamped backup + archive before write."""
+    if VOLUME_WARN:
+        return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
+                "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
     if state["status"] == "processing":
         return redirect(url_for("index"))
     with state_lock:
@@ -481,6 +498,9 @@ def fix():
 @app.route("/validate", methods=["POST"])
 def validate():
     """Button-only re-check: fresh validation_report.json + flags in the log."""
+    if VOLUME_WARN:
+        return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
+                "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
     if state["status"] == "processing":
         return redirect(url_for("index"))
     with state_lock:
@@ -585,6 +605,9 @@ def restore_drive():
     """Pull the whole working set back from the user's shared Google Drive
     backup folder: *.webp -> assets/questions/<SUBJECT>/, known data files
     -> data/, state.json -> output root. Everything else is ignored."""
+    if VOLUME_WARN:
+        return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
+                "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
     if state["status"] == "processing":
         return redirect(url_for("index"))
     folder = request.form.get("folder", "").strip()
@@ -662,6 +685,9 @@ def restore_drive():
 @app.route("/restore-zip", methods=["POST"])
 def restore_zip():
     """Extract a downloaded output_results.zip back into OUTPUT_DIR."""
+    if VOLUME_WARN:
+        return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
+                "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
     if state["status"] == "processing":
         return redirect(url_for("index"))
     f = request.files.get("file")

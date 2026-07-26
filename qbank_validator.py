@@ -317,6 +317,58 @@ def check_chapter(chapter_id, rows):
     qns = sorted({q_no_of(r) for r in rows if q_no_of(r) is not None})
     if qns:
         s = set(qns)
+
+    # foreign-solution-segment: a solution TAIL that lives VERBATIM inside a
+    # sibling row's solution belongs to the other question (zip-8: PSY-009-017
+    # carried PSY-009-012's Alzheimer's paragraphs after its own correct
+    # solution). Shingle-8 overlap over normalized text, segment >= 250 chars.
+    sols = [(r.get("id"), (r.get("solution") or {}).get("text") or "") for r in rows]
+    sols = [(i, t) for i, t in sols if len(t) > 400]
+    def _shingles(t, n=8):
+        w = re.findall(r"\w+", t.lower())
+        return {" ".join(w[i:i + n]) for i in range(0, max(0, len(w) - n + 1))}
+    sh = {i: _shingles(t) for i, t in sols}
+    for a in range(len(sols)):
+        for b in range(a + 1, len(sols)):
+            id_a, id_b = sols[a][0], sols[b][0]
+            common = sh[id_a] & sh[id_b]
+            if len(common) < 25:  # << 200 char of verbatim overlap
+                continue
+            seg_chars = sum(len(x) for x in common)
+            if seg_chars < 400:
+                continue
+            # the parasitic copy is usually the LONGER solution (real + foreign tail)
+            la, lb = len(sols[a][1]), len(sols[b][1])
+            suspect, other = (id_a, id_b) if la > lb else (id_b, id_a)
+            flags.append(flag(chapter_id, "foreign_solution_segment",
+                              f"{suspect}: ~{seg_chars} chars of its solution ALSO appear verbatim in "
+                              f"{other} -- foreign tail suspected; scan & trim",
+                              _as_int(suspect.rsplit("-", 1)[-1]), other_id=other))
+
+    # suspect_truncated_table: solution ends on a header lead-in ('... shown
+    # below:') AND its table has the SAME header as a sibling's but far fewer
+    # rows (zip-8: PSY-001-011 Erikson table 5 rows vs 001-012's full 8).
+    hdr_rows = {}
+    for r in rows:
+        st = (r.get("solution") or {}).get("text") or ""
+        for t in (r.get("solution") or {}).get("tables") or []:
+            md = (t.get("markdown") or "").strip()
+            if not md:
+                continue
+            hd = re.sub(r"\s+", "", md.splitlines()[0].lower())
+            body = sum(1 for ln in md.splitlines() if ln.strip().startswith("|") and "---" not in ln) - 1
+            hdr_rows.setdefault(hd, []).append((r.get("id"), body, st.rstrip(), md.splitlines()[0][:60]))
+    for hd, items in hdr_rows.items():
+        if len(items) < 2:
+            continue
+        biggest = max(x[1] for x in items)
+        for rid, body, st, hdr_txt in items:
+            if body > 0 and biggest - body >= 3 and st.endswith(":"):
+                flags.append(flag(chapter_id, "suspect_truncated_table",
+                                  f"{rid}: table '{hdr_txt}' has {body} row(s) vs sibling's "
+                                  f"{biggest} with the same header AND the solution ends on a "
+                                  f"header lead-in -- table likely cut",
+                                  _as_int(rid.rsplit("-", 1)[-1])))
         for missing in [n for n in range(min(qns), max(qns) + 1) if n not in s]:
             flags.append(flag(chapter_id, "numbering_gap",
                               f"question {missing} absent (series runs {min(qns)}..{max(qns)})", missing))
