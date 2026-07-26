@@ -99,11 +99,25 @@ def patch_all(rows, assets_q):
         else:
             act("P3", "SKIP", "PSY-032-003 has no embedded dump header")
 
-    # ---- P4/P5/GENERIC: duplicate tables inside one solution (all rows)
+    # ---- P4/P10/GENERIC: duplicate tables + stray printed Answer Key tables
+    # inside solutions. The book's printed key ('| Question No. | Correct
+    # Option |' / type 'answer key') is never solution content -- it rides
+    # along from the answers page. Stripping kills all 39 cosmetic flags
+    # from the 2026-07-27 zip-8 validation report.
+    def _is_answer_key(t):
+        ty = str(t.get("type") or "").strip().lower().replace("_", " ")
+        md = (t.get("markdown") or "")
+        head = md.lstrip().splitlines()[0] if md.strip() else ""
+        return ty == "answer key" or ("Question No." in head and "Correct Option" in head)
+
     for r in rows:
         tbls = (r.get("solution") or {}).get("tables") or []
-        seen, keep, dups = set(), [], 0
+        seen, keep, dups, keys = set(), [], 0, 0
         for t in tbls:
+            if _is_answer_key(t):
+                keys += 1
+                archive.append({"patch": "P10", "id": r.get("id"), "archived": t})
+                continue
             k = _norm_md(t.get("markdown"))
             if k and k in seen:
                 dups += 1
@@ -111,9 +125,10 @@ def patch_all(rows, assets_q):
             if k:
                 seen.add(k)
             keep.append(t)
-        if dups:
+        if dups or keys:
             r["solution"]["tables"] = keep
-            act("P4", "APPLY", f"{r['id']}: dropped {dups} duplicate table(s)")
+            act("P4/P10", "APPLY", f"{r['id']}: dropped {dups} duplicate table(s), "
+                                   f"stripped {keys} stray printed Answer Key table(s)")
 
     # ---- P5b: PSY-009-005 raw markdown table pasted inside solution TEXT
     r = by_id.get("PSY-009-005")
@@ -200,6 +215,62 @@ def patch_all(rows, assets_q):
             r1["question"]["text"] = None
         else:
             act("P9", "SKIP", "PSY-012-001 stem no longer a zero-coherence duplicate")
+
+    # ---- P11: PSY-001-011 Erikson table completed. zip-8 audit: its
+    # stage table is the SAME printed table as PSY-001-012's (identical
+    # headers/rows) but truncated after Stage Five. Append the missing
+    # rows VERBATIM from the sibling's table (book-shipped content).
+    r11, r12 = by_id.get("PSY-001-011"), by_id.get("PSY-001-012")
+    if r11 and r12:
+        t11 = [t for t in (r11["solution"].get("tables") or []) if "Stage One" in (t.get("markdown") or "")]
+        t12 = [t for t in (r12["solution"].get("tables") or []) if "Stage Eight" in (t.get("markdown") or "")]
+        added = []
+        if t11 and t12 and "Stage Eight" not in t11[0]["markdown"]:
+            rows12 = t12[0]["markdown"].splitlines()
+            for st in ("Stage Six", "Stage Seven", "Stage Eight"):
+                if st not in t11[0]["markdown"]:
+                    src = next((ln for ln in rows12 if st in ln.strip()), None)
+                    if src:
+                        t11[0]["markdown"] = t11[0]["markdown"].rstrip() + "\n" + src
+                        added.append(st)
+        if added:
+            act("P11", "APPLY", f"PSY-001-011 Erikson table completed with verbatim rows "
+                                f"{added} from PSY-001-012's identical printed table")
+        else:
+            act("P11", "SKIP", "PSY-001-011 stage table already complete")
+
+    # ---- P12: PSY-009-017 foreign tail. Row-verified: the text after its
+    # real vascular-dementia discussion ('The given clinical scenario of a
+    # patient with progressive cognitive impairment...' + Statement/Option
+    # lines) belongs to OTHER questions -- the same sentences already live
+    # VERBATIM in PSY-009-012's solution. Trim + archive.
+    r = by_id.get("PSY-009-017")
+    if r:
+        st = r["solution"]["text"] or ""
+        MARK = "The given clinical scenario of a patient with progressive cognitive impairment"
+        if MARK in st and "large-vessel territories." in st:
+            cut = st.index(MARK)
+            act("P12", "APPLY", "PSY-009-017 foreign tail trimmed "
+                                 "(duplicated Alzheimer's content already in PSY-009-012)",
+                archived=st[cut:])
+            r["solution"]["text"] = st[:cut].rstrip()
+        else:
+            act("P12", "SKIP", "PSY-009-017 has no foreign tail")
+
+    # ---- P13: PSY-031-003 mislabeled explanation line. Own options:
+    # C = Persistent motor tic disorder (the CORRECT answer, needs no
+    # rebuttal), D = Late onset autism. The 'Option C: ... rule out autism'
+    # line discusses AUTISM, i.e. it is the rebuttal of own option D with
+    # a wrong letter. Relabel C->D; content untouched.
+    r = by_id.get("PSY-031-003")
+    if r and "Option C: Normal social milestones rule out autism." in (r["solution"]["text"] or ""):
+        r["solution"]["text"] = r["solution"]["text"].replace(
+            "Option C: Normal social milestones rule out autism.",
+            "Option D: Normal social milestones rule out autism.")
+        act("P13", "APPLY", "PSY-031-003 autism line relabeled 'Option C' -> 'Option D' "
+                            "(own D = Late onset autism; own C is the correct answer)")
+    else:
+        act("P13", "SKIP", "PSY-031-003 line already sane")
 
     return rows, actions, archive
 

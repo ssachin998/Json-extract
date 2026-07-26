@@ -173,7 +173,12 @@ def check_row(row, assets_questions):
         # bullet-list endings; only 2 of 55 flags were real). Patterns kept:
         # dangling connector ends ('...criteria:', '...--'), raw trailing
         # space after a word (stream cut mid-flow: '...• During ').
-        if DANGLING_END_RE.search(s):
+        # zip-8 audit addendum: a dangling ':' header lead-in ('... are
+        # listed below:') is NOT truncation when the printed table it
+        # introduces lives in solution.tables -- all 6 such flags in the
+        # resumed run were row-verified false positives (001-012, 006-013,
+        # 006-019, 011-015, 013-003, 023-005).
+        if DANGLING_END_RE.search(s) and not (s.endswith(":") and sol.get("tables")):
             flags.append(flag(cid, "truncated_solution",
                               f"{row.get('id')}: solution ends on a dangling connector (...{s[-50:]!r})", qn))
         elif sol_text != s and re.search(r"[A-Za-z0-9]$", s) and s[-1] not in TERMINAL_PUNCT:
