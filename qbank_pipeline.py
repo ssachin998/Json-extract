@@ -815,6 +815,107 @@ def build_carry_context(carry, overlap_pages):
 ANSWER_KEY_ROW_RE = re.compile(r"\|\s*(\d{1,3})\s*\|\s*([A-Da-d])\s*\|")
 SOLUTION_TO_Q_RE = re.compile(r"Solution to Question\s+(\d{1,3})", re.IGNORECASE)
 
+# --- stale carry-context guards (clarified RCA: the header-alone-at-page-end
+# split is NORMAL in this book for questions AND solutions, and the overlap
+# window resolves it -- do NOT touch that path. The actual bug is a carry
+# context whose OWN split never resolves staying alive long enough to meet
+# the same number again in the Solutions section ("Solution to Question 4:")
+# and cross-merge question prose with solution prose).
+CARRY_EXPIRY_BATCHES = 3      # unresolved carry dies after this many batches
+
+SOLUTION_STYLE_STEM_RE = re.compile(
+    r"^\s*(?:option\s+[a-d]\s*[:.)\-]|ans(?:wer)?\s*[:.)\-]|correct\s+answer\s+is\b|"
+    r"the\s+(?:correct\s+)?answer\s+is\b|solution\s*[:.)\-]|explanation\s*[:.)\-]|"
+    r"answer\s*[:.)\-]|solution\s+to\s+question\s+\d+)", re.IGNORECASE)
+
+SECTION_HEADING_RE = re.compile(
+    r"^\s*(?:chapter\s+\d{1,3}\s*[:.\-–]?\s*)?"
+    r"(detailed\s+explanations?|answer\s*keys?|answers?\s+(?:and|&)\s+explanations?|"
+    r"explanations?|answers?)\s*[.:\-–]?\s*$", re.IGNORECASE)
+
+
+def looks_like_solution_style_stem(text):
+    """True when a would-be question_text is really solution prose
+    ("Option A: ...", "Ans. is B", "Solution to Question 4: ...").
+    Anchored at the start so real stems mentioning options mid-text are safe."""
+    return bool(text and SOLUTION_STYLE_STEM_RE.search(str(text)))
+
+
+def detect_section_boundary(items):
+    """Return a short label on the FIRST batch whose extracted content shows
+    the questions -> answers/solutions section boundary, else None. Signals,
+    all from Gemini's own extraction (body-page pdftotext is garbled for this
+    book, so deterministic page-text scanning is NOT an option):
+      - a standalone heading line like "Detailed Explanations" / "Answer Key"
+      - a self-labeled "Solution to Question N:" solution fragment
+      - an Answer Key table (type says answer + 'Correct Option' markdown)"""
+    for it in items:
+        for t in it.get("tables") or []:
+            md = t.get("markdown") or ""
+            if "answer" in str(t.get("type", "")).lower() and "Correct Option" in md:
+                return "Answer Key table"
+        sol = it.get("solution_text") or ""
+        m = SOLUTION_TO_Q_RE.search(sol)
+        if m:
+            return f"'Solution to Question {m.group(1)}' fragment"
+        for field in (it.get("question_text"), sol):
+            for line in str(field or "").splitlines():
+                line = line.strip()
+                if line and len(line) <= 60 and SECTION_HEADING_RE.match(line):
+                    return f"'{line}' heading"
+    return None
+
+
+def _carry_resolved(rec, cut_part):
+    """Has the piece this carry was waiting for actually arrived?"""
+    cut = (cut_part or "solution").lower()
+    if cut == "options":
+        return len(rec.get("options") or {}) >= 4
+    if cut == "question":
+        return bool((rec.get("question_text") or "").strip()) and \
+            len(rec.get("options") or {}) >= 4
+    return bool((rec.get("solution_text") or "").strip())   # "solution"/"unknown"
+
+
+def enforce_carry_expiry(carry, batch_seq, tracker, banned, chapter_records, chapter_id):
+    """Kill stale carry contexts before they can cross-merge into the
+    Solutions section. Rules, in order:
+      - q_no already banned this chapter -> drop (the no-meta fallback in
+        compute_carry would otherwise RESPAWN the same stale carry every
+        batch that number stays the max text-no-solution candidate).
+      - carried piece now filled -> resolved, drop quietly, un-track.
+      - same q_no unresolved for CARRY_EXPIRY_BATCHES batches -> drop,
+        mark the question still-incomplete IMMEDIATELY (turant), and ban
+        the number for the rest of the chapter.
+    Numberless tails (last_open_question=None) live one batch by
+    construction and pass through untouched."""
+    if carry is None:
+        return None
+    qn = carry.get("last_open_question")
+    if qn is None:
+        return carry
+    if qn in banned:
+        return None
+    rec = chapter_records.get(qn) or {}
+    if _carry_resolved(rec, carry.get("cut_part")):
+        tracker.pop(qn, None)
+        return None
+    opened = tracker.setdefault(qn, batch_seq)
+    if batch_seq - opened >= CARRY_EXPIRY_BATCHES:
+        tracker.pop(qn, None)
+        banned.add(qn)
+        cut = carry.get("cut_part") or "solution"
+        print(f"  [CARRY] q{qn} carry EXPIRED unresolved after "
+              f"{CARRY_EXPIRY_BATCHES} batches (cut part: {cut}) -- dropped + "
+              f"number banned this chapter + marked still-incomplete (a stale "
+              f"context must never meet its number again in the Solutions "
+              f"section)")
+        _append_jsonl(DATA_DIR / "still_incomplete_after_retry.jsonl",
+                      {"q_no": qn, "missing": [cut], "chapter_id": chapter_id,
+                       "reason": "carry-context expired unresolved"})
+        return None
+    return carry
+
 
 def _frag_mostly_present(frag, existing, threshold=0.85):
     """Token-overlap duplicate guard: substring checks miss near-dupes when
@@ -1032,6 +1133,22 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
             print(f"  [WARN] Gemini returned a non-numeric q_no ({raw_qn!r}), skipping")
             skipped.append(item)
             continue
+        # ---- solution-style stem guard (backup net for the stale carry
+        # bug): an unresolved carry context that survives into the Solutions
+        # section can talk the model into CONTINUING the carried q_no with
+        # solution PROSE as its question_text ("Option A: ...", "Answer: ...",
+        # "Solution to Question 4: ..."). That text is not a stem -- reject
+        # just this field (the item's real payload -- solution_text/options/
+        # answer -- still merges below). A new record hit by this keeps its
+        # other fields, stays stem-less, and becomes targeted-retry eligible
+        # via the Gap-1 anchor rule instead of keeping a poisoned stem.
+        if looks_like_solution_style_stem(item.get("question_text")):
+            stats.setdefault("poison_stems_rejected", 0)
+            stats["poison_stems_rejected"] += 1
+            print(f"  [WARN] q{qn}: question_text is solution prose "
+                  f"('{str(item['question_text'])[:60]}...') -- rejected as stem "
+                  f"(stale carry-merge guard); other fields still merge")
+            item = {**item, "question_text": None}
         rec = existing.setdefault(qn, {
             "q_no": qn, "question_text": None, "options": None,
             "correct_option": None, "solution_text": None, "tables": [],
@@ -1334,6 +1451,9 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                  "carry_used": 0, "carry_merges": 0,
                  "orphans_recovered": 0, "orphans_buffered": 0, "orphans_remaining": 0}
         carry_from_prev = None     # FEATURE 2 payload for the NEXT request
+        carry_tracker = {}         # q_no -> batch-seq its UNRESOLVED carry opened
+        carry_banned = set()       # expired q_nos: never respawn a carry this chapter
+        answers_section_seen = False
         prev_window_last_page = None
 
         overlap = max(0, min(BATCH_OVERLAP_PAGES, PAGES_PER_GEMINI_CALL - 1))
@@ -1416,6 +1536,26 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             prev_window_last_page = max(window_pages)
             carry_from_prev = compute_carry(batch_meta, items, chapter_records,
                                             prev_window_last_page)
+            # stale-carry guard #1: expire carries whose own split never
+            # resolved (ban blocks the compute_carry fallback respawn)
+            carry_from_prev = enforce_carry_expiry(carry_from_prev, stats["batches"],
+                                                   carry_tracker, carry_banned,
+                                                   chapter_records, chapter_id)
+            # stale-carry guard #2: questions->solutions SECTION boundary.
+            # The first batch that shows the answers section hard-resets ALL
+            # questions-section carry context -- resolved or not -- so it can
+            # NEVER bleed into the Solutions section and cross-merge there.
+            if not answers_section_seen:
+                boundary = detect_section_boundary(items)
+                if boundary:
+                    answers_section_seen = True
+                    had_pending = carry_from_prev is not None or bool(carry_tracker)
+                    carry_from_prev = None
+                    carry_tracker.clear()
+                    print(f"  [SECTION] {boundary} first seen at pages "
+                          f"{window_pages[0]}-{window_pages[-1]} -- answers "
+                          f"section begins; questions-section carry context "
+                          f"HARD-RESET{' (dropped pending context)' if had_pending else ''}")
             last_open = (f"q{carry_from_prev['last_open_question']}"
                          if carry_from_prev and carry_from_prev["last_open_question"] is not None
                          else ("open (no number)" if carry_from_prev else "-"))
