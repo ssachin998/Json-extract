@@ -589,23 +589,21 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2):
               f"incomplete ({preview}) -- sending targeted re-ask")
 
         prompt = build_targeted_retry_prompt(incomplete, chapter_records)
-        try:
-            parts = [prompt] + [Image.open(p) for p in page_files]
-            resp = model.generate_content(
-                parts, safety_settings=SAFETY_SETTINGS,
-                request_options={"retry": None},
-            )
-            state["calls_today"] += 1
-            save_state(state)
-            if not resp.candidates:
-                print("  [RETRY] empty/blocked response -- skipping this round")
-                continue
-            text = resp.text.strip()
-            text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
-            fixes = json.loads(text)
-        except Exception as e:
-            print(f"  [RETRY] call failed: {e} -- skipping this round")
+        # Resilient execution (run-4 lesson, ch9/ch16): never ONE heavy
+        # whole-chapter call that fails as a unit -- back off on transient
+        # 5xx, split halves->singles on any failure. A recitation-prone
+        # single page now only costs that page, not the whole chapter's
+        # retry.
+        fix_arrays = gemini_json_call_splitting(
+            model, prompt, page_files, state,
+            label=f" (targeted retry round {round_no})")
+        if not fix_arrays:
+            print("  [RETRY] every sub-call failed even after splitting -- skipping this round")
             continue
+        fixes = []
+        for arr in fix_arrays:
+            if isinstance(arr, list):
+                fixes.extend(arr)
 
         fixed_this_round = 0
         for fix in fixes:
@@ -676,6 +674,121 @@ def qns_printed_on_page(pdf_path, true_page, chapter_records):
     return sorted(found)
 
 
+def _transient_gemini_err(err_text):
+    t = err_text.lower()
+    return ("500" in t or "503" in t or "internal error" in t
+            or "high demand" in t or "unavailable" in t)
+
+
+def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
+    """Execute ONE logical ask (prompt + page images) so that a single bad
+    or heavy call can never sink it. Run-4 PROOF of why this exists: a
+    whole-chapter targeted retry went out as ONE 14-page call and failed
+    as a unit -- 500 on ch9's set, recitation (finish_reason=4) on ch16's
+    set (page 217 inside it poisoned the whole call) -- and both rounds
+    then just SKIPPED, permanently losing 4+5 solutions and q11's options.
+    Ladder per failure:
+      1. transient (500/503/high-demand): 20s backoff, identical re-try once
+      2. 429/quota burst: 65s backoff, re-try once; still limited -> the
+         usual clean save+exit (same as the main batch loop)
+      3. any remaining failure: split the page set in HALVES, re-ask each;
+         a failing half descends to SINGLE pages
+    Returns a list of parsed JSON arrays from all successful sub-calls
+    ([] = everything failed; deterministic per-page failures like
+    recitation-on-one-page simply cost that page, not the ask)."""
+    def one_call(files):
+        reset_daily_counter_if_needed(state)
+        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+            print("Daily Gemini call limit reached. Saving progress, exiting.")
+            save_state(state)
+            sys.exit(0)
+        parts = [prompt] + [Image.open(p) for p in files]
+        resp = model.generate_content(parts, safety_settings=SAFETY_SETTINGS,
+                                      request_options={"retry": None})
+        state["calls_today"] += 1
+        save_state(state)
+        if not resp.candidates:
+            raise RuntimeError(f"empty/blocked response (prompt_feedback={getattr(resp, 'prompt_feedback', None)})")
+        text = resp.text.strip()
+        text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
+        return json.loads(text)
+
+    def attempt(files):
+        try:
+            return one_call(files)
+        except Exception as e:
+            t = str(e)
+            if "429" in t or "quota" in t.lower():
+                print(f"  [429] rate limited{label} -- backing off 65s once")
+                time.sleep(65)
+                try:
+                    return one_call(files)
+                except Exception as e2:
+                    t2 = str(e2)
+                    if "429" in t2 or "quota" in t2.lower():
+                        print(f"  [QUOTA] still limited after backoff -- saving, exiting: {e2}")
+                        save_state(state)
+                        sys.exit(0)
+                    print(f"  [WARN] post-backoff call failed differently{label}: {e2}")
+                    return None
+            if _transient_gemini_err(t):
+                print(f"  [WARN] transient Gemini error{label} ({t[:120]}) -- one 20s-backoff retry")
+                time.sleep(20)
+                try:
+                    return one_call(files)
+                except Exception as e2:
+                    print(f"  [WARN] backoff retry failed{label}: {str(e2)[:160]}")
+                    return None
+            print(f"  [WARN] call failed{label}: {t[:200]}")
+            return None
+
+    if not page_files:
+        return []
+    whole = attempt(page_files)
+    if whole is not None:
+        return [whole]
+    mid = (len(page_files) + 1) // 2
+    halves = [page_files[:mid], page_files[mid:]]
+    results = []
+    for half in halves:
+        if not half:
+            continue
+        r = attempt(half)
+        if r is not None:
+            results.append(r)
+            continue
+        for single in half:
+            r2 = attempt([single])
+            if r2 is not None:
+                results.append(r2)
+            else:
+                print(f"  [WARN] page {Path(single).name} failed even alone{label} "
+                      f"-- excluded from this ask (chapter-end recovery paths remain)")
+    return results
+
+
+def _page_crops(pf, parts, overlap_frac=0.12):
+    """Split a page image into `parts` horizontal bands with a small overlap
+    (a solution clipped at the cut line appears WHOLE in >=1 crop; overlap
+    re-extraction is merge-safe because every consumer is fill-only/deduped).
+    Returns [(label, crop_path)]; crops live next to the source page."""
+    im = Image.open(pf)
+    w, h = im.size
+    labels_map = {2: ("TOP half", "BOTTOM half"),
+                  4: ("quarter 1 (top)", "quarter 2", "quarter 3", "quarter 4 (bottom)")}
+    labels = labels_map.get(parts) or [f"band {i + 1}/{parts}" for i in range(parts)]
+    step = h / parts
+    ov = step * overlap_frac
+    crops = []
+    for i in range(parts):
+        top = max(0, int(i * step - ov))
+        bot = min(h, int((i + 1) * step + ov))
+        out = Path(str(pf).rsplit(".", 1)[0] + f"_crop{parts}x{i + 1}.jpg")
+        im.crop((0, top, w, bot)).save(out, "JPEG", quality=90)
+        crops.append((labels[i], out))
+    return crops
+
+
 def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, pdf_path=None):
     """Second-chance pass for pages that failed even alone (recitation-prone
     content, run-2: PSY page 217 cost ch16 5 solutions). Called at chapter
@@ -706,7 +819,47 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
             state["calls_today"] += 1
             save_state(state)
         except Exception as e:
-            print(f"  [DRAIN] {entry['page_file']} failed on second chance ({e}) -- kept in failed_pages queue")
+            # CROP LADDER (run-4 PROOF: PSY ch16 page 217 failed with
+            # finish_reason=4 recitation at batch, alone, AND here, and its
+            # 5 solutions were lost; ch9's whole-chapter retry died as one
+            # 500-prone call). Recitation/safety filters fire on long
+            # verbatim spans, and heavy calls hit 500s -- smaller crops mean
+            # a smaller span and a lighter call per ask. Halves -> quarters,
+            # fill-only merge per successful crop; the page is healed only
+            # when EVERY crop at some level came back as a valid call.
+            print(f"  [DRAIN] {entry['page_file']} failed on second chance ({e}) -- trying crop ladder")
+            ladder_healed = False
+            for parts_n in (2, 4):
+                all_ok, any_items = True, False
+                for crop_label, crop_pf in _page_crops(pf, parts_n):
+                    try:
+                        crop_ctx = (f"RECOVERY NOTE: you are seeing one crop ({crop_label}) of a "
+                                    f"page that must be extracted in pieces. {RECOVERY_CONTEXT}")
+                        raw = call_gemini_on_pages(model, [crop_pf], context=crop_ctx)
+                        state["calls_today"] += 1
+                        save_state(state)
+                    except Exception as e2:
+                        print(f"  [DRAIN] {entry['page_file']} {crop_label} failed too ({e2})")
+                        all_ok = False
+                        continue
+                    items2, _ = extract_batch_meta(raw)
+                    if items2:
+                        any_items = True
+                    chapter_records, skipped2 = merge_question_records(
+                        chapter_records, items2, stats, fill_only=True)
+                    for it in skipped2:
+                        new_orphans.append({"chapter_id": entry.get("chapter_id"), "batch_start": -1,
+                                            "pdf_pages": [int(entry["true_page"])], "new_pages": [],
+                                            "carry_q_no": None, "item": it})
+                    print(f"  [DRAIN] {entry['page_file']} {crop_label}: {len(items2)} item(s)")
+                if all_ok:
+                    print(f"  [DRAIN] {entry['page_file']} recovered via {parts_n}x crop ladder "
+                          f"({any_items and 'items found' or 'page genuinely had no items'})")
+                    healed.append(entry)
+                    ladder_healed = True
+                    break
+            if not ladder_healed:
+                print(f"  [DRAIN] {entry['page_file']} resisted even the crop ladder -- kept in failed_pages queue")
             continue
         print(f"  [DRAIN] {entry['page_file']} recovered on second chance")
         items, _meta = extract_batch_meta(raw)
@@ -1818,6 +1971,7 @@ def recover_pages(plan_path):
     model = genai.GenerativeModel(GEMINI_MODEL)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    state = load_state()   # real state: quota tracking + failed_pages queue
 
     questions_path = DATA_DIR / "questions.jsonl"
     all_lines = [json.loads(l) for l in
@@ -1868,8 +2022,10 @@ def recover_pages(plan_path):
             except Exception as e:
                 print(f"  [WARN] recovery call failed for {chapter_id} pages "
                       f"{window_pages}: {e}")
-                raw = retry_batch_page_by_page(model, batch,
-                                               {"calls_today": 0, "day_stamp": ""})
+                raw = retry_batch_page_by_page(model, batch, state,
+                                               ctx={"subject": subject,
+                                                    "chapter_no": chapter_no,
+                                                    "chapter_id": chapter_id})
                 if not raw:
                     continue
             items, _meta = extract_batch_meta(raw)
@@ -1892,6 +2048,23 @@ def recover_pages(plan_path):
                                                                 records, image_files_by_q)
                     if rec_leftover:
                         unmatched_images.append({"page": file_page_num, "files": rec_leftover})
+
+        # drain this chapter's queued failed pages (incl. ones recovery itself
+        # just queued): crop-ladder second chance, fragments join the orphan
+        # pool BEFORE recover_orphans runs -- same order as the production path.
+        pending_failed = [e for e in state.get("failed_pages", [])
+                          if e.get("chapter_id") == chapter_id]
+        if pending_failed:
+            records, rec_drain_orphans, healed = drain_failed_pages(
+                model, pending_failed, rec_dir, records, state, stats,
+                pdf_path=pdf_path)
+            orphans.extend(rec_drain_orphans)
+            if healed:
+                healed_ids = {(e["subject"], e["chapter_no"], e["true_page"]) for e in healed}
+                state["failed_pages"] = [e for e in state.get("failed_pages", [])
+                                         if (e.get("subject"), e.get("chapter_no"), e.get("true_page"))
+                                         not in healed_ids]
+                save_state(state)
 
         orphans = recover_orphans(orphans, records, subject, chapter_no, stats)
         for orph in orphans:
