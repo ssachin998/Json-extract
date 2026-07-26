@@ -132,6 +132,7 @@ PAGE = """
         🔍 Check data (validator report)
       </button>
     </form>
+    <a href="/data-status" class="block text-center w-full bg-slate-200 text-slate-800 font-bold py-2 rounded">📦 Data status (is my file safe?)</a>
     <p class="text-xs text-gray-500">Tap <b>Fix</b> first (auto backup, safe to tap again), then <b>Check</b>. Every flag appears in the black log box below — screenshot it and send it.</p>
   </div>
 
@@ -467,6 +468,41 @@ def validate():
     t.daemon = True
     t.start()
     return redirect(url_for("index"))
+
+@app.route("/data-status")
+def data_status():
+    """Read-only proof that the extraction data on the Volume is intact.
+    Shows file sizes + question/image counts -- nothing is modified."""
+    out = Path(os.environ.get("OUTPUT_DIR", "./qbank_output"))
+    lines = [f"Output folder: {out}"]
+    if not out.exists():
+        lines.append("X  folder missing -- is the Railway Volume mounted on this service?")
+        return "<pre style='font-size:15px;padding:12px'>" + "\n".join(lines) + "</pre>"
+    q = out / "data" / "questions.jsonl"
+    if q.exists():
+        n = sum(1 for l in q.read_text(encoding="utf-8").splitlines() if l.strip())
+        lines.append(f"OK  questions.jsonl = {n} questions  ({q.stat().st_size // 1024} KB)")
+    else:
+        lines.append("X  data/questions.jsonl missing")
+    d = out / "data"
+    if d.exists():
+        for f in sorted(d.iterdir()):
+            if f.name != "questions.jsonl":
+                lines.append(f"    data/{f.name}  ({f.stat().st_size // 1024} KB)")
+    aq = out / "assets" / "questions"
+    if aq.exists():
+        for sub in sorted(aq.iterdir()):
+            if sub.is_dir():
+                lines.append(f"OK  assets/questions/{sub.name} = {len(list(sub.iterdir()))} images")
+    else:
+        lines.append("X  assets/questions folder missing")
+    bak = list(out.glob("data/*.bak-*"))
+    if bak:
+        lines.append(f"    backups found: {len(bak)}")
+    lines.append("")
+    lines.append("Agar upar 'OK questions.jsonl = 434 questions' dikh raha hai,")
+    lines.append("to data 100% safe hai. Screenshot bhej do.")
+    return "<pre style='font-size:15px;padding:12px'>" + "\n".join(lines) + "</pre>"
 
 @app.route("/download")
 def download():
