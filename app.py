@@ -114,6 +114,12 @@ PAGE = """
 <div class="max-w-lg mx-auto space-y-4">
   <h1 class="text-xl font-bold">QBank Extractor</h1>
 
+  {% if vol_warn %}
+  <div class="bg-red-600 text-white rounded-lg shadow p-4 text-sm font-bold">
+    {{ vol_warn }}
+  </div>
+  {% endif %}
+
   <div class="bg-white rounded-lg shadow p-4">
     <p class="text-sm mb-2">Status: <span class="font-semibold">{{ state.status }}</span></p>
     {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
@@ -133,7 +139,21 @@ PAGE = """
       </button>
     </form>
     <a href="/data-status" class="block text-center w-full bg-slate-200 text-slate-800 font-bold py-2 rounded">📦 Data status (is my file safe?)</a>
-    <p class="text-xs text-gray-500">Tap <b>Fix</b> first (auto backup, safe to tap again), then <b>Check</b>. Every flag appears in the black log box below — screenshot it and send it.</p>
+    <form action="/restore-drive" method="POST" class="pt-2 border-t space-y-2">
+      <label class="block text-xs font-semibold mb-1">Google Drive backup folder link (waapas lane ke liye)</label>
+      <input type="text" name="folder" value="1ZOKiB1TTFXTeiGkTPQq6SkKcrDa9GQxp" class="w-full text-xs border p-2 rounded">
+      <button class="w-full bg-violet-600 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        ♻️ Restore data from Drive
+      </button>
+    </form>
+    <details class="pt-2 border-t">
+      <summary class="text-xs font-semibold cursor-pointer">Or upload output_results.zip (if saved on phone)</summary>
+      <form action="/restore-zip" method="POST" enctype="multipart/form-data" class="space-y-2 mt-2">
+        <input type="file" name="file" accept=".zip" class="w-full text-sm border p-2 rounded">
+        <button class="w-full bg-slate-800 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>Restore from zip</button>
+      </form>
+    </details>
+    <p class="text-xs text-gray-500">Order: <b>Restore</b> (data waapas) → <b>🩹 Fix</b> → <b>🔍 Check</b>. Har step ke baad black log box ka screenshot bhejo.</p>
   </div>
 
   <div class="bg-white rounded-lg shadow p-4 border-2 border-emerald-500 space-y-3">
@@ -212,6 +232,20 @@ setInterval(() => {
 
 import re as _re
 
+OUTPUT_ROOT_ENV = os.environ.get("OUTPUT_DIR", "./qbank_output")
+
+# If the service writes under /data but no Railway Volume is mounted there,
+# EVERYTHING VANISHES on every redeploy (this already burned us once).
+# Surface it as a huge red banner instead of silently losing data again.
+VOLUME_WARN = None
+if OUTPUT_ROOT_ENV.startswith("/data"):
+    _d = Path("/data")
+    if not (_d.exists() and _d.is_mount()):
+        VOLUME_WARN = ("⚠️ Volume NAHI lagaa hai — /data pe Railway Volume attach nahi hai, "
+                       "isliye har redeploy pe saara data DELETE ho jayega. "
+                       "Fix: Railway → Service → Settings → Volumes → New Volume → "
+                       "Mount Path: /data. Phir ye banner apne aap chala jayega.")
+
 def resolve_download_url(url):
     """Convert common share-link formats (Google Drive etc.) into a direct
     download URL. Falls back to the original URL if it's not recognized."""
@@ -225,7 +259,7 @@ def resolve_download_url(url):
 
 @app.route("/")
 def index():
-    return render_template_string(PAGE, state=state)
+    return render_template_string(PAGE, state=state, vol_warn=VOLUME_WARN)
 
 @app.route("/status")
 def status():
@@ -475,8 +509,24 @@ def data_status():
     Shows file sizes + question/image counts -- nothing is modified."""
     out = Path(os.environ.get("OUTPUT_DIR", "./qbank_output"))
     lines = [f"Output folder: {out}"]
+    d = Path("/data")
+    lines.append(f"/data exists: {d.exists()}   /data is a mounted Volume: "
+                 f"{('YES' if d.is_mount() else 'NO -- ephemeral, vanishes on redeploy!') if d.exists() else '?'}")
+    if d.exists():
+        kids = sorted(p.name + ("/" if p.is_dir() else "") for p in d.iterdir())
+        lines.append(f"/data contents: {', '.join(kids[:30]) or '(empty)'}")
     if not out.exists():
-        lines.append("X  folder missing -- is the Railway Volume mounted on this service?")
+        # maybe the data lives somewhere ELSE in the container -- hunt for it
+        found = []
+        for base in (Path("/app"), Path("."), Path("/tmp")):
+            try:
+                for p in base.rglob("questions.jsonl"):
+                    found.append(str(p))
+            except Exception:
+                pass
+        lines.append("X  output folder missing.")
+        lines.append(("Found copies elsewhere: " + ", ".join(found)) if found
+                     else "No questions.jsonl anywhere -- use Restore to bring it back from Drive.")
         return "<pre style='font-size:15px;padding:12px'>" + "\n".join(lines) + "</pre>"
     q = out / "data" / "questions.jsonl"
     if q.exists():
@@ -503,6 +553,164 @@ def data_status():
     lines.append("Agar upar 'OK questions.jsonl = 434 questions' dikh raha hai,")
     lines.append("to data 100% safe hai. Screenshot bhej do.")
     return "<pre style='font-size:15px;padding:12px'>" + "\n".join(lines) + "</pre>"
+
+DRIVE_DATA_FILES = {"questions.jsonl", "chapters.json", "orphans.jsonl",
+                    "decorative_images.jsonl", "validation_report.json",
+                    "unmatched_images.jsonl", "integrity_flags.jsonl",
+                    "stem_conflicts.jsonl", "still_incomplete_after_retry.jsonl",
+                    "fix_output_archive.jsonl", "audit_state.json"}
+
+def _fetch_drive_file(file_id, dest):
+    """Download one shared Drive file to dest (streamed). Returns bytes written."""
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    r = requests.get(url, stream=True, timeout=120, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    if "text/html" in r.headers.get("Content-Type", ""):  # big-file confirm page
+        m = _re.search(r"confirm=([0-9A-Za-z_-]+)", r.text)
+        if m:
+            r = requests.get(f"{url}&confirm={m.group(1)}", stream=True, timeout=120,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with open(dest, "wb") as fh:
+        for chunk in r.iter_content(chunk_size=65536):
+            if chunk:
+                fh.write(chunk)
+                n += len(chunk)
+    return n
+
+@app.route("/restore-drive", methods=["POST"])
+def restore_drive():
+    """Pull the whole working set back from the user's shared Google Drive
+    backup folder: *.webp -> assets/questions/<SUBJECT>/, known data files
+    -> data/, state.json -> output root. Everything else is ignored."""
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    folder = request.form.get("folder", "").strip()
+    m = _re.search(r"(?:folders/|[?&]id=|^\s*)([A-Za-z0-9_-]{10,})", folder)
+    if not m:
+        return "Drive folder link samajh nahi aaya", 400
+    folder_id = m.group(1)
+    with state_lock:
+        state["status"] = "processing"
+
+    def _do_restore():
+        try:
+            import html as _html
+            out = Path(OUTPUT_ROOT_ENV)
+            log(f"♻️ Restore started -- reading Drive folder listing ...")
+            lst = requests.get(f"https://drive.google.com/embeddedfolderview?id={folder_id}#list",
+                               timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+            lst.raise_for_status()
+            entries = _re.findall(r'file/d/([A-Za-z0-9_-]+)/[^"#]*"[^>]*>.*?flip-entry-title">([^<]+)<',
+                                  lst.text, _re.DOTALL)
+            seen, files = set(), []
+            for fid, name in entries:
+                name = _html.unescape(name).strip()
+                if fid not in seen and name:
+                    seen.add(fid)
+                    files.append((fid, name))
+            log(f"   found {len(files)} file(s) in the folder")
+            if not files:
+                raise RuntimeError("Folder se file list nahi mili -- Drive folder ka sharing "
+                                   "'Anyone with the link' pe set hai kya? Screenshot bhejo.")
+            ok, skipped, failed = 0, 0, 0
+            for i, (fid, name) in enumerate(files, 1):
+                low = name.lower()
+                if low.endswith((".webp", ".png", ".jpg", ".jpeg")):
+                    sub = name.split("-", 1)[0].upper()  # PSY-001-001_Q_01.webp -> PSY
+                    dest = out / "assets" / "questions" / sub / name
+                elif low in DRIVE_DATA_FILES:
+                    dest = out / "data" / name
+                elif low == "state.json":
+                    dest = out / "state.json"
+                else:
+                    skipped += 1
+                    continue
+                try:
+                    _fetch_drive_file(fid, dest)
+                    ok += 1
+                except Exception as fe:
+                    failed += 1
+                    log(f"   X {name}: {fe}")
+                if i % 25 == 0:
+                    log(f"   ... {i}/{len(files)} ({ok} restored)")
+            log(f"✅ Restore done: {ok} file(s) restored, {skipped} ignored (pdf/log etc.), "
+                f"{failed} failed")
+            q = out / "data" / "questions.jsonl"
+            if q.exists():
+                n = sum(1 for l in q.read_text(encoding="utf-8").splitlines() if l.strip())
+                log(f"📦 questions.jsonl = {n} questions -- data wapas aa gaya!")
+            else:
+                log("⚠️ questions.jsonl missing after restore -- folder me woh file hai kya?")
+            with state_lock:
+                state["status"] = "completed"
+            make_zip()
+        except Exception as e:
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = str(e)
+            log(f"❌ Restore error: {e}")
+            traceback.print_exc()
+
+    t = threading.Thread(target=_do_restore)
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
+
+@app.route("/restore-zip", methods=["POST"])
+def restore_zip():
+    """Extract a downloaded output_results.zip back into OUTPUT_DIR."""
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    f = request.files.get("file")
+    if not f or not f.filename.lower().endswith(".zip"):
+        return "output_results.zip file chahiye", 400
+    tmp = UPLOAD_DIR / "restore_upload.zip"
+    f.save(tmp)
+    with state_lock:
+        state["status"] = "processing"
+
+    def _do_restore_zip():
+        try:
+            import shutil as _sh
+            out = Path(OUTPUT_ROOT_ENV)
+            out.mkdir(parents=True, exist_ok=True)
+            n = 0
+            with zipfile.ZipFile(tmp) as zf:
+                for name in zf.namelist():
+                    clean = name.lstrip("/")
+                    if clean.startswith("./"):
+                        clean = clean[2:]
+                    if clean.startswith("qbank_output/"):
+                        clean = clean.split("/", 1)[1]
+                    if not clean or ".." in clean or clean.endswith("/"):
+                        continue
+                    dest = out / clean
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(name) as src, open(dest, "wb") as dst:
+                        _sh.copyfileobj(src, dst)
+                    n += 1
+            log(f"✅ Zip restored: {n} file(s) -> {out}")
+            q = out / "data" / "questions.jsonl"
+            if q.exists():
+                cnt = sum(1 for l in q.read_text(encoding="utf-8").splitlines() if l.strip())
+                log(f"📦 questions.jsonl = {cnt} questions -- data wapas aa gaya!")
+            with state_lock:
+                state["status"] = "completed"
+            make_zip()
+        except Exception as e:
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = str(e)
+            log(f"❌ Restore zip error: {e}")
+            traceback.print_exc()
+
+    t = threading.Thread(target=_do_restore_zip)
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
 
 @app.route("/download")
 def download():
