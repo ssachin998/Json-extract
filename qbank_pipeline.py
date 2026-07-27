@@ -523,6 +523,49 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
             print(f"  [WARN] [SWEEP] q{qn}: foreign 'Option' head but no verbatim donor "
                   f"-- kept, logged for review")
 
+    # 2b. foreign "Solution to Question N:" dump TAIL (external-audit class,
+    #     2026-07-27: on a dense solutions page the model sometimes returns
+    #     the FIRST record's item with its own correct solution PLUS the
+    #     verbatim solutions of every later question on that page concatenated
+    #     after 'Solution to Question 2:' headers; e.g. ch11 q1 carried
+    #     q1+q2+...+q8 in one 5689-char blob while q2..q8 ALSO owned their
+    #     own correct copies). sanitize_solution_text only trims such a tail
+    #     when it duplicates THIS record's own text; a tail holding the
+    #     neighbour's UNIQUE solution is kept there by caution. Here the
+    #     cross-record proof exists: if the header names a record of THIS
+    #     chapter that already owns a non-empty solution, the tail is provably
+    #     redundant -> trim at the FIRST such header. Donor-less headers are
+    #     left intact (never delete possibly-unique content) and flagged.
+    for qn in qns:
+        sol = chapter_records[qn].get("solution_text") or ""
+        if not sol:
+            continue
+        for m in SOLUTION_DUMP_HDR_RE.finditer(sol):
+            if m.start() <= 2:
+                continue  # leading header: sanitize_solution_text strips it at build
+            n = int(m.group(1))
+            if n == qn:
+                continue
+            donor_sol = chapter_records.get(n, {}).get("solution_text") or ""
+            if donor_sol.strip():
+                trimmed = sol[:m.start()].rstrip()
+                chapter_records[qn]["solution_text"] = trimmed
+                stats["solution_dumps_trimmed"] = stats.get("solution_dumps_trimmed", 0) + 1
+                iflag("foreign_solution_dump_trimmed", qn,
+                      f"embedded 'Solution to Question {n}:' header at char {m.start()} -- "
+                      f"tail trimmed ({len(sol) - len(trimmed)} chars); donor q{n} already owns "
+                      f"its solution ({len(donor_sol)} chars) -- redundancy proven")
+                print(f"  [SWEEP] q{qn}: trimmed foreign 'Solution to Question {n}:' dump tail "
+                      f"({len(trimmed)} chars kept; donor q{n} owns its own solution)")
+                if looks_truncated_solution(trimmed, has_tables=bool(chapter_records[qn].get("tables"))):
+                    forced_solution.add(qn)
+                break
+            iflag("foreign_solution_dump_review", qn,
+                  f"embedded 'Solution to Question {n}:' header but donor q{n} owns NO "
+                  f"solution -- tail kept (may be unique content), needs review",
+                  matched=False)
+            break
+
     # 3. truncated-solution suspects (023-007/006-009 class): deterministic
     #    dangling-end / mid-flow-cut patterns -- re-ask the FULL solution.
     for qn in qns:
@@ -778,6 +821,9 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                        (chapter_records[qn].get("solution_text") or ""),
                        has_tables=bool(chapter_records[qn].get("tables")))}
     still_incomplete = find_incomplete_records(chapter_records, force_solution_qns=live_forced)
+    # ALWAYS rewrite this chapter's ledger entries to the outcome of THIS run
+    # (possibly zero -- full heal must also clear stale rows), never blindly append.
+    _prune_still_incomplete(chapter_id)
     if still_incomplete:
         path = DATA_DIR / "still_incomplete_after_retry.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)  # same guard as save_state/_append_jsonl (fresh volume)
@@ -789,6 +835,28 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
               f"{max_rounds} round(s) -- logged to still_incomplete_after_retry.jsonl")
 
     return total_fixed
+
+def _prune_still_incomplete(chapter_id):
+    """Drop this chapter's OLD entries from still_incomplete_after_retry.jsonl.
+    The ledger was append-only: rows healed later (next retry round, recovery,
+    or the healer) left stale 'missing solution' entries behind (confirmed in
+    the 2026-07-27 external audit: 12 entries whose questions.jsonl rows were
+    actually complete). Rewriting per chapter keeps the ledger truthful."""
+    path = DATA_DIR / "still_incomplete_after_retry.jsonl"
+    if not chapter_id or not path.exists():
+        return
+    kept = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        if not ln.strip():
+            continue
+        try:
+            if json.loads(ln).get("chapter_id") == chapter_id:
+                continue
+        except json.JSONDecodeError:
+            pass
+        kept.append(ln)
+    path.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
+
 
 def pdftotext_page(pdf_path, true_page):
     out = subprocess.run(["pdftotext", "-f", str(true_page), "-l", str(true_page),
@@ -1105,6 +1173,9 @@ def build_carry_context(carry, overlap_pages):
 
 ANSWER_KEY_ROW_RE = re.compile(r"\|\s*(\d{1,3})\s*\|\s*([A-Da-d])\s*\|")
 SOLUTION_TO_Q_RE = re.compile(r"Solution to Question\s+(\d{1,3})", re.IGNORECASE)
+# Dump-tail detector (stricter): title-case header WITH colon, i.e. the real
+# printed "Solution to Question 2:" section header, not prose mentions.
+SOLUTION_DUMP_HDR_RE = re.compile(r"Solution to Question\s+(\d{1,3})\s*:")
 
 # --- stale carry-context guards (clarified RCA: the header-alone-at-page-end
 # split is NORMAL in this book for questions AND solutions, and the overlap

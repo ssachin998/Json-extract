@@ -273,6 +273,34 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 
 ---
 
+### 4.16 Changelog — 2026-07-27 (external-audit round 2, 26 tests green)
+
+Triggered by an independent zip audit of a duplicate test-run dataset (same
+trial book under two subject codes = 868 rows; 47 flags):
+
+1. **Foreign dump-tail trim (sweep step 2b)** — `chapter_integrity_sweep` now
+   trims an embedded `Solution to Question N:` tail when the numbered sibling
+   record in the same chapter already owns a non-empty solution (redundancy
+   proven). Donor-less tails kept + review-flagged. Origin: sanitize only
+   trimmed tails duplicating the record's OWN text; neighbours' unique text
+   was conservatively kept → the chapter's first solutions record could ship
+   a whole-page blob (was 27/47 flags in the audit).
+2. **still_incomplete ledger rewrite** — `_prune_still_incomplete(chapter_id)`
+   runs before every chapter's ledger write; healed rows can no longer leave
+   stale "missing" entries (was 12 stale entries in the audit).
+3. **Zip hygiene** — `make_zip` excludes healer `.bak-*` snapshots and the
+   `_archive/` tree.
+4. **Healer generalized** — P12/P13 are now content-signature gated for ANY
+   subject (not PSY-locked); NEW **P14** (generic embedded dump-tail trim with
+   donor guard, any subject) and **P15** (generic same-header sibling-table
+   completion, Erikson-class).
+5. **Dashboard 🧹 /reset** — Danger-zone button (requires typing RESET):
+   archives `data/`, `assets/`, `state.json` into `_archive/<ts>/` INSIDE the
+   volume (nothing deleted), giving each new book a clean slate. Reset is
+   400-blocked without a mounted Volume or while a run is processing.
+
+---
+
 ## 11. What feedback is wanted from the reviewer
 
 - Correctness bugs / race conditions / data-loss paths in `qbank_pipeline.py` (merge, resume, quota exits).

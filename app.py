@@ -10,7 +10,9 @@ in qbank_pipeline.py — this file does not duplicate or replace any of that.
 """
 
 import os
+import shutil
 import threading
+import time
 import traceback
 import zipfile
 from pathlib import Path
@@ -110,8 +112,14 @@ def make_zip():
     zpath = Path("output_results.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in out.rglob("*"):
-            if f.is_file():
-                zf.write(f, f.relative_to(out.parent))
+            if not f.is_file():
+                continue
+            rel = f.relative_to(out)
+            if ".bak-" in f.name:
+                continue  # healer backups are raw snapshots, not dataset content
+            if rel.parts and rel.parts[0] == "_archive":
+                continue  # /reset archives live on the volume, not in exports
+            zf.write(f, f.relative_to(out.parent))
 
 PAGE = """
 <!DOCTYPE html>
@@ -165,6 +173,18 @@ PAGE = """
       </form>
     </details>
     <p class="text-xs text-gray-500">Order: <b>Restore</b> (data waapas) → <b>🩹 Fix</b> → <b>🔍 Check</b>. Har step ke baad black log box ka screenshot bhejo.</p>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 border-2 border-red-500 space-y-2">
+    <p class="text-xs font-bold text-red-700 uppercase">Danger zone — new book ke liye clean slate</p>
+    <p class="text-xs text-gray-600">Purane output ko volume ke andar <b>_archive/</b> folder me move karke fresh start karta hai (delete NAHI hota — waapas la sakte ho). Zip me archive include nahi hota.</p>
+    <form action="/reset" method="POST" class="space-y-2"
+          onsubmit="return this.confirm.value === 'RESET' ? true : (alert('Box me RESET likho'), false);">
+      <input type="text" name="confirm" placeholder="Yahan RESET likho" class="w-full text-sm border p-2 rounded">
+      <button class="w-full bg-red-600 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        🧹 Reset output (pehle sab archive hota hai)
+      </button>
+    </form>
   </div>
 
   <div class="bg-white rounded-lg shadow p-4 border-2 border-emerald-500 space-y-3">
@@ -521,6 +541,46 @@ def validate():
     t = threading.Thread(target=_do_validate)
     t.daemon = True
     t.start()
+    return redirect(url_for("index"))
+
+@app.route("/reset", methods=["POST"])
+def reset_output():
+    """Clean-slate for the NEXT book: move current output into
+    _archive/<timestamp>/ INSIDE the volume (nothing is deleted), so a
+    fresh run starts with empty data/assets/state. Needed because test
+    runs accumulate alongside real data (e.g. the same trial book run
+    twice under two subject codes = 868 duplicate rows in one volume)."""
+    if VOLUME_WARN:
+        return ("Volume /data pe attach nahi hai -- reset blocked (archive bhi kahin "
+                "survive nahi karegi). Pehle Volume lagao.", 400)
+    if request.form.get("confirm", "").strip().upper() != "RESET":
+        return "Confirmation ke liye box me RESET likho.", 400
+    if state["status"] == "processing":
+        return "Run chal raha hai -- pehle complete hone do.", 400
+    out = Path(OUTPUT_ROOT_ENV)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    arch = out / "_archive" / stamp
+    moved = []
+    try:
+        for name in ("data", "assets"):
+            src = out / name
+            if src.exists():
+                arch.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(arch / name))
+                moved.append(f"{name}/")
+        sf = out / "state.json"
+        if sf.exists():
+            arch.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(sf), str(arch / "state.json"))
+            moved.append("state.json")
+        log(f"🧹 RESET complete -- archived: {', '.join(moved) if moved else '(already clean)'} "
+            f"-> _archive/{stamp}/ (volume ke andar hi safe hai; zip me include nahi hota)")
+        log("🆕 Fresh start -- ab nayi book run karo.")
+    except Exception as e:
+        log(f"❌ Reset failed: {e}")
+        traceback.print_exc()
+        return f"Reset failed: {e}", 500
+    make_zip()
     return redirect(url_for("index"))
 
 @app.route("/data-status")

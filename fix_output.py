@@ -239,38 +239,125 @@ def patch_all(rows, assets_q):
         else:
             act("P11", "SKIP", "PSY-001-011 stage table already complete")
 
-    # ---- P12: PSY-009-017 foreign tail. Row-verified: the text after its
-    # real vascular-dementia discussion ('The given clinical scenario of a
-    # patient with progressive cognitive impairment...' + Statement/Option
-    # lines) belongs to OTHER questions -- the same sentences already live
-    # VERBATIM in PSY-009-012's solution. Trim + archive.
-    r = by_id.get("PSY-009-017")
-    if r:
-        st = r["solution"]["text"] or ""
+    # ---- P12: *-009-017 foreign tail (ANY subject -- the same trial book
+    # run under a second subject code carries the identical defect).
+    # Row-verified: the text after its real vascular-dementia discussion
+    # belongs to OTHER questions -- the same sentences already live
+    # VERBATIM in *-009-012's solution. Content-signature gated. Trim + archive.
+    p12_hits = []
+    for r in rows:
+        st = (r.get("solution") or {}).get("text") or ""
         MARK = "The given clinical scenario of a patient with progressive cognitive impairment"
         if MARK in st and "large-vessel territories." in st:
             cut = st.index(MARK)
-            act("P12", "APPLY", "PSY-009-017 foreign tail trimmed "
-                                 "(duplicated Alzheimer's content already in PSY-009-012)",
-                archived=st[cut:])
+            p12_hits.append(r.get("id"))
+            archive.append({"patch": "P12", "id": r.get("id"), "archived": st[cut:]})
             r["solution"]["text"] = st[:cut].rstrip()
-        else:
-            act("P12", "SKIP", "PSY-009-017 has no foreign tail")
-
-    # ---- P13: PSY-031-003 mislabeled explanation line. Own options:
-    # C = Persistent motor tic disorder (the CORRECT answer, needs no
-    # rebuttal), D = Late onset autism. The 'Option C: ... rule out autism'
-    # line discusses AUTISM, i.e. it is the rebuttal of own option D with
-    # a wrong letter. Relabel C->D; content untouched.
-    r = by_id.get("PSY-031-003")
-    if r and "Option C: Normal social milestones rule out autism." in (r["solution"]["text"] or ""):
-        r["solution"]["text"] = r["solution"]["text"].replace(
-            "Option C: Normal social milestones rule out autism.",
-            "Option D: Normal social milestones rule out autism.")
-        act("P13", "APPLY", "PSY-031-003 autism line relabeled 'Option C' -> 'Option D' "
-                            "(own D = Late onset autism; own C is the correct answer)")
+    if p12_hits:
+        act("P12", "APPLY", f"foreign Alzheimer's tail trimmed on {', '.join(p12_hits)} "
+                            f"(duplicated content already in the chapter's 009-012 row)")
     else:
-        act("P13", "SKIP", "PSY-031-003 line already sane")
+        act("P12", "SKIP", "no row carries the 009-017 foreign tail signature")
+
+    # ---- P13: *-031-003 mislabeled explanation line (ANY subject). Own
+    # options: C = Persistent motor tic disorder (the CORRECT answer, needs
+    # no rebuttal), D = Late onset autism. The 'Option C: ... rule out autism'
+    # line is the rebuttal of own option D with a wrong letter. Relabel
+    # C->D; content untouched.
+    p13_hits = []
+    for r in rows:
+        st = (r.get("solution") or {}).get("text") or ""
+        if "Option C: Normal social milestones rule out autism." in st:
+            r["solution"]["text"] = st.replace(
+                "Option C: Normal social milestones rule out autism.",
+                "Option D: Normal social milestones rule out autism.")
+            p13_hits.append(r.get("id"))
+    if p13_hits:
+        act("P13", "APPLY", f"autism line relabeled 'Option C' -> 'Option D' on "
+                            f"{', '.join(p13_hits)} (own D = Late onset autism; "
+                            f"own C is the correct answer)")
+    else:
+        act("P13", "SKIP", "no row carries the mislabeled 031-003 line")
+
+    # ---- P14: embedded 'Solution to Question N:' dump tail (ANY subject,
+    # external-audit 2026-07-27: e.g. the chapter's first solutions record
+    # carried its own correct answer PLUS the verbatim solutions of every
+    # later question on the page -- ch11 q1 held q1..q8 in one 5689-char
+    # blob). Donor guard: trim at the FIRST embedded header only when the
+    # numbered sibling row in the SAME chapter already owns a non-empty
+    # solution (tail = provably redundant). Donor-less tails are kept.
+    DUMP_RE = re.compile(r"Solution to Question\s+(\d{1,3})\s*:")
+    p14_hits = []
+    for r in rows:
+        st = (r.get("solution") or {}).get("text") or ""
+        if not st:
+            continue
+        own_id = r.get("id", "")
+        m_own = re.search(r"-(\d{3})$", own_id)
+        own_q = int(m_own.group(1)) if m_own else None
+        for m in DUMP_RE.finditer(st):
+            if m.start() <= 2:
+                continue  # leading header: harmless furniture, validator-LOW
+            n = int(m.group(1))
+            if n == own_q:
+                continue
+            donor = by_id.get(f"{r.get('chapter_id')}-{n:03d}")
+            donor_sol = ((donor or {}).get("solution") or {}).get("text") or ""
+            if donor_sol.strip():
+                archive.append({"patch": "P14", "id": own_id,
+                                "archived": st[m.start():],
+                                "reason": f"foreign 'Solution to Question {n}:' dump tail; "
+                                          f"donor {donor.get('id')} owns its solution"})
+                p14_hits.append(f"{own_id} ('Solution to Question {n}:' @char {m.start()}, "
+                                f"{len(st) - len(st[:m.start()].rstrip())} chars removed)")
+                r["solution"]["text"] = st[:m.start()].rstrip()
+            break  # first embedded foreign header decides; donor-less -> keep
+    if p14_hits:
+        act("P14", "APPLY", "dump tail trimmed on: " + "; ".join(p14_hits))
+    else:
+        act("P14", "SKIP", "no embedded 'Solution to Question N:' dump tails found")
+
+    # ---- P15: sibling table completion (Erikson-class, ANY chapter/subject).
+    # Two tables in one chapter share the SAME normalized markdown header row
+    # and one is a strict superset (recipient's every body row appears in the
+    # donor, donor has extra rows) -> the shorter print reused the same
+    # printed table but the extraction dropped rows; extend recipient with the
+    # donor's VERBATIM extra rows.
+    by_ch = {}
+    for r in rows:
+        by_ch.setdefault(r.get("chapter_id"), []).append(r)
+    p15_hits = []
+    for cid, ch_rows in by_ch.items():
+        tabs = []  # (row, table_index, header_norm, body_rows)
+        for r in ch_rows:
+            for ti, t in enumerate((r.get("solution") or {}).get("tables") or []):
+                md_lines = [ln for ln in (t.get("markdown") or "").splitlines() if ln.strip()]
+                if len(md_lines) < 3:
+                    continue
+                header_norm = _norm_md(md_lines[0])
+                body = [ln for ln in md_lines[1:] if set(ln.strip()) - set("|-: ")]
+                tabs.append((r, ti, header_norm, body))
+        for i in range(len(tabs)):
+            for j in range(len(tabs)):
+                if i == j:
+                    continue
+                ri, ti, hi, bi = tabs[i]
+                rj, tj, hj, bj = tabs[j]
+                if hi != hj or not bi or len(bj) <= len(bi):
+                    continue
+                norm_bi, norm_bj = {_norm_md(x) for x in bi}, {_norm_md(x) for x in bj}
+                if not norm_bi <= norm_bj:
+                    continue  # different rows, not a truncation of the donor
+                extras = [x for x in bj if _norm_md(x) not in norm_bi]
+                ri["solution"]["tables"][ti]["markdown"] = \
+                    ri["solution"]["tables"][ti]["markdown"].rstrip() + "\n" + "\n".join(extras)
+                p15_hits.append(f"{ri.get('id')} table[{ti}] +{len(extras)} row(s) "
+                                f"from {rj.get('id')} (same printed table)")
+                break  # one donor per recipient per run; idempotent after
+    if p15_hits:
+        act("P15", "APPLY", "sibling-completed: " + "; ".join(p15_hits))
+    else:
+        act("P15", "SKIP", "no same-header truncated sibling tables found")
 
     return rows, actions, archive
 
