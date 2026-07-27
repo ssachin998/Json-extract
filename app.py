@@ -139,6 +139,10 @@ PAGE = """
   </div>
   {% endif %}
 
+  <div class="bg-violet-700 text-white rounded-lg shadow p-3 text-sm font-bold">
+    🧪 V2 — Multi-Phase 3-Pass pipeline (Q/A/S). Iska output ALAG root me jata hai — v1 data ko koi asar nahi.
+  </div>
+
   <div class="bg-white rounded-lg shadow p-4">
     <p class="text-sm mb-2">Status: <span class="font-semibold">{{ state.status }}</span></p>
     {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
@@ -187,8 +191,36 @@ PAGE = """
     </form>
   </div>
 
+  <div class="bg-white rounded-lg shadow p-4 border-2 border-violet-500 space-y-3">
+    <p class="text-xs font-bold text-violet-700 uppercase">🧪 V2 smoke test — sirf 1 chapter</p>
+    <p class="text-xs text-gray-600">Full book lagane se pehle ek chapter test karo. Output <b>_v2test/</b> folder me jata hai — asli data bilkul safe.</p>
+    <form action="/v2-test" method="POST" class="space-y-3">
+      <div>
+        <label class="block text-sm font-semibold mb-1">PDF link (Google Drive / direct URL)</label>
+        <input type="url" name="pdf_url" class="w-full text-sm border p-2 rounded" placeholder="https://..." required>
+      </div>
+      <div class="grid grid-cols-3 gap-2">
+        <div>
+          <label class="block text-xs font-semibold mb-1">Subject</label>
+          <input type="text" name="subject_code" maxlength="3" placeholder="PSY" class="w-full text-sm border p-2 rounded" required>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold mb-1">Chapter no</label>
+          <input type="number" name="chapter_no" min="1" placeholder="11" class="w-full text-sm border p-2 rounded" required>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold mb-1">Page offset</label>
+          <input type="number" name="page_offset" value="-1" class="w-full text-sm border p-2 rounded">
+        </div>
+      </div>
+      <button class="w-full bg-violet-600 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
+        🧪 Run V2 test (1 chapter)
+      </button>
+    </form>
+  </div>
+
   <div class="bg-white rounded-lg shadow p-4 border-2 border-emerald-500 space-y-3">
-    <p class="text-xs font-bold text-emerald-700 uppercase">Recommended for phone</p>
+    <p class="text-xs font-bold text-emerald-700 uppercase">Recommended for phone — FULL BOOK (v2)</p>
     <form action="/run-url" method="POST" class="space-y-3">
       <div>
         <label class="block text-sm font-semibold mb-1">PDF link (Google Drive / Telegram / direct download URL)</label>
@@ -376,6 +408,103 @@ def run_url():
     t.daemon = True
     t.start()
     return redirect(url_for("index"))
+
+@app.route("/v2-test", methods=["POST"])
+def v2_test():
+    """Smoke-test the v2 3-pass flow on ONE chapter, output into an isolated
+    <OUTPUT_ROOT>_v2test/ folder -- never touches real data. Phone-friendly
+    equivalent of running test_v2_chapter.py on the server."""
+    if state["status"] == "processing":
+        return redirect(url_for("index"))
+    pdf_url = resolve_download_url(request.form.get("pdf_url", "").strip())
+    subject_code = request.form.get("subject_code", "").strip().upper() or "TST"
+    try:
+        chapter_no = int(request.form.get("chapter_no", ""))
+    except ValueError:
+        return "Chapter number do (e.g. 11)", 400
+    page_offset = parse_page_offset()
+    if not pdf_url:
+        return "No URL provided", 400
+    with state_lock:
+        state["status"] = "processing"
+
+    def download_then_test():
+        try:
+            log("⬇️ [V2-TEST] Downloading PDF...")
+            fname = secure_filename(pdf_url.split("/")[-1].split("?")[0]) or f"{subject_code}.pdf"
+            if not fname.lower().endswith(".pdf"):
+                fname = f"{subject_code}.pdf"
+            pdf_path = UPLOAD_DIR / fname
+            r = requests.get(pdf_url, stream=True, timeout=120,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            if "text/html" in r.headers.get("Content-Type", ""):
+                m = _re.search(r'confirm=([0-9A-Za-z_-]+)', r.text)
+                if m:
+                    r = requests.get(f"{pdf_url}&confirm={m.group(1)}", stream=True,
+                                     timeout=120, headers={"User-Agent": "Mozilla/5.0"})
+                    r.raise_for_status()
+            first_chunk = None
+            with open(pdf_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        first_chunk = first_chunk or chunk
+                        f.write(chunk)
+            if not first_chunk or not first_chunk.startswith(b"%PDF"):
+                pdf_path.unlink(missing_ok=True)
+                with state_lock:
+                    state["status"] = "failed"
+                    state["error"] = "Downloaded content is not a valid PDF"
+                log("❌ [V2-TEST] link se asli PDF nahi mila (webpage aa gaya).")
+                return
+            log(f"✅ [V2-TEST] Downloaded {fname}")
+
+            # isolated output root for the smoke test
+            test_root = Path(str(Path(OUTPUT_ROOT_ENV)) + "_v2test")
+            pipeline.OUTPUT_ROOT = test_root
+            pipeline.DATA_DIR = test_root / "data"
+            pipeline.ASSETS_DIR = test_root / "assets"
+            pipeline.STATE_FILE = test_root / "state.json"
+            pipeline.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+            cfg = {"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}
+            st = pipeline.load_state()
+            chapters_out = []
+            log(f"🧪 [V2-TEST] {subject_code} chapter {chapter_no} (3-pass chal raha hai)...")
+            import google.generativeai as genai
+            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+            model = genai.GenerativeModel(pipeline.GEMINI_MODEL)
+            q_path = pipeline.DATA_DIR / "questions.jsonl"
+            with open(q_path, "a", encoding="utf-8") as qfh:
+                pipeline.process_pdf(cfg, st, model, chapters_out, qfh,
+                                     only_chapter_no=chapter_no)
+            import json as _json
+            rows = [_json.loads(l) for l in q_path.read_text().splitlines() if l.strip()] \
+                if q_path.exists() else []
+            n = len(rows)
+            ma = sum(1 for r in rows if not r.get("correct_options"))
+            ms = sum(1 for r in rows if not (r.get("solution") or {}).get("text"))
+            log(f"📊 [V2-TEST] Result: {n} questions | missing answer: {ma} | "
+                f"missing solution: {ms} (output: _v2test/ folder, asli data safe ✅)")
+            with state_lock:
+                state["status"] = "completed"
+            log("✅ [V2-TEST] Done! Clean lagne pe full book Run karo (v2 neeche emerald card se).")
+        except SystemExit:
+            with state_lock:
+                state["status"] = "paused"
+            log("⏸ [V2-TEST] daily Gemini limit -- kal dobara dabana.")
+        except Exception as e:
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = str(e)
+            log(f"❌ [V2-TEST] error: {e}")
+            traceback.print_exc()
+
+    t = threading.Thread(target=download_then_test)
+    t.daemon = True
+    t.start()
+    return redirect(url_for("index"))
+
 
 @app.route("/run", methods=["POST"])
 def run():

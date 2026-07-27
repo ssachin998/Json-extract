@@ -361,8 +361,197 @@ SAFETY_SETTINGS = [
 # explains this rape survivor's amnesia") -- BLOCK_ONLY_HIGH keeps obviously
 # harmful content blocked while allowing legitimate clinical material through.
 
-def call_gemini_on_pages(model, image_paths, context=""):
-    parts = [SCHEMA_PROMPT]
+# ============================================================
+# V2 — MULTI-PHASE (3-PASS) ARCHITECTURE
+# Same pages, three small focused asks instead of one big ask.
+# Why: the v1 single-pass prompt made the model juggle stems+options,
+# answer keys AND solutions in one response -- its per-call attention
+# budget split three ways, causing context bleeding (wrong-owner stems),
+# glued solution blobs and dropped key rows. Small focused asks are
+# measurably more accurate (the same principle as targeted_retry).
+#
+# QUOTA NOTE: this is NOT "3x every call". A zero-token pdftotext probe
+# decides per batch which passes are even worth a call:
+#   * questions-section batch -> Q-pass only (A/S skipped)
+#   * solutions-section batch -> S-pass only (Q skipped, sticky)
+#   * batch whose pages print an answer-key table -> +A-pass
+# On the trial book this lands very close to v1's total call count while
+# each call is narrower and cleaner.
+# ============================================================
+
+PIPELINE_TAG = "v2-3pass"
+
+_BATCH_META_BLOCK = """- BATCH META (required): after the last object, append ONE extra control
+  object describing how the LAST page of this batch ends:
+  {"_batch_meta": {"last_q_no": <int or null>,
+                   "ends_mid_content": true|false,
+                   "cut_part": "question"|"options"|"solution"|null,
+                   "tail_text": "<verbatim last ~25 words at the bottom of
+                                 the last page, else empty string>"}}
+- Output ONLY the JSON array, no commentary, no markdown code fences.
+"""
+
+SCHEMA_PROMPT_Q = """You are extracting MCQ QUESTIONS from scanned textbook pages into strict JSON.
+This is the QUESTION-ONLY pass. Extract question stems, options and any table
+that is part of a QUESTION. DO NOT extract answers or solutions/explanations
+in this pass -- a separate pass handles those; never copy solution prose here.
+
+Return a JSON array. Each element is one question:
+{
+  "q_no": <question number as printed>,
+  "question_text": "..." | null,
+  "options": {"A": "...", "B": "...", "C": "...", "D": "..."} | null,
+  "correct_option": null,
+  "solution_text": null,
+  "tables": [{"type": "short_label", "markdown": "| col | col |\\n|---|---|\\n..."}],
+  "has_figure_in_question": true|false,
+  "has_figure_in_solution": false
+}
+
+Rules:
+- Preserve every word verbatim. Do NOT summarize or paraphrase.
+- NEVER invent a question number. If text at the top of the FIRST page is a
+  continuation from BEFORE these pages (starts mid-sentence, no number
+  visible), return it as one item with "q_no": null and the visible fragment
+  under "question_text"/"options".
+- If a question's options are split across two pages, only include the
+  options actually visible on THIS batch -- they merge automatically.
+- If a visible line is clearly an answer-letter line or explanation prose
+  (not a stem/option), SKIP it -- do not force it into an item.
+- CONTEXT HANDLING: a "CONTEXT FROM PREVIOUS BATCH" text block may precede
+  the page images. Use it ONLY to continue the referenced item under its
+  original q_no -- never output that context text as a new item. Leading
+  page-images may be OVERLAP from the previous batch (continuity only):
+  if a stem/options visibly SPAN from an overlap page into new pages,
+  combine both sides into ONE complete item under its printed q_no.
+""" + _BATCH_META_BLOCK
+
+SCHEMA_PROMPT_A = """You are reading ANSWER KEYS from scanned textbook pages into strict JSON.
+This is the ANSWER-KEY-ONLY pass. Your ONLY job: extract the mapping from
+question number to correct option letter, wherever it is printed on these
+pages (dedicated key tables, or answer lines printed beside questions).
+
+Return a JSON array with ONE entry PER ROW you can see:
+{"q_no": <int>, "question_text": null, "options": null,
+ "correct_option": "A" | "B" | "C" | "D",
+ "solution_text": null, "tables": [],
+ "has_figure_in_question": false, "has_figure_in_solution": false}
+
+Rules:
+- READ THIS CAREFULLY: any table with a "Question No." / "Q.No" column and a
+  "Correct Option" / "Answer" column -- however many rows -- MUST produce one
+  JSON entry PER ROW. A 20-row table = 20 entries, not one summary entry.
+  Do not skip rows, do not summarize the table, do not describe it in prose.
+- Normalise the letter to UPPERCASE A/B/C/D. If a row's letter is illegible,
+  SKIP that row entirely -- never guess.
+- Preserve row order and letters exactly as printed (verbatim accuracy).
+- Return ONLY the rows you can actually see on THESE pages. If no key/answer
+  is printed here, return an empty array [].
+""" + _BATCH_META_BLOCK.replace(
+    '"cut_part": "question"|"options"|"solution"|null', '"cut_part": null')
+
+SCHEMA_PROMPT_S = """You are extracting printed SOLUTIONS / EXPLANATIONS from scanned textbook
+pages into strict JSON. This is the SOLUTION-ONLY pass. DO NOT extract
+question stems or options in this pass -- a separate pass handles those.
+
+Return a JSON array. Each element is one question's solution:
+{
+  "q_no": <question number the solution is printed for>,
+  "question_text": null,
+  "options": null,
+  "correct_option": "A" | "B" | "C" | "D" | null,   // only if "Ans: B" style is printed
+  "solution_text": "..." ,
+  "tables": [{"type": "short_label", "markdown": "| col | col |\\n|---|---|\\n..."}],
+  "has_figure_in_question": false,
+  "has_figure_in_solution": true|false
+}
+
+Rules:
+- Preserve every word verbatim. Do NOT summarize or paraphrase.
+- NEVER invent a question number -- use ONLY numbers explicitly printed with
+  the solution (e.g. "Solution to Question 4:" -> q_no 4). If the top of the
+  FIRST page continues a solution from BEFORE these pages with no number
+  visible, return it as one item with "q_no": null under "solution_text".
+- ONE ENTRY PER QUESTION. The text of EACH question's solution goes ONLY into
+  that question's own entry. Text printed after a "Solution to Question N:"
+  header belongs to q_no N, never to an earlier entry.
+- Any table inside a solution must become a markdown table string in "tables".
+- CONTEXT HANDLING: a "CONTEXT FROM PREVIOUS BATCH" text block may precede
+  the page images. Use it ONLY to continue the referenced solution under its
+  original q_no -- never output that context text as a new item. Leading
+  page-images may be OVERLAP (continuity only): if a solution visibly SPANS
+  from an overlap page into new pages, combine both sides into ONE complete
+  entry under its printed q_no.
+""" + _BATCH_META_BLOCK
+
+# Zero-token pdftotext probes that decide which passes a batch even needs.
+KEY_TABLE_PROBE_RE = re.compile(
+    r"(question\s*no|q\.?\s*no)[^\n]{0,40}(correct\s*option|answer)"
+    r"|answer\s*key", re.IGNORECASE)
+SOLUTION_PROBE_RE = re.compile(
+    r"solution\s+to\s+question\s+\d{1,3}\s*:", re.IGNORECASE)
+
+# Claude's mandated Task-4 marker (kept verbatim for audit parity) -- the
+# SAFE clipping built around it lives in clip_pass_solutions(); the naive
+# "cut at first match" version is NOT used anywhere because it can delete
+# unique neighbour content when the model fails to emit sibling items.
+SOLUTION_MARKER_RE = re.compile(r'(?i)solution\s+to\s+question\s+(\d+)\s*:', re.MULTILINE)
+
+
+def clip_pass_solutions(items):
+    """V2 S-pass response parser guard (Task 4, hardened).
+
+    For every item, clip a foreign "Solution to Question N:" tail ONLY when
+    the tail is provably redundant -- i.e. the numbered question appears as
+    its OWN sibling item in the same response (the model emitted both, so
+    nothing unique is lost). Steps per item:
+      1. strip LEADING "Solution to Question N:" furniture headers (all of
+         them -- never clip-to-empty, which the naive version would do);
+      2. scan for an embedded header naming a DIFFERENT q_no that exists as a
+         sibling item -> hard-cut before it;
+      3. an embedded header naming a q_no with NO sibling item is LEFT
+         INTACT (possibly unique neighbour content) -- the chapter-level
+         integrity sweep trims it later with a chapter-wide donor proof.
+    Returns (items, n_clipped)."""
+    def _qn(it):
+        try:
+            q = it.get("q_no")
+            return int(q) if q is not None and not isinstance(q, bool) else None
+        except (TypeError, ValueError):
+            return None
+
+    sibling_qns = {q for q in (_qn(it) for it in items) if q is not None}
+    n_clipped = 0
+    for it in items:
+        s = it.get("solution_text") or ""
+        if not s:
+            continue
+        orig = s
+        own = _qn(it)
+        # 1. leading furniture headers
+        while True:
+            m = re.match(r"\s*Solution\s+to\s+Question\s+\d{1,3}\s*[:.\-]?\s*",
+                         s, re.IGNORECASE)
+            if not m:
+                break
+            s = s[m.end():]
+        # 2. provably-redundant foreign tail
+        for m in SOLUTION_MARKER_RE.finditer(s):
+            if m.start() == 0:
+                continue
+            n = int(m.group(1))
+            if own is not None and n == own:
+                continue
+            if n in sibling_qns:
+                s = s[:m.start()].rstrip()
+                n_clipped += 1
+            break  # 3. donor-less tails are left for the chapter sweep
+        if s != orig:
+            it["solution_text"] = s
+    return items, n_clipped
+
+def call_gemini_on_pages(model, image_paths, context="", prompt=None):
+    parts = [prompt or SCHEMA_PROMPT]
     if context:
         parts.append(context)  # carry-forward / overlap context (stateless API)
     for p in image_paths:
@@ -386,7 +575,7 @@ def call_gemini_on_pages(model, image_paths, context=""):
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     return json.loads(text)
 
-def retry_batch_page_by_page(model, batch, state, ctx=None):
+def retry_batch_page_by_page(model, batch, state, ctx=None, prompt=None):
     """A whole-batch failure (RECITATION/safety finish_reason, token limit)
     is usually caused by just ONE page in the batch. Retrying each page
     alone isolates the bad page instead of losing the whole batch's worth
@@ -408,7 +597,7 @@ def retry_batch_page_by_page(model, batch, state, ctx=None):
             save_state(state)
             sys.exit(0)
         try:
-            items.extend(call_gemini_on_pages(model, [pf]))
+            items.extend(call_gemini_on_pages(model, [pf], prompt=prompt))
             state["calls_today"] += 1
             recovered += 1
         except Exception as e2:
@@ -862,6 +1051,31 @@ def pdftotext_page(pdf_path, true_page):
     out = subprocess.run(["pdftotext", "-f", str(true_page), "-l", str(true_page),
                           "-layout", str(pdf_path), "-"], capture_output=True, text=True)
     return out.stdout or ""
+
+
+def probe_batch_pages(pdf_path, window_pages):
+    """V2 zero-token pass-activation probe. Reads the pdftotext layer of the
+    batch's pages ONCE (one subprocess for the whole window) and decides which
+    of the 3 passes are worth a Gemini call:
+      key_table=True  -> pages print an answer-key table  -> run A-pass
+      solutions=True  -> pages print 'Solution to Question N:' -> run S-pass
+    Text layer is used ONLY for activation decisions, never as content. On any
+    probe failure (scanned-only PDF, pdftotext missing) fall back to running
+    ALL passes -- accuracy must never depend on the text layer existing."""
+    try:
+        lo, hi = min(window_pages), max(window_pages)
+        out = subprocess.run(["pdftotext", "-f", str(lo), "-l", str(hi),
+                              "-layout", str(pdf_path), "-"],
+                             capture_output=True, text=True)
+        text = out.stdout or ""
+    except Exception:
+        return {"key_table": True, "solutions": True, "probe_failed": True}
+    if not text.strip():
+        return {"key_table": True, "solutions": True, "probe_failed": True}
+    # >=2 solution headers = a real solutions page, not a stray cross-reference
+    return {"key_table": bool(KEY_TABLE_PROBE_RE.search(text)),
+            "solutions": len(SOLUTION_PROBE_RE.findall(text)) >= 2,
+            "probe_failed": False}
 
 
 def qns_printed_on_page(pdf_path, true_page, chapter_records):
@@ -2047,7 +2261,11 @@ def _append_jsonl(path, obj):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
+def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
+                only_chapter_no=None):
+    """only_chapter_no (v2 test hook): when set, every other chapter is
+    skipped -- lets test_v2_chapter.py run the full 3-pass machinery on ONE
+    chapter without touching the rest of the book."""
     subject = pdf_cfg["subject"]
     pdf_path = pdf_cfg["path"]
     progress = state["pdf_progress"].setdefault(subject, {"chapters_done": [], "current": None})
@@ -2061,6 +2279,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
 
     for ch in chapters:
         chapter_id = f"{subject}-{ch['chapter_no']:03d}"
+        if only_chapter_no is not None and ch["chapter_no"] != only_chapter_no:
+            continue
         if chapter_id in progress["chapters_done"]:
             continue
 
@@ -2087,10 +2307,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
                  "carry_used": 0, "carry_merges": 0,
                  "orphans_recovered": 0, "orphans_buffered": 0, "orphans_remaining": 0,
                  "chapter_id": chapter_id}
-        carry_from_prev = None     # FEATURE 2 payload for the NEXT request
-        carry_tracker = {}         # q_no -> batch-seq its UNRESOLVED carry opened
-        carry_banned = set()       # expired q_nos: never respawn a carry this chapter
-        answers_section_seen = False
+        # V2: per-pass carry-forward state (Q-pass and S-pass track their own
+        # open items; A-pass items are one-shot key rows, no carry needed).
+        carry_by_pass = {"Q": None, "S": None}     # FEATURE 2 payloads, per pass
+        carry_trackers = {"Q": {}, "S": {}}        # q_no -> batch-seq of UNRESOLVED carry
+        carry_banned = {"Q": set(), "S": set()}    # expired q_nos: never respawn
+        solutions_section_seen = False             # sticky once the Solutions section begins
         prev_window_last_page = None
 
         overlap = max(0, min(BATCH_OVERLAP_PAGES, PAGES_PER_GEMINI_CALL - 1))
@@ -2099,108 +2321,153 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh):
             if batch_start and batch_start + overlap >= len(page_files):
                 break  # trailing window would contain ONLY overlap pages
                        # (nothing new) -- don't spend a quota call on it
-            reset_daily_counter_if_needed(state)
-            if state["calls_today"] >= MAX_CALLS_PER_DAY:
-                print("Daily Gemini call limit reached. Saving progress, exiting.")
-                save_state(state)
-                sys.exit(0)
-
             batch = page_files[batch_start:batch_start + PAGES_PER_GEMINI_CALL]
             window_pages = [int(p.stem.split("-")[-1]) for p in batch]
             overlap_pages = [pn for pn in window_pages
                              if prev_window_last_page is not None and pn <= prev_window_last_page]
             new_pages = [pn for pn in window_pages if pn not in overlap_pages]
-            carry_in = carry_from_prev                      # context for THIS call
-            context_str = build_carry_context(carry_in, overlap_pages)
-            if carry_in:
-                stats["carry_used"] += 1
-            try:
-                raw_items = call_gemini_on_pages(genai_model, batch, context=context_str)
-                state["calls_today"] += 1
-                save_state(state)
-            except Exception as e:
-                err_text = str(e)
-                if "429" in err_text or "quota" in err_text.lower():
-                    # Free tier = ~1500 req/day PER DAY but also capped PER MINUTE
-                    # (~15 RPM). A burst 429 is NOT the daily cap -- back off once
-                    # and retry before declaring the whole day over.
-                    print(f"  [429] rate limited on {subject} ch{ch['chapter_no']} batch {batch_start}"
-                          f" -- backing off 65s (could be the per-minute cap, not the daily one)")
-                    time.sleep(65)
-                    try:
-                        raw_items = call_gemini_on_pages(genai_model, batch, context=context_str)
-                        state["calls_today"] += 1
-                        save_state(state)
-                    except Exception as e2:
-                        t2 = str(e2)
-                        if "429" in t2 or "quota" in t2.lower():
-                            print(f"  [QUOTA] still limited after 65s backoff -- daily cap it is. "
-                                  f"Saving progress, exiting: {e2}")
+            stats["batches"] += 1
+
+            # V2 pass activation (zero-token pdftotext probe + sticky section
+            # state): questions-section batch -> Q-pass only; solutions
+            # section -> S-pass only; key tables / solution headers detected
+            # on THESE pages -> +A-pass / S-pass. This keeps the call count
+            # near v1 levels while every call is narrower. A probe failure
+            # (scanned-only PDF) returns all-True -> all passes run (safe).
+            probe = probe_batch_pages(pdf_path, window_pages)
+            do_s = solutions_section_seen or probe["solutions"]
+            do_a = probe["key_table"]
+            do_q = not solutions_section_seen
+            if not (do_q or do_s or do_a):
+                do_q = True  # eerily silent page (figures only?) -- default to Q-pass
+
+            for pass_name, prompt, active in (
+                    ("Q", SCHEMA_PROMPT_Q, do_q),
+                    ("A", SCHEMA_PROMPT_A, do_a),
+                    ("S", SCHEMA_PROMPT_S, do_s)):
+                if not active:
+                    continue
+                reset_daily_counter_if_needed(state)
+                if state["calls_today"] >= MAX_CALLS_PER_DAY:
+                    print("Daily Gemini call limit reached. Saving progress, exiting.")
+                    save_state(state)
+                    sys.exit(0)
+                carry_in = carry_by_pass.get(pass_name) if pass_name in ("Q", "S") else None
+                context_str = build_carry_context(carry_in, overlap_pages)
+                if carry_in:
+                    stats["carry_used"] += 1
+                try:
+                    raw_items = call_gemini_on_pages(genai_model, batch,
+                                                     context=context_str, prompt=prompt)
+                    state["calls_today"] += 1
+                    save_state(state)
+                except Exception as e:
+                    err_text = str(e)
+                    if "429" in err_text or "quota" in err_text.lower():
+                        # Free tier = ~1500 req/day PER DAY but also ~15 RPM per
+                        # minute. A burst 429 is NOT the daily cap -- back off
+                        # once before declaring the whole day over.
+                        print(f"  [429] rate limited on {subject} ch{ch['chapter_no']} "
+                              f"batch {batch_start} {pass_name}-pass -- backing off 65s "
+                              f"(could be the per-minute cap, not the daily one)")
+                        time.sleep(65)
+                        try:
+                            raw_items = call_gemini_on_pages(genai_model, batch,
+                                                             context=context_str, prompt=prompt)
+                            state["calls_today"] += 1
                             save_state(state)
-                            sys.exit(0)
-                        print(f"  [WARN] post-backoff call failed differently: {e2}")
-                        raw_items = retry_batch_page_by_page(genai_model, batch, state, ctx={"subject": subject, "chapter_no": ch["chapter_no"], "chapter_id": chapter_id})
+                        except Exception as e2:
+                            t2 = str(e2)
+                            if "429" in t2 or "quota" in t2.lower():
+                                print(f"  [QUOTA] still limited after 65s backoff -- daily cap "
+                                      f"it is. Saving progress, exiting: {e2}")
+                                save_state(state)
+                                sys.exit(0)
+                            print(f"  [WARN] post-backoff call failed differently "
+                                  f"({pass_name}-pass): {e2}")
+                            raw_items = retry_batch_page_by_page(
+                                genai_model, batch, state,
+                                ctx={"subject": subject, "chapter_no": ch["chapter_no"],
+                                     "chapter_id": chapter_id, "pass": pass_name},
+                                prompt=prompt)
+                            if not raw_items:
+                                continue
+                    else:
+                        print(f"  [WARN] Gemini {pass_name}-pass failed on {subject} "
+                              f"ch{ch['chapter_no']} batch {batch_start}: {e}")
+                        # don't lose the whole batch over one bad page
+                        raw_items = retry_batch_page_by_page(
+                            genai_model, batch, state,
+                            ctx={"subject": subject, "chapter_no": ch["chapter_no"],
+                                 "chapter_id": chapter_id, "pass": pass_name},
+                            prompt=prompt)
                         if not raw_items:
                             continue
-                else:
-                    print(f"  [WARN] Gemini call failed on {subject} ch{ch['chapter_no']} batch {batch_start}: {e}")
-                    # don't lose the whole batch over one bad page
-                    raw_items = retry_batch_page_by_page(genai_model, batch, state, ctx={"subject": subject, "chapter_no": ch["chapter_no"], "chapter_id": chapter_id})
-                    if not raw_items:
-                        continue
 
-            items, batch_meta = extract_batch_meta(raw_items)
-            chapter_records, skipped = merge_question_records(chapter_records, items, stats)
-            try:
-                last_qn_in_batch = max(int(it.get("q_no")) for it in items
-                                       if it.get("q_no") is not None)
-            except (ValueError, TypeError):
-                last_qn_in_batch = None
-            for it in skipped:
-                # RC-2 salvage buffer: fragments (usually batch-boundary
-                # continuations) carry real content -- keep with provenance
-                # for the second-pass recovery at chapter end.
-                orphans.append({
-                    "chapter_id": chapter_id, "batch_start": batch_start,
-                    "pdf_pages": window_pages, "new_pages": new_pages,
-                    "carry_q_no": carry_in["last_open_question"] if carry_in else None,
-                    "cut_part": carry_in.get("cut_part") if carry_in else None,
-                    "last_qn_in_batch": last_qn_in_batch,
-                    "item": it,
-                })
-            stats["orphans_buffered"] += len(skipped)
-            stats["batches"] += 1
+                if pass_name == "S":
+                    raw_items, n_clip = clip_pass_solutions(raw_items)
+                    if n_clip:
+                        print(f"  [S-CLIP] {n_clip} foreign 'Solution to Question N:' "
+                              f"tail(s) clipped in S-pass output (sibling item "
+                              f"present -- provably zero-loss)")
+                items, batch_meta = extract_batch_meta(raw_items)
+                chapter_records, skipped = merge_question_records(chapter_records, items, stats)
+                try:
+                    last_qn_in_batch = max(int(it.get("q_no")) for it in items
+                                           if it.get("q_no") is not None)
+                except (ValueError, TypeError):
+                    last_qn_in_batch = None
+                for it in skipped:
+                    # RC-2 salvage buffer: fragments (usually batch-boundary
+                    # continuations) carry real content -- keep with provenance
+                    # (+ which pass produced them) for chapter-end recovery.
+                    orphans.append({
+                        "chapter_id": chapter_id, "batch_start": batch_start,
+                        "pdf_pages": window_pages, "new_pages": new_pages,
+                        "carry_q_no": carry_in["last_open_question"] if carry_in else None,
+                        "cut_part": carry_in.get("cut_part") if carry_in else None,
+                        "last_qn_in_batch": last_qn_in_batch,
+                        "pass": pass_name,
+                        "item": it,
+                    })
+                stats["orphans_buffered"] += len(skipped)
+                if pass_name in ("Q", "S"):
+                    # per-pass carry-forward (Feature 2), then stale-carry guard #1
+                    carry_by_pass[pass_name] = compute_carry(
+                        batch_meta, items, chapter_records, max(window_pages))
+                    carry_by_pass[pass_name] = enforce_carry_expiry(
+                        carry_by_pass[pass_name], stats["batches"],
+                        carry_trackers[pass_name], carry_banned[pass_name],
+                        chapter_records, chapter_id)
+                # stale-carry guard #2: questions->solutions SECTION boundary.
+                # The first batch that shows the solutions section hard-resets
+                # ALL carry context -- resolved or not -- so it can NEVER bleed
+                # into the Solutions section and cross-merge there. Q-pass also
+                # turns OFF from the next batch (probe may still enable S/A).
+                if pass_name == "Q" and not solutions_section_seen:
+                    boundary = detect_section_boundary(items)
+                    if boundary:
+                        solutions_section_seen = True
+                        had_pending = any(v is not None for v in carry_by_pass.values()) \
+                            or any(carry_trackers.values())
+                        carry_by_pass = {"Q": None, "S": None}
+                        carry_trackers = {"Q": {}, "S": {}}
+                        print(f"  [SECTION] {boundary} first seen at pages "
+                              f"{window_pages[0]}-{window_pages[-1]} -- solutions "
+                              f"section begins; ALL carry context HARD-RESET"
+                              f"{' (dropped pending context)' if had_pending else ''}; "
+                              f"Q-pass disabled from the next batch")
+                carry_obj = carry_by_pass.get(pass_name)
+                last_open = (f"q{carry_obj['last_open_question']}"
+                             if carry_obj and carry_obj["last_open_question"] is not None
+                             else ("open (no number)" if carry_obj else "-"))
+                print(f"  [GEMINI:{pass_name}] pages {window_pages[0]}-{window_pages[-1]}"
+                      f" | overlap: {overlap_pages if overlap_pages else '-'}"
+                      f" | carry-in: {('q' + str(carry_in['last_open_question'])) if carry_in and carry_in['last_open_question'] is not None else '-'}"
+                      f" | last-open: {last_open}"
+                      f" | items: {len(items)} | orphans buffered: {len(skipped)}")
+
             prev_window_last_page = max(window_pages)
-            carry_from_prev = compute_carry(batch_meta, items, chapter_records,
-                                            prev_window_last_page)
-            # stale-carry guard #1: expire carries whose own split never
-            # resolved (ban blocks the compute_carry fallback respawn)
-            carry_from_prev = enforce_carry_expiry(carry_from_prev, stats["batches"],
-                                                   carry_tracker, carry_banned,
-                                                   chapter_records, chapter_id)
-            # stale-carry guard #2: questions->solutions SECTION boundary.
-            # The first batch that shows the answers section hard-resets ALL
-            # questions-section carry context -- resolved or not -- so it can
-            # NEVER bleed into the Solutions section and cross-merge there.
-            if not answers_section_seen:
-                boundary = detect_section_boundary(items)
-                if boundary:
-                    answers_section_seen = True
-                    had_pending = carry_from_prev is not None or bool(carry_tracker)
-                    carry_from_prev = None
-                    carry_tracker.clear()
-                    print(f"  [SECTION] {boundary} first seen at pages "
-                          f"{window_pages[0]}-{window_pages[-1]} -- answers "
-                          f"section begins; questions-section carry context "
-                          f"HARD-RESET{' (dropped pending context)' if had_pending else ''}")
-            last_open = (f"q{carry_from_prev['last_open_question']}"
-                         if carry_from_prev and carry_from_prev["last_open_question"] is not None
-                         else ("open (no number)" if carry_from_prev else "-"))
-            print(f"  [GEMINI] pages {window_pages[0]}-{window_pages[-1]}"
-                  f" | overlap: {overlap_pages if overlap_pages else '-'}"
-                  f" | carry-in: {('q' + str(carry_in['last_open_question'])) if carry_in and carry_in['last_open_question'] is not None else '-'}"
-                  f" | last-open: {last_open}"
-                  f" | items: {len(items)} | orphans buffered: {len(skipped)}")
 
             # extract real (non-watermark) images from this batch's pages.
             # pdftoppm names output files using the ACTUAL pdf page number
