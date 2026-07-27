@@ -1,0 +1,5 @@
+pypdf
+pillow
+google-generativeai
+flask
+requests
