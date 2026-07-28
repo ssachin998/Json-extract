@@ -46,6 +46,19 @@ class GeminiJsonParserTests(unittest.TestCase):
         self.assertEqual(clean, "Explanation:\nEnd.")
         self.assertEqual(len(tables), 1)
 
+    def test_plain_bullet_solution_and_words_are_unchanged(self):
+        text = "• First clinical finding\n• the classic example of this is Stockholm syndrome"
+        clean, tables = _normalize_solution_payload(text, [], 24)
+        self.assertEqual(clean, text)
+        self.assertEqual(tables, [])
+        self.assertIn(" is Stockholm", clean)
+
+    def test_same_source_table_is_kept_for_different_questions(self):
+        table = {"markdown": "| Phase | Result |\n|---|---|\n| Oral | Fixation |"}
+        # Dedupe is deliberately record-local: q7 and q8 may both print it.
+        self.assertEqual(_dedupe_tables([table]), [table])
+        self.assertEqual(_dedupe_tables([table]), [table])
+
     def test_rejects_non_json_tail(self):
         with self.assertRaises(ValueError):
             parse_gemini_json_array('[{"q_no": 1}] explanation')
