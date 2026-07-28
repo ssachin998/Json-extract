@@ -94,6 +94,25 @@ SOLUTION_GATE_MIN_SHARE = 0.6   # if >=60% of a chapter's questions already have
                                  # drops, not absent print.
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # confirmed working model from your bot's config
 
+MIN_SECONDS_BETWEEN_CALLS = 5   # free tier = ~15 requests/minute (1 per 4s).
+                                 # Without pacing, back-to-back calls (v2's Q/A/S
+                                 # passes, single-page retries, crop ladders) bust
+                                 # the RPM window instantly -> 429 bursts. 5s
+                                 # spacing caps a run at 12 RPM: bursts disappear
+                                 # and the 65s backoff ladder stops firing.
+_last_call_ts = 0.0
+
+def _pace_gemini_call():
+    """Sleep just enough that consecutive Gemini requests stay
+    MIN_SECONDS_BETWEEN_CALLS apart. Called at the two choke points EVERY
+    request flows through: call_gemini_on_pages and
+    gemini_json_call_splitting's one_call."""
+    global _last_call_ts
+    gap = time.time() - _last_call_ts
+    if gap < MIN_SECONDS_BETWEEN_CALLS:
+        time.sleep(MIN_SECONDS_BETWEEN_CALLS - gap)
+    _last_call_ts = time.time()
+
 IMG_PATH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}-\d{3}-\d{3}_[A-Z]+(_[A-Z])?_\d{2}\.webp$")
 
 # ============================================================
@@ -118,6 +137,40 @@ def write_chapters(path, chapters_out):
     for c in chapters_out:
         uniq[c["chapter_id"]] = c
     path.write_text(json.dumps(list(uniq.values()), indent=2, ensure_ascii=False))
+
+
+def write_chapter_file(subject, chapter_id, chapter_rows):
+    """Per-chapter output file, written the moment ONE chapter FULLY completes
+    (batches, orphans, image ladder, drain, sweep, targeted retry -- every
+    process) and BEFORE the next chapter starts. Proves per-chapter closure
+    at a glance and lets the consuming app load chapters individually."""
+    d = DATA_DIR / "by_chapter"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{chapter_id}.jsonl").write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in chapter_rows),
+        encoding="utf-8")
+
+
+def build_subject_bundle(subject, chapters_out):
+    """All chapters done -> bundle everything under subjects/{SUBJECT_NAME}/:
+    chapters.json (this subject only), questions.jsonl (concat of the
+    per-chapter files, in chapter order) and chapters/{CH}.jsonl copies.
+    Additive convenience layer -- data/questions.jsonl stays the master."""
+    src = DATA_DIR / "by_chapter"
+    ch_files = sorted(src.glob(f"{subject}-*.jsonl")) if src.exists() else []
+    root = OUTPUT_ROOT / "subjects" / subject
+    (root / "chapters").mkdir(parents=True, exist_ok=True)
+    combined = []
+    for f in ch_files:
+        txt = f.read_text(encoding="utf-8")
+        (root / "chapters" / f.name).write_text(txt, encoding="utf-8")
+        combined.append(txt)
+    (root / "questions.jsonl").write_text("".join(combined), encoding="utf-8")
+    mine = [c for c in chapters_out if c.get("subject") == subject]
+    (root / "chapters.json").write_text(json.dumps(mine, indent=2, ensure_ascii=False),
+                                        encoding="utf-8")
+    print(f"[{subject}] bundle ready -> subjects/{subject}/ "
+          f"({len(ch_files)} chapter file(s) + chapters.json + questions.jsonl)")
 
 def today_stamp():
     return time.strftime("%Y-%m-%d")
@@ -556,6 +609,7 @@ def call_gemini_on_pages(model, image_paths, context="", prompt=None):
         parts.append(context)  # carry-forward / overlap context (stateless API)
     for p in image_paths:
         parts.append(Image.open(p))
+    _pace_gemini_call()
     resp = model.generate_content(
         parts,
         safety_settings=SAFETY_SETTINGS,
@@ -1123,6 +1177,7 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
             save_state(state)
             sys.exit(0)
         parts = [prompt] + [Image.open(p) for p in files]
+        _pace_gemini_call()
         resp = model.generate_content(parts, safety_settings=SAFETY_SETTINGS,
                                       request_options={"retry": None})
         state["calls_today"] += 1
@@ -2661,6 +2716,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         if n_fixed:
             print(f"  [RETRY] closed {n_fixed} field(s) via targeted retry")
 
+        chapter_rows = []
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
                 subject, chapter_id, ch["chapter_no"], qn, rec,
@@ -2668,6 +2724,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             )
             questions_fh.write(json.dumps(final_q, ensure_ascii=False) + "\n")
             questions_fh.flush()
+            chapter_rows.append(final_q)
+        # per-chapter file: written only NOW, when this chapter has FULLY
+        # finished every process -- the batch loop of the NEXT chapter has
+        # not started yet.
+        write_chapter_file(subject, chapter_id, chapter_rows)
 
         progress["chapters_done"].append(chapter_id)
         save_state(state)
@@ -2693,6 +2754,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
               f" | carry merges: {stats['carry_merges']}"
               f" | orphans: {stats['orphans_recovered']} recovered, {stats['orphans_remaining']} unresolved"
               f" | unmatched images: {n_unmatched}")
+
+    # ALL chapters of this subject are complete now -> bundle everything into
+    # a subject-named folder (per-chapter files were written as each chapter
+    # closed; earlier run's files persist on the volume, so a resumed run
+    # still produces the full bundle here).
+    build_subject_bundle(subject, chapters_out)
 
 # ============================================================
 # TARGETED RECOVERY MODE (--recover plan.json)
