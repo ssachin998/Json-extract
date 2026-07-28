@@ -679,7 +679,8 @@ def call_gemini_on_pages(model, image_paths, context="", prompt=None):
     candidate = candidates[0]
     finish_reason = getattr(candidate, "finish_reason", None)
     if finish_reason and str(finish_reason) not in ("1", "STOP"):
-        print(f"  [GEMINI_ERROR] {page_label}: status=ok finish_reason={finish_reason} block_reason={feedback}")
+        kind = "SAFETY_BLOCKED" if str(finish_reason) in ("8", "PROHIBITED_CONTENT") else "GEMINI_ERROR"
+        print(f"  [{kind}] {page_label}: status=ok finish_reason={finish_reason} block_reason={feedback}", flush=True)
         raise RuntimeError(f"Gemini response did not finish normally (finish_reason={finish_reason})")
     try:
         text = resp.text
@@ -2571,6 +2572,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     save_state(state)
                 except Exception as e:
                     err_text = str(e)
+                    if "finish_reason=8" in err_text or "PROHIBITED_CONTENT" in err_text:
+                        event = {"subject": subject, "chapter_id": chapter_id, "chapter_no": ch["chapter_no"],
+                                 "pass": pass_name, "pages": window_pages, "reason": err_text[:240]}
+                        state.setdefault("safety_blocked", []).append(event)
+                        save_state(state)
+                        print(f"  [SAFETY_BLOCKED] {subject} {chapter_id} {pass_name}-pass pages {window_pages} "
+                              "-- queued for recovery and manual review", flush=True)
                     if "429" in err_text or "quota" in err_text.lower():
                         # Free tier = ~1500 req/day PER DAY but also ~15 RPM per
                         # minute. A burst 429 is NOT the daily cap -- back off

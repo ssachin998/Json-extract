@@ -535,6 +535,12 @@ def v2_test():
                         "still_incomplete_after_retry.jsonl — do not start full-book run yet.")
                 else:
                     log("✅ [V2-TEST] No retry-ledger gaps remain; run validator before full book.")
+                safety_events = [e for e in st.get("safety_blocked", [])
+                                 if e.get("chapter_id") == f"{subject_code}-{chapter_no:03d}"]
+                if safety_events:
+                    safety_pages = sorted({str(p) for e in safety_events for p in e.get("pages", [])})
+                    log("🚫 [V2-TEST] SAFETY BLOCKED page(s): " + ", ".join(safety_pages) +
+                        " — recovered output may exist, but inspect these pages manually before a full-book run.")
                 # Test output lives outside the main output root, so /download
                 # cannot include it; build a dedicated downloadable archive.
                 try:
