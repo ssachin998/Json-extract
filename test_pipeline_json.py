@@ -21,6 +21,12 @@ class GeminiJsonParserTests(unittest.TestCase):
             [{"q_no": 1}, {"q_no": 2}],
         )
 
+    def test_recovers_json_prefixed_by_model_prose(self):
+        self.assertEqual(
+            parse_gemini_json_array('Here is the requested data:\n```json\n[{"q_no": 1}]\n```'),
+            [{"q_no": 1}],
+        )
+
     def test_rejects_non_json_tail(self):
         with self.assertRaises(ValueError):
             parse_gemini_json_array('[{"q_no": 1}] explanation')

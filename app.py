@@ -524,6 +524,17 @@ def v2_test():
                 ms = sum(1 for r in rows if not (r.get("solution") or {}).get("text"))
                 log(f"📊 [V2-TEST] Result: {n} questions | missing answer: {ma} | "
                     f"missing solution: {ms} (output: _v2test/ folder, asli data safe ✅)")
+                # Non-empty fields do not prove a complete solution. Surface
+                # the retry ledger prominently so a test is never described
+                # as clean while truncated-solution suspects remain.
+                ledger = test_root / "data" / "still_incomplete_after_retry.jsonl"
+                pending = sum(1 for line in ledger.read_text(encoding="utf-8").splitlines()
+                              if line.strip()) if ledger.exists() else 0
+                if pending:
+                    log(f"⚠️ [V2-TEST] REVIEW REQUIRED: {pending} item(s) remain in "
+                        "still_incomplete_after_retry.jsonl — do not start full-book run yet.")
+                else:
+                    log("✅ [V2-TEST] No retry-ledger gaps remain; run validator before full book.")
                 # Test output lives outside the main output root, so /download
                 # cannot include it; build a dedicated downloadable archive.
                 try:
@@ -543,7 +554,7 @@ def v2_test():
                 log("🔒 [V2-TEST] Main output path restored for the next full-book run.")
             with state_lock:
                 state["status"] = "completed"
-            log("✅ [V2-TEST] Done! Clean lagne pe full book Run karo (v2 neeche emerald card se).")
+            log("✅ [V2-TEST] Done! Full book sirf tab run karo jab review warning/validator flags resolve ho.")
         except SystemExit:
             with state_lock:
                 state["status"] = "paused"

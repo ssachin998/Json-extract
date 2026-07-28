@@ -612,10 +612,17 @@ def parse_gemini_json_array(text):
     single-page requests, and an individual page could still be lost. Accept
     consecutive complete arrays (or objects) while rejecting malformed tails.
     """
-    clean = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", (text or "").strip(),
+    clean = re.sub(r"```(?:json)?", "", (text or "").strip(),
                    flags=re.IGNORECASE).strip()
     if not clean:
         raise ValueError("Gemini returned an empty JSON response")
+
+    # Some otherwise-valid answers start with prose such as "Here is the
+    # JSON:". Recover the first JSON container rather than discarding a full
+    # batch and retrying every page individually.
+    starts = [i for i in (clean.find("["), clean.find("{")) if i >= 0]
+    if starts:
+        clean = clean[min(starts):]
 
     decoder = json.JSONDecoder()
     values, pos = [], 0
@@ -991,6 +998,12 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
                 f"genuinely shows none, leave it null."
             )
         lines.append("\n".join(block))
+    lines.extend([
+        "",
+        "OUTPUT RULE (mandatory): return ONLY a valid JSON array, beginning with [ and ending with ].",
+        "Do not write an explanation, heading, markdown fence, or any text before or after the array.",
+        "If no requested fields are visible, return [].",
+    ])
     return "\n".join(lines)
 
 
@@ -1222,6 +1235,8 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
             raise RuntimeError(f"empty/blocked response (prompt_feedback={getattr(resp, 'prompt_feedback', None)})")
         return parse_gemini_json_array(resp.text)
 
+    malformed_json = object()
+
     def attempt(files):
         try:
             return one_call(files)
@@ -1240,6 +1255,14 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
                         sys.exit(0)
                     print(f"  [WARN] post-backoff call failed differently{label}: {e2}")
                     return None
+            if "Invalid Gemini JSON" in t or "empty JSON response" in t:
+                # Splitting a malformed structured response into every single
+                # page does not repair the model's output format; it merely
+                # burns quota (the 2026-07-28 V2 smoke test made 17 such
+                # calls). Keep the chapter data, log the retry failure, and
+                # leave the targeted fields in the review ledger.
+                print(f"  [WARN] malformed Gemini JSON{label}; not splitting into per-page retries")
+                return malformed_json
             if _transient_gemini_err(t):
                 print(f"  [WARN] transient Gemini error{label} ({t[:120]}) -- one 20s-backoff retry")
                 time.sleep(20)
@@ -1254,6 +1277,8 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
     if not page_files:
         return []
     whole = attempt(page_files)
+    if whole is malformed_json:
+        return []
     if whole is not None:
         return [whole]
     mid = (len(page_files) + 1) // 2
@@ -1263,11 +1288,15 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
         if not half:
             continue
         r = attempt(half)
+        if r is malformed_json:
+            continue
         if r is not None:
             results.append(r)
             continue
         for single in half:
             r2 = attempt([single])
+            if r2 is malformed_json:
+                continue
             if r2 is not None:
                 results.append(r2)
             else:
