@@ -649,7 +649,10 @@ def parse_gemini_json_array(text):
 
 
 def call_gemini_on_pages(model, image_paths, context="", prompt=None):
-    parts = [prompt or SCHEMA_PROMPT]
+    parts = [prompt or SCHEMA_PROMPT,
+             "These are medical/psychiatric educational pages. Clinical references to violence, "
+             "sexuality, self-harm, abuse, or forensic scenarios are quoted textbook content; "
+             "transcribe them faithfully for educational extraction, without adding advice."]
     if context:
         parts.append(context)  # carry-forward / overlap context (stateless API)
     for p in image_paths:
@@ -984,7 +987,10 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
         if "options" in missing:
             lines.append(f"- Return all four options A-D for q{qn}; captured letters: {sorted((rec.get('options') or {}).keys())}.")
         if "solution" in missing:
-            lines.append(f"- Return the complete verbatim solution for q{qn}; put any table only in tables[].")
+            original = (rec.get("solution_text") or "")[:500]
+            lines.append(
+                f"- Return only the missing/continuing part of q{qn}'s verbatim solution; put any table only in tables[]. "
+                f"Preserve the source's line breaks and bullet-list structure. Existing text (do not repeat): {original!r}")
     return "\n".join(lines)
 
 
@@ -1048,6 +1054,9 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
         for arr in fix_arrays:
             if isinstance(arr, list):
                 fixes.extend(arr)
+        # A targeted response is a PATCH, never permission to replace fields
+        # that were already complete. Ignore any extra model fields.
+        requested_by_qn = {qn: set(missing) for qn, missing in incomplete}
 
         fixed_this_round = 0
         for fix in fixes:
@@ -1056,28 +1065,42 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
             except (TypeError, ValueError):
                 continue
             rec = chapter_records.get(qn)
-            if rec is None:
+            requested = requested_by_qn.get(qn, set())
+            if rec is None or not requested:
                 continue
-            if fix.get("question_text") and not (rec.get("question_text") or "").strip():
+            if "question" in requested and fix.get("question_text") and not (rec.get("question_text") or "").strip():
                 rec["question_text"] = str(fix["question_text"]).strip()
                 fixed_this_round += 1
-            if fix.get("correct_option") and not rec.get("correct_option"):
+            if "answer" in requested and fix.get("correct_option") and not rec.get("correct_option"):
                 rec["correct_option"] = str(fix["correct_option"]).strip().upper()
                 fixed_this_round += 1
             sol_existing = (rec.get("solution_text") or "").strip()
             incoming_text, incoming_tables = _normalize_solution_payload(
                 str(fix.get("solution_text") or ""), fix.get("tables") or [], qn)
-            if incoming_text and (
-                    not sol_existing
-                    or (qn in forced and len(incoming_text) > len(sol_existing))):
-                rec["solution_text"] = incoming_text
-                fixed_this_round += 1
-            if incoming_tables:
-                before_tables = len(rec.get("tables") or [])
-                rec["tables"] = _dedupe_tables(list(rec.get("tables") or []) + incoming_tables)
-                if len(rec["tables"]) != before_tables:
+            if "solution" in requested and incoming_text:
+                if not sol_existing:
+                    rec["solution_text"] = incoming_text
                     fixed_this_round += 1
-            if fix.get("options"):
+                elif qn in forced:
+                    # Targeted prompt asks for the missing continuation, so
+                    # preserve the established prose/bullets instead of
+                    # replacing it with a regenerated full solution.
+                    if incoming_text.startswith(sol_existing) and len(incoming_text) > len(sol_existing):
+                        rec["solution_text"] = incoming_text
+                        fixed_this_round += 1
+                    elif not _frag_mostly_present(incoming_text, sol_existing, 0.9):
+                        rec["solution_text"] = sol_existing.rstrip() + "\n" + incoming_text
+                        fixed_this_round += 1
+            if "solution" in requested and incoming_tables:
+                before_tables = rec.get("tables") or []
+                merged_tables = _dedupe_tables(list(before_tables) + incoming_tables)
+                if merged_tables != before_tables:
+                    rec["tables"] = merged_tables
+                    # Only count a table patch if it adds information, not if
+                    # normalization merely changes ordering of an identical set.
+                    if len(merged_tables) > len(before_tables):
+                        fixed_this_round += 1
+            if "options" in requested and fix.get("options"):
                 rec["options"] = rec.get("options") or {}
                 before = len(rec["options"])
                 for k, v in fix["options"].items():
