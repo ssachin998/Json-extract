@@ -1023,7 +1023,10 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
             print("  [RETRY] daily call limit reached -- stopping retries for now")
             break
 
-        preview = ", ".join(f"q{qn}" for qn, _ in incomplete[:10])
+        # Include the actual eligibility reason; a non-empty solution alone
+        # does not say whether q13 is missing an answer, option, stem, or was
+        # explicitly marked as a truncation suspect.
+        preview = ", ".join(f"q{qn}[{','.join(missing)}]" for qn, missing in incomplete[:10])
         if len(incomplete) > 10:
             preview += ", ..."
         print(f"  [RETRY] round {round_no}: {len(incomplete)} question(s) still "
@@ -1630,13 +1633,11 @@ def looks_truncated_solution(text, has_tables=False, has_images=False):
     # that record to a truncation retry based on text ending alone.
     if has_tables:
         return False
-    if DANGLING_END_RE.search(s):
-        return True
-    if t != s and re.search(r"[A-Za-z0-9]$", s) and s[-1] not in TERMINAL_PUNCT:
-        return True
-    if len(s) < 60 and s[-1] not in TERMINAL_PUNCT and not (has_tables or has_images):
-        return True
-    return False
+    # Do not infer truncation from absent terminal punctuation, a trailing
+    # OCR space, or a short explanation. Source pages frequently omit a final
+    # period, and those heuristics created false retries (including q13).
+    # Only an explicit dangling lead-in is deterministic enough to re-ask.
+    return bool(DANGLING_END_RE.search(s))
 
 
 def _stem_payload_coherence(stem, rec):

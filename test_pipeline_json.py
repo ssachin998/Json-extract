@@ -31,6 +31,10 @@ class GeminiJsonParserTests(unittest.TestCase):
         self.assertFalse(looks_truncated_solution("Stages are:", has_tables=True))
         self.assertTrue(looks_truncated_solution("Stages are:", has_tables=False))
 
+    def test_missing_terminal_period_is_not_a_truncation_signal(self):
+        self.assertFalse(looks_truncated_solution("This is a complete source sentence"))
+        self.assertFalse(looks_truncated_solution("Complete OCR sentence "))
+
     def test_table_dedupe_prefers_full_overlap_capture(self):
         partial = {"markdown": "| Stage | Goal |\n|---|---|\n| One | Trust |\n| Two | Autonomy |"}
         full = {"markdown": "| Stage | Goal |\n|---|---|\n| One | Trust |\n| Two | Autonomy |\n| Three | Initiative |"}
