@@ -654,23 +654,39 @@ def call_gemini_on_pages(model, image_paths, context="", prompt=None):
         parts.append(context)  # carry-forward / overlap context (stateless API)
     for p in image_paths:
         parts.append(Image.open(p))
+    page_label = ",".join(Path(p).name for p in image_paths)
     _pace_gemini_call()
-    resp = model.generate_content(
-        parts,
-        safety_settings=SAFETY_SETTINGS,
-        request_options={"retry": None},
-    )
+    try:
+        resp = model.generate_content(
+            parts,
+            safety_settings=SAFETY_SETTINGS,
+            request_options={"retry": None},
+        )
+    except Exception as exc:
+        status = getattr(exc, "status_code", None) or getattr(exc, "code", None) or "unknown"
+        print(f"  [GEMINI_ERROR] {page_label}: status={status} reason={str(exc)[:240]}")
+        raise RuntimeError(f"Gemini API error status={status}: {exc}") from exc
 
-    if not resp.candidates:
-        raise RuntimeError(f"Empty response (prompt blocked?). prompt_feedback={resp.prompt_feedback}")
+    candidates = getattr(resp, "candidates", None) or []
+    feedback = getattr(resp, "prompt_feedback", None)
+    if not candidates:
+        print(f"  [GEMINI_ERROR] {page_label}: status=ok candidates=0 block_reason={feedback}")
+        raise RuntimeError(f"Empty Gemini response; block_reason={feedback}")
 
-    candidate = resp.candidates[0]
+    candidate = candidates[0]
     finish_reason = getattr(candidate, "finish_reason", None)
     if finish_reason and str(finish_reason) not in ("1", "STOP"):
-        raise RuntimeError(f"Response did not finish normally (finish_reason={finish_reason}). "
-                            f"Likely safety-blocked or hit token limit -- try fewer pages per call.")
-
-    return parse_gemini_json_array(resp.text)
+        print(f"  [GEMINI_ERROR] {page_label}: status=ok finish_reason={finish_reason} block_reason={feedback}")
+        raise RuntimeError(f"Gemini response did not finish normally (finish_reason={finish_reason})")
+    try:
+        text = resp.text
+    except Exception as exc:
+        print(f"  [GEMINI_ERROR] {page_label}: status=ok finish_reason={finish_reason} text_unavailable={exc}")
+        raise RuntimeError(f"Gemini response text unavailable: {exc}") from exc
+    if not (text or "").strip():
+        print(f"  [GEMINI_ERROR] {page_label}: status=ok finish_reason={finish_reason} empty_body=true")
+        raise RuntimeError("Empty Gemini response body")
+    return parse_gemini_json_array(text)
 
 def retry_batch_page_by_page(model, batch, state, ctx=None, prompt=None):
     """A whole-batch failure (RECITATION/safety finish_reason, token limit)
@@ -947,63 +963,28 @@ def find_incomplete_records(chapter_records, force_solution_qns=()):
 
 
 def build_targeted_retry_prompt(incomplete_items, chapter_records):
+    """Focused retry schema.  Tables must never be returned inside prose."""
     lines = [
-        "You already extracted most of this chapter's questions from these "
-        "pages. A few specific pieces are still missing. Look at these SAME "
-        "pages again, very carefully, and find ONLY the missing pieces listed "
-        "below. Do not re-output anything else.",
-        "",
-        "Return a JSON array. Each element:",
-        '{"q_no": <int>, "question_text": "..."|null, "correct_option": "A"|"B"|"C"|"D"|null, '
-        '"options": {"A":"...","B":"...","C":"...","D":"..."} | null, '
-        '"solution_text": "..." | null}',
-        "Only fill the field(s) actually requested for that q_no; leave the "
-        "other fields null. If you genuinely cannot find a piece anywhere in "
-        "these pages, leave it null rather than guessing.",
-        "",
+        "You already extracted most of this chapter from these SAME pages. Find ONLY the requested missing pieces.",
+        "Return ONLY a valid JSON array, beginning with [ and ending with ]. No prose or markdown fences.",
+        "Each element uses exactly this schema:",
+        '{"q_no": <int>, "question_text": "..."|null, "correct_option": "A"|"B"|"C"|"D"|null, "options": {"A":"...","B":"...","C":"...","D":"..."}|null, "solution_text":"plain prose only"|null, "tables":[{"type":"short label","markdown":"| col | col |\\n|---|---|\\n..."}]}',
+        "Every table MUST be in tables[] as markdown. NEVER put pipes, headers, or table rows in solution_text.",
+        "Only fill requested fields; use null when not visible. Return [] if none are visible.",
         "MISSING PIECES TO FIND:",
     ]
     for qn, missing in incomplete_items:
         rec = chapter_records[qn]
         qtext = (rec.get("question_text") or "")[:120]
-        block = [f"Question {qn} (\"{qtext}...\"):"]
+        lines.append(f"Question {qn} (stem begins: {qtext!r}):")
         if "question" in missing:
-            sol_anchor = (rec.get("solution_text") or "")[:150]
-            ans_anchor = rec.get("correct_option")
-            anchor_desc = (f'its printed solution begins "{sol_anchor}..."' if sol_anchor
-                           else f"its marked correct option is {ans_anchor}")
-            block.append(
-                f"  - Find the FULL VERBATIM question stem AND all 4 options "
-                f"(A/B/C/D) for question {qn}. Anchor: {anchor_desc}. Locate "
-                f"the question that solution belongs to, on these SAME pages."
-            )
+            lines.append(f"- Return full verbatim question stem and all four options A-D for q{qn}.")
         if "answer" in missing:
-            block.append(
-                f"  - Find the CORRECT OPTION LETTER for question {qn}. Check "
-                f"any Answer Key table (a Question No. -> Correct Option table, "
-                f"which may span two pages) for the row matching {qn}."
-            )
+            lines.append(f"- Return the correct option letter for q{qn} from the printed answer key.")
         if "options" in missing:
-            have = sorted((rec.get("options") or {}).keys())
-            block.append(
-                f"  - Find ALL 4 options (A/B/C/D) for question {qn}. "
-                f"Already captured: {have or 'none'}. Find the missing letter(s)."
-            )
+            lines.append(f"- Return all four options A-D for q{qn}; captured letters: {sorted((rec.get('options') or {}).keys())}.")
         if "solution" in missing:
-            block.append(
-                f"  - Find the VERBATIM explanation/solution text printed for "
-                f"question {qn}. It may sit in a 'Solutions'/'Explanations' block "
-                f"near the questions, sometimes labelled 'Solution to Question "
-                f"{qn}:'. Return the FULL text exactly as printed; if the page "
-                f"genuinely shows none, leave it null."
-            )
-        lines.append("\n".join(block))
-    lines.extend([
-        "",
-        "OUTPUT RULE (mandatory): return ONLY a valid JSON array, beginning with [ and ending with ].",
-        "Do not write an explanation, heading, markdown fence, or any text before or after the array.",
-        "If no requested fields are visible, return [].",
-    ])
+            lines.append(f"- Return the complete verbatim solution for q{qn}; put any table only in tables[].")
     return "\n".join(lines)
 
 
@@ -1081,12 +1062,18 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                 rec["correct_option"] = str(fix["correct_option"]).strip().upper()
                 fixed_this_round += 1
             sol_existing = (rec.get("solution_text") or "").strip()
-            if fix.get("solution_text") and (
+            incoming_text, incoming_tables = _normalize_solution_payload(
+                str(fix.get("solution_text") or ""), fix.get("tables") or [], qn)
+            if incoming_text and (
                     not sol_existing
-                    or (qn in forced
-                        and len(str(fix["solution_text"]).strip()) > len(sol_existing))):
-                rec["solution_text"] = str(fix["solution_text"]).strip()
+                    or (qn in forced and len(incoming_text) > len(sol_existing))):
+                rec["solution_text"] = incoming_text
                 fixed_this_round += 1
+            if incoming_tables:
+                before_tables = len(rec.get("tables") or [])
+                rec["tables"] = _dedupe_tables(list(rec.get("tables") or []) + incoming_tables)
+                if len(rec["tables"]) != before_tables:
+                    fixed_this_round += 1
             if fix.get("options"):
                 rec["options"] = rec.get("options") or {}
                 before = len(rec["options"])
@@ -1225,15 +1212,10 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
             print("Daily Gemini call limit reached. Saving progress, exiting.")
             save_state(state)
             sys.exit(0)
-        parts = [prompt] + [Image.open(p) for p in files]
-        _pace_gemini_call()
-        resp = model.generate_content(parts, safety_settings=SAFETY_SETTINGS,
-                                      request_options={"retry": None})
+        result = call_gemini_on_pages(model, files, prompt=prompt)
         state["calls_today"] += 1
         save_state(state)
-        if not resp.candidates:
-            raise RuntimeError(f"empty/blocked response (prompt_feedback={getattr(resp, 'prompt_feedback', None)})")
-        return parse_gemini_json_array(resp.text)
+        return result
 
     malformed_json = object()
 
@@ -1263,8 +1245,8 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
                 # leave the targeted fields in the review ledger.
                 print(f"  [WARN] malformed Gemini JSON{label}; not splitting into per-page retries")
                 return malformed_json
-            if _transient_gemini_err(t):
-                print(f"  [WARN] transient Gemini error{label} ({t[:120]}) -- one 20s-backoff retry")
+            if _transient_gemini_err(t) or "Empty Gemini response" in t or "Gemini API error" in t:
+                print(f"  [WARN] transient/empty Gemini response{label} ({t[:120]}) -- one 20s-backoff retry")
                 time.sleep(20)
                 try:
                     return one_call(files)
@@ -1543,6 +1525,85 @@ OPTION_LINE_START_RE = re.compile(r"^\s*Option\s+([A-D])\b\s*[:.)]\s*", re.IGNOR
 TERMINAL_PUNCT = ".!?)\"'\u201d\u00bb"
 
 
+PIPE_TABLE_LINE_RE = re.compile(r"^\s*\|.*\|.*\|\s*$")
+
+
+def _table_body_rows(table):
+    """Normalized non-header body rows for completeness/prefix comparison."""
+    lines = []
+    for line in str((table or {}).get("markdown") or "").splitlines():
+        norm = re.sub(r"\s+", "", line).lower()
+        if not norm or re.fullmatch(r"\|?-{3,}(?:\|-{3,})+\|?", norm):
+            continue
+        lines.append(norm)
+    return lines
+
+
+def _dedupe_tables(tables):
+    """Keep one best table per overlap capture.
+
+    Exact whitespace-insensitive matches are duplicates.  A shorter table
+    whose normalized rows are a strict prefix of another is the page-break
+    capture of the longer table, so retain the longer version.
+    """
+    candidates = [t for t in (tables or []) if isinstance(t, dict)]
+    # Evaluate full captures first so a partial capture can never win by order.
+    candidates.sort(key=lambda t: (len(_table_body_rows(t)), len(str(t.get("markdown") or ""))),
+                    reverse=True)
+    kept = []
+    for table in candidates:
+        key = re.sub(r"\s+", "", str(table.get("markdown") or "").lower())
+        rows = _table_body_rows(table)
+        duplicate = False
+        for winner in kept:
+            winner_key = re.sub(r"\s+", "", str(winner.get("markdown") or "").lower())
+            winner_rows = _table_body_rows(winner)
+            same = bool(key) and key == winner_key
+            strict_prefix = bool(rows) and len(rows) < len(winner_rows) and winner_rows[:len(rows)] == rows
+            if same or strict_prefix:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(table)
+    return kept
+
+
+def _extract_inline_pipe_tables(text):
+    """Remove 3+ consecutive markdown pipe-table lines from prose and return
+    them as structured tables.  This is a schema firewall for retry output."""
+    lines = (text or "").splitlines()
+    prose, extracted, i = [], [], 0
+    while i < len(lines):
+        if not PIPE_TABLE_LINE_RE.match(lines[i]):
+            prose.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and PIPE_TABLE_LINE_RE.match(lines[j]):
+            j += 1
+        block = lines[i:j]
+        if len(block) >= 3:
+            extracted.append({"type": "recovered inline table", "markdown": "\n".join(block)})
+        else:
+            prose.extend(block)
+        i = j
+    return "\n".join(prose).strip(), extracted
+
+
+def _normalize_solution_payload(text, tables, qn=None):
+    clean, recovered = _extract_inline_pipe_tables(text)
+    all_tables = _dedupe_tables(list(tables or []) + recovered)
+    if recovered:
+        print(f"  [SCHEMA_VIOLATION] q{qn if qn is not None else '?'}: moved "
+              f"{len(recovered)} inline pipe-table block(s) from solution_text to tables")
+    # This warning is deliberately after remediation: any surviving 3-line
+    # pipe table is a future parser case, not silently shipped prose.
+    if any(len([ln for ln in clean.splitlines()[i:i + 3] if PIPE_TABLE_LINE_RE.match(ln)]) == 3
+           for i in range(max(0, len(clean.splitlines()) - 2))):
+        print(f"  [SCHEMA_VIOLATION] q{qn if qn is not None else '?'}: pipe-table syntax remains in solution_text")
+    return clean, all_tables
+
+
 def looks_truncated_solution(text, has_tables=False, has_images=False):
     """REAL truncation patterns only (replaces the weak 'no terminal punct'
     heuristic that produced ~53 false positives against this book's
@@ -1554,6 +1615,11 @@ def looks_truncated_solution(text, has_tables=False, has_images=False):
     t = (text or "")
     s = t.rstrip()
     if not s:
+        return False
+    # This sweep is specifically a prose-continuation detector. A populated
+    # table is the continuation for a lead-in ("stages are:"), so never send
+    # that record to a truncation retry based on text ending alone.
+    if has_tables:
         return False
     if DANGLING_END_RE.search(s):
         return True
@@ -1977,6 +2043,14 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
             print(f"  [WARN] Gemini returned a non-numeric q_no ({raw_qn!r}), skipping")
             skipped.append(item)
             continue
+        # Enforce the solution schema before any overlap merge.  A retry or
+        # normal pass may put markdown tables in prose; route them to tables
+        # so the final record never carries the same table twice.
+        if item.get("solution_text"):
+            clean_sol, item_tables = _normalize_solution_payload(
+                item.get("solution_text"), item.get("tables") or [], qn)
+            item = {**item, "solution_text": clean_sol, "tables": item_tables}
+
         # ---- solution-style stem guard (backup net for the stale carry
         # bug): an unresolved carry context that survives into the Solutions
         # section can talk the model into CONTINUING the carried q_no with
@@ -2078,13 +2152,11 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                 rec["correct_option"] = str(item["correct_option"]).strip().upper()
 
         if item.get("tables"):
-            # Dedupe by markdown: overlap pages (BATCH_OVERLAP_PAGES) are
-            # extracted twice, and blindly extending would duplicate tables.
-            have = {t.get("markdown") for t in rec["tables"]}
-            for t in item["tables"]:
-                if t.get("markdown") not in have:
-                    rec["tables"].append(t)
-                    have.add(t.get("markdown"))
+            # Overlap captures can be byte-identical OR a shorter prefix when
+            # the first batch ends mid-table. Keep the fullest table, not the
+            # first table merely because it arrived first.
+            rec["tables"] = _dedupe_tables(list(rec.get("tables") or []) +
+                                            list(item.get("tables") or []))
         rec["has_figure_in_question"] = rec["has_figure_in_question"] or item.get("has_figure_in_question", False)
         rec["has_figure_in_solution"] = rec["has_figure_in_solution"] or item.get("has_figure_in_solution", False)
     return existing, skipped
@@ -2125,21 +2197,6 @@ def sanitize_solution_text(text, own_qn=None):
             notes.append(f"embedded 'Solution to Question {m.group(1)}' header kept "
                          f"(tail not a duplicate -- needs model/review)")
     return s, notes
-
-
-def _dedupe_tables(tables):
-    """Drop duplicate tables by whitespace-insensitive markdown key (run-4:
-    PSY-012-008 carried the same table twice, PSY-009-005 three times --
-    overlap re-reads with squished spaces bypassed the exact-key dedupe)."""
-    seen, out = set(), []
-    for t in tables or []:
-        key = re.sub(r"\s+", "", (t.get("markdown") or "").lower())
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        out.append(t)
-    return out
 
 
 def _is_printed_answer_key(t):
