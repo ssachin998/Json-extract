@@ -157,6 +157,14 @@ def check_row(row, assets_questions):
         flags.append(flag(cid, "bad_options",
                           f"{row.get('id')}: {len(opts)} options ({sorted(opt_ids)}), "
                           f"{nonempty} non-empty -- expected A-D x4", qn))
+    # A blank correct answer makes the question unusable even when every
+    # other structural field exists; elevate it above the generic option flag.
+    blank_correct = [str(c).strip().upper() for c in correct
+                     if not str(next((o.get("text") for o in opts
+                                     if str(o.get("id", "")).strip().upper() == str(c).strip().upper()), "") or "").strip()]
+    if blank_correct:
+        flags.append(flag(cid, "blank_correct_option", f"{row.get('id')}: correct option(s) "
+                          f"{blank_correct} have null/empty text", qn, HIGH))
     if not correct:
         flags.append(flag(cid, "missing_answer", f"{row.get('id')}: no correct option", qn))
     elif any(str(c).strip().upper() not in opt_ids for c in correct):
@@ -334,8 +342,15 @@ def check_chapter(chapter_id, rows):
             common = sh[id_a] & sh[id_b]
             if len(common) < 25:  # << 200 char of verbatim overlap
                 continue
-            seg_chars = sum(len(x) for x in common)
-            if seg_chars < 400:
+            # Counting every shared shingle grossly overstates one contiguous
+            # overlap because adjacent shingles share seven of eight words.
+            # Report the largest contiguous matching token block instead.
+            wa = re.findall(r"\w+", sols[a][1].lower())
+            wb = re.findall(r"\w+", sols[b][1].lower())
+            blocks = SequenceMatcher(None, wa, wb).get_matching_blocks()
+            best = max(blocks, key=lambda b: b.size)
+            seg_chars = len(" ".join(wa[best.a:best.a + best.size]))
+            if seg_chars < 250:
                 continue
             # the parasitic copy is usually the LONGER solution (real + foreign tail)
             la, lb = len(sols[a][1]), len(sols[b][1])

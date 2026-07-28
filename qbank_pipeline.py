@@ -1371,7 +1371,12 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
             healed.append(entry)  # nothing more we can do; don't loop forever
             continue
         try:
-            raw = call_gemini_on_pages(model, [pf], context=RECOVERY_CONTEXT)
+            recitation_safe = "finish_reason=4" in str(entry.get("reason", ""))
+            if recitation_safe:
+                print(f"  [RECITATION_RECOVERY] {entry['page_file']}: paraphrase-mode recovery")
+            raw = call_gemini_on_pages(
+                model, [pf], context=RECOVERY_CONTEXT,
+                prompt=(SCHEMA_PROMPT + RECITATION_RECOVERY_CONTEXT) if recitation_safe else None)
             state["calls_today"] += 1
             save_state(state)
         except Exception as e:
@@ -2952,6 +2957,12 @@ def final_q_to_record(q):
     owned = {"question": [i["file"] for i in q["question"]["images"]],
              "solution": [i["file"] for i in q["solution"]["images"]]}
     return rec, owned
+
+RECITATION_RECOVERY_CONTEXT = (
+    "RECITATION-SAFE RECOVERY: describe the visible educational content in your own words. "
+    "Do not quote or transcribe long passages verbatim; preserve question numbers, answer letters, "
+    "and the meaning of explanations. Return the normal JSON schema. "
+)
 
 RECOVERY_CONTEXT = (
     "RECOVERY NOTE: these are SELECTED pages from a single chapter, sent to "
