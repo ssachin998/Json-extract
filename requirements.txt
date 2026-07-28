@@ -1,5 +1,6 @@
-pypdf
-pillow
-google-generativeai
-flask
-requests
+# Bounded versions keep Railway builds reproducible while allowing security fixes.
+pypdf>=5.0,<7
+Pillow>=10.0,<12
+google-generativeai>=0.8.5,<0.9
+Flask>=3.0,<4
+requests>=2.31,<3

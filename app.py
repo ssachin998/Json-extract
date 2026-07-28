@@ -78,6 +78,8 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         state["status"] = "processing"
         state["error"] = None
     try:
+        if not os.environ.get("GEMINI_API_KEY"):
+            raise RuntimeError("GEMINI_API_KEY is not configured in Railway variables")
         pipeline.PDFS[:] = [{"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}]
         pipeline.main()
         # zero-token deterministic validation right after every run -- the
@@ -108,11 +110,9 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         traceback.print_exc()  # full traceback with file/line -> Railway Deploy Logs
 
 def make_zip():
-    # Must mirror qbank_pipeline's OUTPUT_ROOT -- on Railway that's
-    # /data/qbank_output (the Volume), NOT the local ./qbank_output.
-    # (Hardcoding the relative path here meant the zip was never created
-    # on Railway, so /download always 404'd.)
-    out = Path(os.environ.get("OUTPUT_DIR", "./qbank_output"))
+    # Use the pipeline's live root rather than recalculating OUTPUT_DIR.  This
+    # keeps an export paired with the data the pipeline actually wrote.
+    out = Path(pipeline.OUTPUT_ROOT)
     if not out.exists():
         return
     zpath = Path("output_results.zip")
@@ -337,6 +337,17 @@ def index():
 def status():
     return jsonify(state)
 
+@app.route("/health")
+def health():
+    """Small, dependency-free readiness endpoint for Railway monitoring."""
+    return jsonify({
+        "ok": True,
+        "output_root": str(OUTPUT_ROOT_ENV),
+        "volume_ready": not bool(VOLUME_WARN),
+        "gemini_key_configured": bool(os.environ.get("GEMINI_API_KEY")),
+        "status": state["status"],
+    })
+
 def parse_page_offset():
     """int() of "" or junk raises ValueError -> Flask 500 page. Be forgiving."""
     try:
@@ -468,47 +479,59 @@ def v2_test():
                 return
             log(f"✅ [V2-TEST] Downloaded {fname}")
 
-            # isolated output root for the smoke test
+            # A smoke test must never redirect a later full-book run into the
+            # test folder.  The pipeline keeps these paths as module globals,
+            # so save and restore all of them even when Gemini/PDF processing
+            # raises an exception.
             test_root = Path(str(Path(OUTPUT_ROOT_ENV)) + "_v2test")
-            pipeline.OUTPUT_ROOT = test_root
-            pipeline.DATA_DIR = test_root / "data"
-            pipeline.ASSETS_DIR = test_root / "assets"
-            pipeline.STATE_FILE = test_root / "state.json"
-            pipeline.DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-            cfg = {"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}
-            st = pipeline.load_state()
-            chapters_out = []
-            log(f"🧪 [V2-TEST] {subject_code} chapter {chapter_no} (3-pass chal raha hai)...")
-            import google.generativeai as genai
-            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel(pipeline.GEMINI_MODEL)
-            q_path = pipeline.DATA_DIR / "questions.jsonl"
-            with open(q_path, "a", encoding="utf-8") as qfh:
-                pipeline.process_pdf(cfg, st, model, chapters_out, qfh,
-                                     only_chapter_no=chapter_no)
-            import json as _json
-            rows = [_json.loads(l) for l in q_path.read_text().splitlines() if l.strip()] \
-                if q_path.exists() else []
-            n = len(rows)
-            ma = sum(1 for r in rows if not r.get("correct_options"))
-            ms = sum(1 for r in rows if not (r.get("solution") or {}).get("text"))
-            log(f"📊 [V2-TEST] Result: {n} questions | missing answer: {ma} | "
-                f"missing solution: {ms} (output: _v2test/ folder, asli data safe ✅)")
-            # test output lives OUTSIDE the main output root, so /download's
-            # zip never includes it -- build a dedicated test zip the phone
-            # can grab via the violet "Download TEST results" button.
+            original_paths = (pipeline.OUTPUT_ROOT, pipeline.DATA_DIR,
+                              pipeline.ASSETS_DIR, pipeline.STATE_FILE)
             try:
-                with zipfile.ZipFile(TEST_ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for f in test_root.rglob("*"):
-                        if f.is_file():
-                            zf.write(f, f.relative_to(test_root))
-                with state_lock:
-                    state["test_ready"] = True
-                log("📦 [V2-TEST] test_results.zip ready -- upar violet "
-                    "'Download TEST results' button se download karo.")
-            except Exception as ze:
-                log(f"⚠️ [V2-TEST] zip nahi ban paya: {ze}")
+                pipeline.OUTPUT_ROOT = test_root
+                pipeline.DATA_DIR = test_root / "data"
+                pipeline.ASSETS_DIR = test_root / "assets"
+                pipeline.STATE_FILE = test_root / "state.json"
+                pipeline.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+                cfg = {"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}
+                st = pipeline.load_state()
+                chapters_out = []
+                log(f"🧪 [V2-TEST] {subject_code} chapter {chapter_no} (3-pass chal raha hai)...")
+                import google.generativeai as genai
+                api_key = os.environ.get("GEMINI_API_KEY")
+                if not api_key:
+                    raise RuntimeError("GEMINI_API_KEY is not configured in Railway variables")
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(pipeline.GEMINI_MODEL)
+                q_path = pipeline.DATA_DIR / "questions.jsonl"
+                with open(q_path, "a", encoding="utf-8") as qfh:
+                    pipeline.process_pdf(cfg, st, model, chapters_out, qfh,
+                                         only_chapter_no=chapter_no)
+                import json as _json
+                rows = [_json.loads(l) for l in q_path.read_text().splitlines() if l.strip()] \
+                    if q_path.exists() else []
+                n = len(rows)
+                ma = sum(1 for r in rows if not r.get("correct_options"))
+                ms = sum(1 for r in rows if not (r.get("solution") or {}).get("text"))
+                log(f"📊 [V2-TEST] Result: {n} questions | missing answer: {ma} | "
+                    f"missing solution: {ms} (output: _v2test/ folder, asli data safe ✅)")
+                # Test output lives outside the main output root, so /download
+                # cannot include it; build a dedicated downloadable archive.
+                try:
+                    with zipfile.ZipFile(TEST_ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for f in test_root.rglob("*"):
+                            if f.is_file():
+                                zf.write(f, f.relative_to(test_root))
+                    with state_lock:
+                        state["test_ready"] = True
+                    log("📦 [V2-TEST] test_results.zip ready -- upar violet "
+                        "'Download TEST results' button se download karo.")
+                except Exception as ze:
+                    log(f"⚠️ [V2-TEST] zip nahi ban paya: {ze}")
+            finally:
+                (pipeline.OUTPUT_ROOT, pipeline.DATA_DIR,
+                 pipeline.ASSETS_DIR, pipeline.STATE_FILE) = original_paths
+                log("🔒 [V2-TEST] Main output path restored for the next full-book run.")
             with state_lock:
                 state["status"] = "completed"
             log("✅ [V2-TEST] Done! Clean lagne pe full book Run karo (v2 neeche emerald card se).")
