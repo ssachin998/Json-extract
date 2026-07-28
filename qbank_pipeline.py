@@ -603,6 +603,44 @@ def clip_pass_solutions(items):
             it["solution_text"] = s
     return items, n_clipped
 
+def parse_gemini_json_array(text):
+    """Parse Gemini's structured response without discarding valid records.
+
+    Gemini occasionally emits two adjacent JSON arrays despite the prompt's
+    "one array only" instruction. ``json.loads`` then raises ``Extra data``;
+    previously that made a healthy six-page batch fall back to six expensive
+    single-page requests, and an individual page could still be lost. Accept
+    consecutive complete arrays (or objects) while rejecting malformed tails.
+    """
+    clean = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", (text or "").strip(),
+                   flags=re.IGNORECASE).strip()
+    if not clean:
+        raise ValueError("Gemini returned an empty JSON response")
+
+    decoder = json.JSONDecoder()
+    values, pos = [], 0
+    length = len(clean)
+    while pos < length:
+        while pos < length and clean[pos].isspace():
+            pos += 1
+        if pos >= length:
+            break
+        try:
+            value, end = decoder.raw_decode(clean, pos)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid Gemini JSON near character {pos}: {exc.msg}") from exc
+        if isinstance(value, list):
+            values.extend(value)
+        elif isinstance(value, dict):
+            # Tolerate newline-delimited objects from a model that ignored the
+            # array wrapper. Downstream validation still handles every item.
+            values.append(value)
+        else:
+            raise ValueError("Gemini JSON must contain an array or object")
+        pos = end
+    return values
+
+
 def call_gemini_on_pages(model, image_paths, context="", prompt=None):
     parts = [prompt or SCHEMA_PROMPT]
     if context:
@@ -625,9 +663,7 @@ def call_gemini_on_pages(model, image_paths, context="", prompt=None):
         raise RuntimeError(f"Response did not finish normally (finish_reason={finish_reason}). "
                             f"Likely safety-blocked or hit token limit -- try fewer pages per call.")
 
-    text = resp.text.strip()
-    text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    return json.loads(text)
+    return parse_gemini_json_array(resp.text)
 
 def retry_batch_page_by_page(model, batch, state, ctx=None, prompt=None):
     """A whole-batch failure (RECITATION/safety finish_reason, token limit)
@@ -1184,9 +1220,7 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
         save_state(state)
         if not resp.candidates:
             raise RuntimeError(f"empty/blocked response (prompt_feedback={getattr(resp, 'prompt_feedback', None)})")
-        text = resp.text.strip()
-        text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
-        return json.loads(text)
+        return parse_gemini_json_array(resp.text)
 
     def attempt(files):
         try:

@@ -484,6 +484,15 @@ def v2_test():
             # so save and restore all of them even when Gemini/PDF processing
             # raises an exception.
             test_root = Path(str(Path(OUTPUT_ROOT_ENV)) + "_v2test")
+            # A smoke test is a fresh measurement, not a resume operation.
+            # Reset does not touch this isolated directory, so retaining it
+            # would append a second copy of the same chapter and report an
+            # inflated question count (for example 26 extracted / 52 shown).
+            if test_root.exists():
+                shutil.rmtree(test_root)
+                log("🧹 [V2-TEST] Previous test output cleared; starting a fresh test.")
+            with state_lock:
+                state["test_ready"] = False
             original_paths = (pipeline.OUTPUT_ROOT, pipeline.DATA_DIR,
                               pipeline.ASSETS_DIR, pipeline.STATE_FILE)
             try:

@@ -21,4 +21,7 @@ ENV OUTPUT_DIR=/data/qbank_output_v2
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
-CMD ["python3", "app.py"]
+# Gunicorn avoids Flask's development-server warning and is safe for Railway.
+# One worker is intentional: the dashboard keeps in-memory run state and must
+# not allow separate workers to start concurrent writes to the same volume.
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 4 --timeout 0 app:app"]
