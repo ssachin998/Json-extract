@@ -1037,7 +1037,7 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
         # retry.
         fix_arrays = gemini_json_call_splitting(
             model, prompt, page_files, state,
-            label=f" (targeted retry round {round_no})")
+            label=f" (targeted retry round {round_no})", direct_page_fallback=True)
         if not fix_arrays:
             print("  [RETRY] every sub-call failed even after splitting -- skipping this round")
             continue
@@ -1190,7 +1190,7 @@ def _transient_gemini_err(err_text):
             or "high demand" in t or "unavailable" in t)
 
 
-def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
+def gemini_json_call_splitting(model, prompt, page_files, state, label="", direct_page_fallback=False):
     """Execute ONE logical ask (prompt + page images) so that a single bad
     or heavy call can never sink it. Run-4 PROOF of why this exists: a
     whole-chapter targeted retry went out as ONE 14-page call and failed
@@ -1263,8 +1263,14 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
         return []
     if whole is not None:
         return [whole]
-    mid = (len(page_files) + 1) // 2
-    halves = [page_files[:mid], page_files[mid:]]
+    # A retry request already combines every remaining q_no into one focused
+    # call. If that genuine combined call fails, targeted retry falls back
+    # directly to single pages (not another cascade of arbitrary halves).
+    if direct_page_fallback:
+        halves = [[page] for page in page_files]
+    else:
+        mid = (len(page_files) + 1) // 2
+        halves = [page_files[:mid], page_files[mid:]]
     results = []
     for half in halves:
         if not half:
@@ -1274,6 +1280,9 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label=""):
             continue
         if r is not None:
             results.append(r)
+            continue
+        if len(half) == 1:
+            print(f"  [WARN] page {Path(half[0]).name} failed even alone{label} -- excluded from this ask")
             continue
         for single in half:
             r2 = attempt([single])
