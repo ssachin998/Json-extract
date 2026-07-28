@@ -29,6 +29,12 @@ app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB per PDF upload
 UPLOAD_DIR = Path("./pdfs")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# Resolved ONCE at import (stable absolute path): the smoke-test zip writer
+# and its download route must agree on the location no matter what cwd the
+# server process has at request time.
+TEST_ZIP_PATH = Path("test_results.zip").resolve()
+UPLOAD_DIR.mkdir(exist_ok=True)
+
 state_lock = threading.Lock()
 state = {"status": "idle", "log": [], "error": None}
 
@@ -147,6 +153,9 @@ PAGE = """
     <p class="text-sm mb-2">Status: <span class="font-semibold">{{ state.status }}</span></p>
     {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
     <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">Download results (.zip)</a>
+    {% if state.get('test_ready') %}
+    <a href="/download-test" class="inline-block mt-2 bg-violet-600 text-white text-sm px-3 py-2 rounded">⬇️ Download TEST results (.zip)</a>
+    {% endif %}
   </div>
 
   <div class="bg-white rounded-lg shadow p-4 border-2 border-amber-400 space-y-2">
@@ -486,6 +495,20 @@ def v2_test():
             ms = sum(1 for r in rows if not (r.get("solution") or {}).get("text"))
             log(f"📊 [V2-TEST] Result: {n} questions | missing answer: {ma} | "
                 f"missing solution: {ms} (output: _v2test/ folder, asli data safe ✅)")
+            # test output lives OUTSIDE the main output root, so /download's
+            # zip never includes it -- build a dedicated test zip the phone
+            # can grab via the violet "Download TEST results" button.
+            try:
+                with zipfile.ZipFile(TEST_ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in test_root.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f.relative_to(test_root))
+                with state_lock:
+                    state["test_ready"] = True
+                log("📦 [V2-TEST] test_results.zip ready -- upar violet "
+                    "'Download TEST results' button se download karo.")
+            except Exception as ze:
+                log(f"⚠️ [V2-TEST] zip nahi ban paya: {ze}")
             with state_lock:
                 state["status"] = "completed"
             log("✅ [V2-TEST] Done! Clean lagne pe full book Run karo (v2 neeche emerald card se).")
@@ -926,6 +949,17 @@ def restore_zip():
     t.daemon = True
     t.start()
     return redirect(url_for("index"))
+
+@app.route("/download-test")
+def download_test():
+    """Violet button target: the LAST smoke test's output as its own zip
+    (_v2test/ sits outside the main output root, so the green /download zip
+    can never see it)."""
+    p = TEST_ZIP_PATH
+    if not p.exists():
+        return "Abhi tak koi smoke test complete nahi hua -- pehle 🧪 violet card se test chalao.", 404
+    return send_file(str(p), as_attachment=True, download_name="v2_test_results.zip")
+
 
 @app.route("/download")
 def download():
