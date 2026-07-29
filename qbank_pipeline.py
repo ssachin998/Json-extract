@@ -672,16 +672,39 @@ def _ocr_content_owner(item, chapter_records):
 
 
 def _novel_solution_tail(existing, incoming):
-    """Return only unseen continuation; never append a repeated OCR paragraph."""
+    """Return only the unseen suffix of OCR text; never append a re-read body."""
     if not incoming or _frag_mostly_present(incoming, existing, 0.85):
         return ""
-    # OCR often returns old solution + new tail. Remove its longest leading
-    # block that matches existing before appending only the genuine tail.
+    # Select the match that consumes the FURTHEST part of incoming text, not
+    # merely its largest isolated block. This removes an entire repeated
+    # solution before retaining its continuation after the truncation point.
     blocks = difflib.SequenceMatcher(None, existing.lower(), incoming.lower()).get_matching_blocks()
-    block = max(blocks, key=lambda b: b.size)
-    if block.size >= 80 and block.b <= 80:
-        return incoming[block.b + block.size:].lstrip(" \n,.;:")
-    return incoming
+    usable = [b for b in blocks if b.size >= 30 and b.b < len(incoming) * 0.75]
+    if usable:
+        end = max(b.b + b.size for b in usable)
+        tail = incoming[end:].lstrip(" \n,.;:")
+        if tail:
+            return tail
+    return ""  # uncertain overlap is safer than duplicating a full solution
+
+
+def _recover_ocr_solution_headers(raw_text, chapter_records):
+    """Use Tesseract text directly when printed Solution-to-Question headers
+    exist; this avoids asking Gemini to regenerate a blocked page at all."""
+    hits = list(re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})\s*[:.]?", raw_text, re.I))
+    recovered = 0
+    for i, hit in enumerate(hits):
+        qn = int(hit.group(1)); rec = chapter_records.get(qn)
+        if not rec:
+            continue
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(raw_text)
+        segment = raw_text[hit.end():end].strip()
+        tail = _novel_solution_tail(rec.get("solution_text") or "", segment)
+        if tail:
+            rec["solution_text"] = (rec.get("solution_text") or "").rstrip() + "\n" + tail
+            recovered += 1
+            print(f"  [OCR_FALLBACK] header-spliced continuation to q{qn}")
+    return recovered
 
 
 def normalize_ocr_fallback_item(raw_item):
@@ -794,7 +817,12 @@ def retry_batch_page_by_page(model, batch, state, ctx=None, prompt=None):
             if ctx:
                 entry.update({"subject": ctx.get("subject"), "chapter_no": ctx.get("chapter_no"),
                               "chapter_id": ctx.get("chapter_id")})
-            state.setdefault("failed_pages", []).append(entry)
+            failed = state.setdefault("failed_pages", [])
+            # Q and S passes can fail on the same recitation-blocked page.
+            # Drain it once; duplicate entries caused duplicate OCR splices.
+            if not any(e.get("chapter_id") == entry.get("chapter_id") and
+                       e.get("true_page") == entry.get("true_page") for e in failed):
+                failed.append(entry)
     save_state(state)
     print(f"  [INFO] single-page retry: {recovered}/{len(batch)} pages recovered")
     return items
@@ -1490,6 +1518,15 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                 try:
                     raw_text = ocr_fallback_text(pf)
                     if raw_text.strip():
+                        header_recovered = _recover_ocr_solution_headers(raw_text, chapter_records)
+                        # Printed solution headers are the reliable path for this
+                        # book. Only ask Gemini to structure OCR when no header
+                        # gave us a deterministic owner.
+                        if header_recovered:
+                            healed.append(entry)
+                            ladder_healed = True
+                            print(f"  [OCR_FALLBACK] {entry['page_file']}: header recovery completed")
+                            continue
                         raw = call_gemini_text_only(model, RECITATION_RECOVERY_CONTEXT +
                             "\nRaw OCR text follows. Structure it into the normal JSON array; "
                             "correct obvious OCR errors but do not invent content.\n\nOCR TEXT:\n" + raw_text)
