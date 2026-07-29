@@ -649,6 +649,20 @@ def parse_gemini_json_array(text):
     return values
 
 
+def normalize_ocr_fallback_item(raw_item):
+    """Map OCR-structurer aliases into the merge schema before orphan logic."""
+    return {
+        "q_no": raw_item.get("q_no") or raw_item.get("question_number"),
+        "question_text": raw_item.get("question_text") or raw_item.get("stem") or raw_item.get("topic"),
+        "solution_text": raw_item.get("solution_text") or raw_item.get("explanation"),
+        "options": raw_item.get("options"),
+        "correct_option": raw_item.get("correct_option") or raw_item.get("correct_options"),
+        "tables": raw_item.get("tables") or [],
+        "has_figure_in_question": bool(raw_item.get("has_figure_in_question")),
+        "has_figure_in_solution": bool(raw_item.get("has_figure_in_solution")),
+    }
+
+
 def ocr_fallback_text(image_path):
     """Non-generative final fallback for recitation-blocked page imagery."""
     return pytesseract.image_to_string(Image.open(image_path))
@@ -1446,6 +1460,19 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                             "correct obvious OCR errors but do not invent content.\n\nOCR TEXT:\n" + raw_text)
                         state["calls_today"] += 1; save_state(state)
                         items2, _ = extract_batch_meta(raw)
+                        items2 = [normalize_ocr_fallback_item(item) for item in items2
+                                  if isinstance(item, dict)]
+                        for item in items2:
+                            try:
+                                owner = chapter_records.get(int(item.get("q_no")))
+                            except (TypeError, ValueError):
+                                owner = None
+                            continuation = (item.get("solution_text") or "").strip()
+                            if owner and continuation and (owner.get("solution_text") or "").strip() and not _frag_mostly_present(continuation, owner["solution_text"], 0.9):
+                                owner["solution_text"] = owner["solution_text"].rstrip() + "\n" + continuation
+                                item["solution_text"] = None
+                                print(f"  [OCR_FALLBACK] appended continuation to q{item['q_no']}")
+                        print(f"  [OCR_FALLBACK] {entry['page_file']}: normalized {len(items2)} OCR item(s)")
                         chapter_records, skipped2 = merge_question_records(chapter_records, items2, stats, fill_only=True)
                         new_orphans.extend({"chapter_id": entry.get("chapter_id"), "item": it,
                                             "pdf_pages": [entry["true_page"]]} for it in skipped2)
@@ -2352,6 +2379,26 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         "tags": [],
     }
 
+def repair_option_labels(question):
+    """Correct only high-confidence mislabeled Option X explanation lines."""
+    text = ((question.get("solution") or {}).get("text") or "")
+    options = {str(o.get("id")).upper(): str(o.get("text") or "")
+               for o in question.get("options") or []}
+    def repl(match):
+        label, desc = match.group(1).upper(), match.group(2)
+        words = {w.lower() for w in re.findall(r"\w+", desc) if len(w) > 2}
+        scores = {oid: len(words & set(re.findall(r"\w+", val.lower()))) / max(1, len(set(re.findall(r"\w+", val.lower()))))
+                  for oid, val in options.items() if val}
+        if not scores:
+            return match.group(0)
+        best = max(scores, key=scores.get)
+        if best != label and scores[best] >= 2 * max(scores.get(label, 0.0), 0.01):
+            print(f"  [LABEL_CORRECTED] {question.get('id')}: Option {label} -> Option {best}")
+            return f"Option {best}: {desc}"
+        return match.group(0)
+    question["solution"]["text"] = re.sub(r"(?m)Option\s+([A-D])\s*:\s*([^\n]+)", repl, text)
+    return question
+
 # ============================================================
 # MAIN DRIVER
 # ============================================================
@@ -2950,6 +2997,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 subject, chapter_id, ch["chapter_no"], qn, rec,
                 image_files_by_q.get(qn, {"question": [], "solution": []})
             )
+            final_q = repair_option_labels(final_q)
             questions_fh.write(json.dumps(final_q, ensure_ascii=False) + "\n")
             questions_fh.flush()
             chapter_rows.append(final_q)
