@@ -688,6 +688,15 @@ def _novel_solution_tail(existing, incoming):
     return ""  # uncertain overlap is safer than duplicating a full solution
 
 
+def is_recitation_risk_solution_page(pdf_path, page_no):
+    """Route printed sensitive solution pages away from vision generation."""
+    text = pdftotext_page(pdf_path, page_no)
+    if not re.search(r"Solution\s+to\s+Question\s+\d{1,3}", text, re.I):
+        return False
+    risk = r"sexual|rape|genital|vulva|penis|assault|suicide|homicide|abuse|forensic|injury"
+    return bool(re.search(risk, text, re.I))
+
+
 def _recover_ocr_solution_headers(raw_text, chapter_records):
     """Use Tesseract text directly when printed Solution-to-Question headers
     exist; this avoids asking Gemini to regenerate a blocked page at all."""
@@ -2741,6 +2750,19 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             if not (do_q or do_s or do_a):
                 do_q = True  # eerily silent page (figures only?) -- default to Q-pass
 
+            # Proactive route: do not first trigger Gemini recitation on a
+            # printed, clinically sensitive solutions page. OCR/header merge
+            # owns it before any vision pass is built.
+            routed_pages = set()
+            for pf in batch:
+                page_no = int(pf.stem.split("-")[-1])
+                if is_recitation_risk_solution_page(pdf_path, page_no):
+                    raw_ocr = ocr_fallback_text(pf)
+                    n = _recover_ocr_solution_headers(raw_ocr, chapter_records)
+                    if n:
+                        routed_pages.add(pf)
+                        print(f"  [PREFLIGHT_OCR] {pf.name}: header-routed {n} solution(s); Gemini skipped")
+
             for pass_name, prompt, active in (
                     ("Q", SCHEMA_PROMPT_Q, do_q),
                     ("A", SCHEMA_PROMPT_A, do_a),
@@ -2752,12 +2774,15 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     print("Daily Gemini call limit reached. Saving progress, exiting.")
                     save_state(state)
                     sys.exit(0)
+                pass_batch = [pf for pf in batch if pf not in routed_pages]
+                if not pass_batch:
+                    continue
                 carry_in = carry_by_pass.get(pass_name) if pass_name in ("Q", "S") else None
                 context_str = build_carry_context(carry_in, overlap_pages)
                 if carry_in:
                     stats["carry_used"] += 1
                 try:
-                    raw_items = call_gemini_on_pages(genai_model, batch,
+                    raw_items = call_gemini_on_pages(genai_model, pass_batch,
                                                      context=context_str, prompt=prompt)
                     state["calls_today"] += 1
                     save_state(state)
@@ -2793,7 +2818,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                             print(f"  [WARN] post-backoff call failed differently "
                                   f"({pass_name}-pass): {e2}")
                             raw_items = retry_batch_page_by_page(
-                                genai_model, batch, state,
+                                genai_model, pass_batch, state,
                                 ctx={"subject": subject, "chapter_no": ch["chapter_no"],
                                      "chapter_id": chapter_id, "pass": pass_name},
                                 prompt=prompt)
@@ -2804,7 +2829,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                               f"ch{ch['chapter_no']} batch {batch_start}: {e}")
                         # don't lose the whole batch over one bad page
                         raw_items = retry_batch_page_by_page(
-                            genai_model, batch, state,
+                            genai_model, pass_batch, state,
                             ctx={"subject": subject, "chapter_no": ch["chapter_no"],
                                  "chapter_id": chapter_id, "pass": pass_name},
                             prompt=prompt)
