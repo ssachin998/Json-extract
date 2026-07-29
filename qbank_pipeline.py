@@ -42,6 +42,7 @@ from pathlib import Path
 import google.generativeai as genai
 from PIL import Image
 from pypdf import PdfReader
+import pytesseract
 
 # ============================================================
 # CONFIG — edit this section for each new subject PDF
@@ -646,6 +647,21 @@ def parse_gemini_json_array(text):
             raise ValueError("Gemini JSON must contain an array or object")
         pos = end
     return values
+
+
+def ocr_fallback_text(image_path):
+    """Non-generative final fallback for recitation-blocked page imagery."""
+    return pytesseract.image_to_string(Image.open(image_path))
+
+
+def call_gemini_text_only(model, prompt):
+    """Structure OCR text without resending the recitation-triggering image."""
+    _pace_gemini_call()
+    resp = model.generate_content([prompt], safety_settings=SAFETY_SETTINGS,
+                                  request_options={"retry": None})
+    if not getattr(resp, "candidates", None) or not (resp.text or "").strip():
+        raise RuntimeError("Empty Gemini text-only OCR restructuring response")
+    return parse_gemini_json_array(resp.text)
 
 
 def call_gemini_on_pages(model, image_paths, context="", prompt=None):
@@ -1419,8 +1435,26 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                     healed.append(entry)
                     ladder_healed = True
                     break
+            if not ladder_healed and recitation_safe:
+                print(f"  [OCR_FALLBACK] {entry['page_file']}: attempting OCR+restructure", flush=True)
+                try:
+                    raw_text = ocr_fallback_text(pf)
+                    if raw_text.strip():
+                        raw = call_gemini_text_only(model, RECITATION_RECOVERY_CONTEXT +
+                            "\nRaw OCR text follows. Structure it into the normal JSON array; "
+                            "correct obvious OCR errors but do not invent content.\n\nOCR TEXT:\n" + raw_text)
+                        state["calls_today"] += 1; save_state(state)
+                        items2, _ = extract_batch_meta(raw)
+                        chapter_records, skipped2 = merge_question_records(chapter_records, items2, stats, fill_only=True)
+                        new_orphans.extend({"chapter_id": entry.get("chapter_id"), "item": it,
+                                            "pdf_pages": [entry["true_page"]]} for it in skipped2)
+                        healed.append(entry)
+                        ladder_healed = True
+                        print(f"  [OCR_FALLBACK] {entry['page_file']}: recovered {len(items2)} item(s)")
+                except Exception as ocr_err:
+                    print(f"  [OCR_FALLBACK] {entry['page_file']} failed: {ocr_err}")
             if not ladder_healed:
-                print(f"  [DRAIN] {entry['page_file']} resisted even the crop ladder -- kept in failed_pages queue")
+                print(f"  [DRAIN] {entry['page_file']} resisted crop+OCR recovery -- kept in failed_pages queue")
             continue
         print(f"  [DRAIN] {entry['page_file']} recovered on second chance")
         items, _meta = extract_batch_meta(raw)
@@ -2279,12 +2313,28 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
               for t in _dedupe_tables(rec.get("tables", []))
               if not _is_printed_answer_key(t)]
 
+    option_rows = [{"id": str(k).strip().upper(), "text": v, "images": []}
+                   for k, v in (rec["options"] or {}).items()]
+    # Correct clearly mislabelled "Option X:" explanation lines only when the
+    # description overlaps another option at least twice as strongly.
+    opt_text = {o["id"]: str(o.get("text") or "") for o in option_rows}
+    def relabel(m):
+        label, desc = m.group(1).upper(), m.group(2)
+        words = {w for w in re.findall(r"\w+", desc.lower()) if len(w) > 2}
+        scores = {k: len(words & set(re.findall(r"\w+", v.lower()))) for k, v in opt_text.items() if v}
+        best = max(scores, key=scores.get) if scores else label
+        if best != label and scores.get(best, 0) >= 2 * max(1, scores.get(label, 0)):
+            print(f"  [LABEL_CORRECTED] {qid}: Option {label} -> Option {best}")
+            return f"Option {best}: {desc}"
+        return m.group(0)
+    sol_text = re.sub(r"(?m)Option\s+([A-D])\s*:\s*([^\n]+)", relabel, sol_text)
+
     return {
         "id": qid,
         "subject": subject,
         "chapter_id": chapter_id,
         "question": {"text": rec["question_text"], "images": q_images},
-        "options": [{"id": str(k).strip().upper(), "text": v, "images": []} for k, v in (rec["options"] or {}).items()],
+        "options": option_rows,
         "correct_options": [rec["correct_option"]] if rec["correct_option"] else [],
         "solution": {"text": sol_text, "images": sol_images, "tables": tables},
         "tags": [],

@@ -5,3 +5,4 @@ google-generativeai>=0.8.5,<0.9
 Flask>=3.0,<4
 gunicorn>=22,<24
 requests>=2.31,<3
+pytesseract>=0.3,<0.4
