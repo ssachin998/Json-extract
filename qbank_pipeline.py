@@ -649,6 +649,41 @@ def parse_gemini_json_array(text):
     return values
 
 
+def _ocr_content_owner(item, chapter_records):
+    """Prefer q_no, then identify OCR scraps from option-content evidence."""
+    try:
+        qn = int(item.get("q_no"))
+        if qn in chapter_records:
+            return qn
+    except (TypeError, ValueError):
+        pass
+    values = " ".join(str(v or "") for v in (item.get("options") or {}).values()).lower()
+    tokens = {t for t in re.findall(r"\w+", values) if len(t) > 3}
+    if not tokens:
+        return None
+    best_qn, best_score = None, 0.0
+    for qn, rec in chapter_records.items():
+        opt_text = " ".join(str(v or "") for v in (rec.get("options") or {}).values()).lower()
+        opt_tokens = {t for t in re.findall(r"\w+", opt_text) if len(t) > 3}
+        score = len(tokens & opt_tokens) / max(1, min(len(tokens), len(opt_tokens)))
+        if score > best_score:
+            best_qn, best_score = qn, score
+    return best_qn if best_score >= 0.5 else None
+
+
+def _novel_solution_tail(existing, incoming):
+    """Return only unseen continuation; never append a repeated OCR paragraph."""
+    if not incoming or _frag_mostly_present(incoming, existing, 0.85):
+        return ""
+    # OCR often returns old solution + new tail. Remove its longest leading
+    # block that matches existing before appending only the genuine tail.
+    blocks = difflib.SequenceMatcher(None, existing.lower(), incoming.lower()).get_matching_blocks()
+    block = max(blocks, key=lambda b: b.size)
+    if block.size >= 80 and block.b <= 80:
+        return incoming[block.b + block.size:].lstrip(" \n,.;:")
+    return incoming
+
+
 def normalize_ocr_fallback_item(raw_item):
     """Map OCR-structurer aliases into the merge schema before orphan logic."""
     return {
@@ -1463,15 +1498,20 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                         items2 = [normalize_ocr_fallback_item(item) for item in items2
                                   if isinstance(item, dict)]
                         for item in items2:
-                            try:
-                                owner = chapter_records.get(int(item.get("q_no")))
-                            except (TypeError, ValueError):
-                                owner = None
+                            owner_qn = _ocr_content_owner(item, chapter_records)
+                            owner = chapter_records.get(owner_qn) if owner_qn is not None else None
                             continuation = (item.get("solution_text") or "").strip()
-                            if owner and continuation and (owner.get("solution_text") or "").strip() and not _frag_mostly_present(continuation, owner["solution_text"], 0.9):
-                                owner["solution_text"] = owner["solution_text"].rstrip() + "\n" + continuation
+                            if owner and continuation and (owner.get("solution_text") or "").strip():
+                                tail = _novel_solution_tail(owner["solution_text"], continuation)
+                                if tail:
+                                    owner["solution_text"] = owner["solution_text"].rstrip() + "\n" + tail
+                                    print(f"  [OCR_FALLBACK] spliced novel continuation to q{owner_qn}")
+                                else:
+                                    print(f"  [OCR_FALLBACK] duplicate solution content ignored for q{owner_qn}")
                                 item["solution_text"] = None
-                                print(f"  [OCR_FALLBACK] appended continuation to q{item['q_no']}")
+                                # A null q_no fragment becomes mergeable once its
+                                # option-content evidence identifies an owner.
+                                item["q_no"] = owner_qn
                         print(f"  [OCR_FALLBACK] {entry['page_file']}: normalized {len(items2)} OCR item(s)")
                         chapter_records, skipped2 = merge_question_records(chapter_records, items2, stats, fill_only=True)
                         new_orphans.extend({"chapter_id": entry.get("chapter_id"), "item": it,
