@@ -35,10 +35,11 @@ class GeminiJsonParserTests(unittest.TestCase):
         self.assertFalse(looks_truncated_solution("This is a complete source sentence"))
         self.assertFalse(looks_truncated_solution("Complete OCR sentence "))
 
-    def test_table_dedupe_prefers_full_overlap_capture(self):
+    def test_table_dedupe_prefers_full_overlap_capture_in_any_order(self):
         partial = {"markdown": "| Stage | Goal |\n|---|---|\n| One | Trust |\n| Two | Autonomy |"}
         full = {"markdown": "| Stage | Goal |\n|---|---|\n| One | Trust |\n| Two | Autonomy |\n| Three | Initiative |"}
         self.assertEqual(_dedupe_tables([partial, full]), [full])
+        self.assertEqual(_dedupe_tables([full, partial]), [full])
 
     def test_inline_table_is_moved_out_of_solution_prose(self):
         text = "Explanation:\n| Phase | Result |\n|---|---|\n| Oral | Fixation |\nEnd."

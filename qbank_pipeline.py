@@ -959,7 +959,8 @@ def find_incomplete_records(chapter_records, force_solution_qns=()):
         missing = []
         if not rec.get("correct_option"):
             missing.append("answer")
-        if not rec.get("options") or len(rec["options"]) < 4:
+        options = rec.get("options") or {}
+        if len(options) < 4 or any(not str(v or "").strip() for v in options.values()):
             missing.append("options")
         if missing:
             incomplete.append((qn, missing))
@@ -1623,8 +1624,8 @@ def _dedupe_tables(tables):
     """
     candidates = [t for t in (tables or []) if isinstance(t, dict)]
     # Evaluate full captures first so a partial capture can never win by order.
-    candidates.sort(key=lambda t: (len(_table_body_rows(t)), len(str(t.get("markdown") or ""))),
-                    reverse=True)
+    candidates.sort(key=lambda t: (-len(_table_body_rows(t)), -len(str(t.get("markdown") or "")),
+                                  re.sub(r"\s+", "", str(t.get("markdown") or "").lower())))
     kept = []
     for table in candidates:
         key = re.sub(r"\s+", "", str(table.get("markdown") or "").lower())
@@ -2315,6 +2316,17 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
 
     option_rows = [{"id": str(k).strip().upper(), "text": v, "images": []}
                    for k, v in (rec["options"] or {}).items()]
+    # Last-resort release backfill: targeted retry above requests all options
+    # when one is blank. If OCR/model extraction still leaves the *correct*
+    # option blank, preserve usability with the solution's opening sentence
+    # and make the repair conspicuous for validator/manual review.
+    correct_id = str(rec.get("correct_option") or "").strip().upper()
+    for opt in option_rows:
+        if opt["id"] == correct_id and not str(opt.get("text") or "").strip():
+            first = re.split(r"(?<=[.!?])\s+", sol_text.strip(), maxsplit=1)[0].strip()
+            if first:
+                opt["text"] = first
+                print(f"  [OPTION_BACKFILLED] {qid}: correct option {correct_id} reconstructed from solution opening")
     # Correct clearly mislabelled "Option X:" explanation lines only when the
     # description overlaps another option at least twice as strongly.
     opt_text = {o["id"]: str(o.get("text") or "") for o in option_rows}
