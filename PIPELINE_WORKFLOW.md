@@ -326,6 +326,43 @@ with all of them mapped into just 2 solutions.
    a whole page on one solution. Integrity sweep step 4b heals rows from runs
    before the cap; validator gains `over_attributed_solution_images`.
 
+### 4.18 Changelog — 2026-08-02 (large-scale hardening, run-5 evidence)
+
+Triggered by the first full-book production run (33 chapters, 46 validator
+flags) -- fixing the defect classes that would multiply across 20 books:
+
+1. **Solution-gate bypass via printed headers** — `find_incomplete_records`
+   now accepts `printed_solution_qns`: a q_no whose "Solution to Question N:"
+   header exists in the chapter's text layer (`chapter_printed_solution_qns`,
+   zero-token, one pdftotext pass) is retry-eligible even when the chapter
+   sits below the 60% gate. Run-5 proof: ch25 at 7/12 (58%) had 5 REAL
+   solutions suppressed by the gate.
+2. **Page-focused rescue pass** — `rescue_incomplete_records` runs AFTER
+   targeted retry: records still missing answer/options/question/solution
+   get ONE focused call PER PAGE where their q_no is actually printed
+   (`locate_missing_record_pages` — question stem and/or solution header,
+   text layer). Targeted retry re-sends the whole chapter and stalls
+   ("filled 0 field(s)"); the rescue's small-page ask is what the 9
+   persistent gaps (ch2 q25/26, ch18 q13, ch19 q11/12, ch24 q12/13, ch27
+   q11, ch33 q9) needed. Merges fill-only, respects quota, rewrites the
+   still-incomplete ledger to post-rescue truth.
+3. **Anchorless-record drop** — rows with NO stem/options/solution after
+   batch + retry + rescue are phantom answer-key rows from a table spanning
+   chapters (ch24 q12/13 class). Dropped from output with a ledger entry
+   (`data/dropped_anchorless.jsonl`); never silently lost.
+4. **Malformed-JSON quota guard** — a batch whose Gemini response fails to
+   parse now gets ONE same-batch re-ask (1 call) before descending into
+   page-by-page salvage (was 6 calls every time; run-5 hit this twice).
+5. **`--auto-recover`** — one command heals a whole book: builds a
+   recover_pages plan from the ledgers (still-incomplete records with their
+   pages located in the text layer, unresolved orphans' pages, unmatched
+   images' pages) and runs it. No more hand-writing plan.json at scale.
+6. **questions.jsonl dedupe** — `_dedupe_questions_by_id` runs at the end of
+   `main()`: surgical re-runs append duplicate rows; the newest row per id
+   wins (idempotent across 20 books).
+7. **Summary line** now reports `rescue: N filled / M calls` and
+   `anchorless dropped: N` per chapter.
+
 ---
 
 ## 11. What feedback is wanted from the reviewer

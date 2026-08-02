@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 import zlib
@@ -232,6 +233,98 @@ class OrphanForeignGuardTests(unittest.TestCase):
         self.assertIn("genuine continuation", recs[16]["solution_text"])
         self.assertEqual(remaining, [])
         self.assertEqual(stats["orphans_recovered"], 1)
+
+
+class SolutionGateBypassTests(unittest.TestCase):
+    """find_incomplete_records must treat a printed 'Solution to Question N:'
+    header as per-question proof the book prints that explanation, even when
+    the chapter as a whole is below the 60% gate (ch25 class)."""
+
+    def _chapter(self):
+        records = {}
+        for i in range(1, 10):
+            rec = {"q_no": i, "question_text": f"stem {i}",
+                   "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                   "correct_option": "A"}
+            rec["solution_text"] = f"solution {i}" if i <= 4 else None  # 4/9 = 44% < 60%
+            records[i] = rec
+        return records
+
+    def test_gate_suppresses_below_threshold(self):
+        incomplete = qp.find_incomplete_records(self._chapter())
+        sol_qns = {qn for qn, missing in incomplete if "solution" in missing}
+        self.assertEqual(sol_qns, set())
+
+    def test_printed_header_bypasses_gate_for_that_qn_only(self):
+        incomplete = qp.find_incomplete_records(self._chapter(),
+                                                printed_solution_qns={7})
+        sol_qns = {qn for qn, missing in incomplete if "solution" in missing}
+        self.assertEqual(sol_qns, {7})
+
+
+class AnchorlessDropTests(unittest.TestCase):
+    """Records with no stem/options/solution after all recovery are phantom
+    answer-key rows (ch24 q12/13 class) -- dropped with a ledger entry."""
+
+    def test_anchorless_detection(self):
+        self.assertTrue(qp._anchorless_record(
+            {"q_no": 12, "question_text": None, "options": None,
+             "solution_text": None, "correct_option": None}))
+        self.assertFalse(qp._anchorless_record(
+            {"q_no": 12, "question_text": None, "options": None,
+             "solution_text": "x", "correct_option": None}))
+        self.assertFalse(qp._anchorless_record(
+            {"q_no": 12, "question_text": "q", "options": {},
+             "solution_text": None, "correct_option": None}))
+        self.assertFalse(qp._anchorless_record(
+            {"q_no": 12, "question_text": None, "options": {"A": "a"},
+             "solution_text": None, "correct_option": None}))
+
+
+class LocatePagesTests(unittest.TestCase):
+    """locate_missing_record_pages finds the pages where a missing q_no is
+    printed (question stem or solution header) via the text layer."""
+
+    def test_locate_question_stem_and_solution_header_pages(self):
+        fake = {1: "1. Question one\n2. Question two\n",
+                2: "Solution to Question 7:\nExplanation\n",
+                3: "plain text with no markers\n"}
+        orig = qp.pdftotext_page
+        qp.pdftotext_page = lambda pdf, page: fake.get(page, "")
+        try:
+            page_files = [Path(f"/tmp/x/page-{n:03d}.jpg") for n in (1, 2, 3)]
+            loc = qp.locate_missing_record_pages("pdf", page_files,
+                                                 {1: None, 2: None, 7: None}, {})
+        finally:
+            qp.pdftotext_page = orig
+        self.assertEqual(loc, {1: [1], 2: [1], 7: [2]})
+
+    def test_unlocatable_qn_is_omitted(self):
+        orig = qp.pdftotext_page
+        qp.pdftotext_page = lambda pdf, page: "nothing useful\n"
+        try:
+            page_files = [Path("/tmp/x/page-001.jpg"), Path("/tmp/x/page-002.jpg")]
+            loc = qp.locate_missing_record_pages("pdf", page_files, {9: None}, {})
+        finally:
+            qp.pdftotext_page = orig
+        self.assertEqual(loc, {})
+
+
+class DedupeQuestionsTests(unittest.TestCase):
+    """Surgical re-runs append duplicate rows; _dedupe_questions_by_id keeps
+    the newest row per id (idempotent re-runs at 20-book scale)."""
+
+    def test_keeps_last_row_per_id(self):
+        path = Path(tempfile.mkdtemp()) / "questions.jsonl"
+        path.write_text('{"id": "PSY-001-001", "v": 1}\n'
+                        '{"id": "PSY-001-001", "v": 2}\n'
+                        '{"id": "PSY-001-002", "v": 1}\n', encoding="utf-8")
+        n = qp._dedupe_questions_by_id(path)
+        self.assertEqual(n, 1)
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        self.assertEqual(len(rows), 2)
+        by_id = {r["id"]: r["v"] for r in rows}
+        self.assertEqual(by_id, {"PSY-001-001": 2, "PSY-001-002": 1})
 
 
 class GeminiJsonParserTests(unittest.TestCase):
