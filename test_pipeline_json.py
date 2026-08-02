@@ -135,6 +135,47 @@ class SolutionFigureMappingTests(unittest.TestCase):
         self.assertEqual((owned.get(5) or {}).get("solution") or [], [])
 
 
+class RetryForeignFragmentGuardTests(unittest.TestCase):
+    """Wrong-owner guard for targeted-retry solution continuations
+    (external-audit 2026-08-02: q16's truncated re-ask returned q17's
+    solution and the old code APPENDED it, blending two solutions)."""
+
+    def setUp(self):
+        self.rec = {"q_no": 16, "options": {"A": "alpha", "B": "beta",
+                                            "C": "gamma", "D": "delta"},
+                    "solution_text": "q16's own partial explanation"}
+        self.chapter = {15: {"solution_text": "q15's solution text"},
+                        16: self.rec,
+                        17: {"solution_text": "q17's completely different "
+                                              "explanation of q17's topic"}}
+
+    def test_genuine_continuation_is_kept(self):
+        frag = "and here the continuation continues without overlap"
+        self.assertIsNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
+
+    def test_foreign_option_line_head_blocked(self):
+        # owner has no 'Option D' explanation topic matching this line
+        frag = "Option D: the exact wording of some other question's option"
+        self.assertIsNotNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
+
+    def test_embedded_solution_header_for_another_question_blocked(self):
+        frag = "text...\nSolution to Question 17: q17's completely different explanation"
+        self.assertIsNotNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
+
+    def test_own_header_not_blocked(self):
+        frag = "text...\nSolution to Question 16: continued"
+        self.assertIsNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
+
+    def test_first_line_verbatim_in_sibling_blocked(self):
+        # the retry fragment restates q17's solution -- its first line IS a
+        # verbatim line of q17's solution (sibling-donor proof)
+        self.chapter[17]["solution_text"] = ("q17's completely different explanation of q17's "
+                                             "topic with lots more detail and then even more")
+        frag = ("q17's completely different explanation of q17's topic with lots more "
+                "detail and then even more\nand the fragment continues here")
+        self.assertIsNotNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
+
+
 class GeminiJsonParserTests(unittest.TestCase):
     def test_parses_one_array(self):
         self.assertEqual(parse_gemini_json_array('[{"q_no": 1}]'), [{"q_no": 1}])

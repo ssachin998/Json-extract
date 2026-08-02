@@ -1118,6 +1118,17 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
     return "\n".join(lines)
 
 
+def _log_blocked_retry_fragment(chapter_id, qn, reason, fragment):
+    """Ledger entry for a targeted-retry response that was provably another
+    question's solution (wrong-owner guard). The fragment is never merged
+    into the record; it stays visible here for review instead of silently
+    blending two solutions (PSY-016/017-017 class)."""
+    _append_jsonl(DATA_DIR / "integrity_flags.jsonl",
+                  {"kind": "retry_foreign_fragment_blocked", "q_no": qn,
+                   "chapter_id": chapter_id, "detail": reason,
+                   "fragment": (fragment or "")[:600]})
+
+
 def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                    force_solution_qns=None, chapter_id=None):
     """
@@ -1203,8 +1214,17 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                 str(fix.get("solution_text") or ""), fix.get("tables") or [], qn)
             if "solution" in requested and incoming_text:
                 if not sol_existing:
-                    rec["solution_text"] = incoming_text
-                    fixed_this_round += 1
+                    # A foreign fragment must not FILL an empty solution either
+                    # (same audit class as the append below: the re-ask for
+                    # q16 can come back carrying q17's block).
+                    foreign = _solution_fragment_foreign(incoming_text, qn, rec, chapter_records)
+                    if foreign:
+                        _log_blocked_retry_fragment(chapter_id, qn, foreign, incoming_text)
+                        print(f"  [RETRY] blocked foreign solution fragment for q{qn} "
+                              f"(empty solution): {foreign}")
+                    else:
+                        rec["solution_text"] = incoming_text
+                        fixed_this_round += 1
                 elif qn in forced:
                     # Targeted prompt asks for the missing continuation, so
                     # preserve the established prose/bullets instead of
@@ -1213,8 +1233,20 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                         rec["solution_text"] = incoming_text
                         fixed_this_round += 1
                     elif not _frag_mostly_present(incoming_text, sol_existing, 0.9):
-                        rec["solution_text"] = sol_existing.rstrip() + "\n" + incoming_text
-                        fixed_this_round += 1
+                        # Wrong-owner guard (external-audit 2026-08-02:
+                        # q16's truncated re-ask returned q17's solution and
+                        # the old code APPENDED it -- 'not mostly present'
+                        # was misread as new continuation). Only append when
+                        # the fragment passes the deterministic foreign
+                        # proofs; a genuine continuation is kept.
+                        foreign = _solution_fragment_foreign(incoming_text, qn, rec, chapter_records)
+                        if foreign:
+                            _log_blocked_retry_fragment(chapter_id, qn, foreign, incoming_text)
+                            print(f"  [RETRY] blocked foreign solution fragment for q{qn}: {foreign} "
+                                  f"(existing solution untouched; fragment logged)")
+                        else:
+                            rec["solution_text"] = sol_existing.rstrip() + "\n" + incoming_text
+                            fixed_this_round += 1
             if "solution" in requested and incoming_tables:
                 before_tables = rec.get("tables") or []
                 merged_tables = _dedupe_tables(list(before_tables) + incoming_tables)
@@ -1930,6 +1962,45 @@ def _foreign_option_line(frag, rec):
         return False
     head = " ".join(re.findall(r"\w+", (frag or "").lower())[:25])
     return sum(1 for t in otoks[:6] if t in head) == 0
+
+
+def _solution_fragment_foreign(frag, qn, rec, chapter_records):
+    """Deterministic 'this retry fragment does NOT belong to q{qn}' proofs
+    for solution text returned by targeted_retry. External-audit class
+    (2026-08-02): a truncated-solution re-ask for q16 came back carrying
+    q17's text and the old code APPENDED it because 'not mostly present'
+    was treated as new continuation -- blending two questions' solutions.
+    Returns a short reason string, or None when no proof fires.
+
+    Proofs (all zero-token, cross-record where possible):
+      1. the fragment begins with an 'Option X:' explanation of an option
+         this record does not own (reuses the orphan wrong-owner guard);
+      2. the fragment carries an embedded 'Solution to Question N:' header
+         naming a DIFFERENT question (self-labeled foreign block);
+      3. the fragment's first content line exists verbatim in another
+         record of this chapter (sibling-donor proof -- the same evidence
+         the integrity sweep uses before it trims a head).
+
+    A fragment that passes all three is kept: a genuine continuation after
+    a cut point shares no tokens with the existing text by construction,
+    so low overlap alone is deliberately NOT foreign evidence."""
+    s = (frag or "").strip()
+    if not s:
+        return None
+    if _foreign_option_line(s, rec):
+        return "fragment begins with an 'Option' line the owner cannot own"
+    for m in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", s, re.IGNORECASE):
+        n = int(m.group(1))
+        if n != qn:
+            return f"fragment carries 'Solution to Question {n}:' (not q{qn})"
+    first_line = s.splitlines()[0].strip()
+    if first_line and len(first_line) >= 20:
+        for other_qn, other in chapter_records.items():
+            if other_qn == qn:
+                continue
+            if first_line in (other.get("solution_text") or ""):
+                return f"first line exists verbatim in q{other_qn}'s solution"
+    return None
 
 
 def looks_like_solution_style_stem(text):
