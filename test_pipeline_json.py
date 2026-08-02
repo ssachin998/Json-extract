@@ -176,6 +176,64 @@ class RetryForeignFragmentGuardTests(unittest.TestCase):
         self.assertIsNotNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
 
 
+class OrphanForeignGuardTests(unittest.TestCase):
+    """recover_orphans rule-3 append must not glue a neighbour's solution
+    onto a partial owner (audit foreign-tail candidates: 006-014, 011-017,
+    011-026, 012-002, 014-015, 022-008)."""
+
+    def test_foreign_fragment_blocked_and_kept_for_review(self):
+        recs = {
+            16: {"q_no": 16, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                 "question_text": "q16 stem", "correct_option": "B",
+                 "solution_text": "q16's own partial explanation", "tables": []},
+            17: {"q_no": 17, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                 "question_text": "q17 stem", "correct_option": "C",
+                 "solution_text": "q17's completely different explanation of q17's "
+                                  "topic with lots more detail and then even more",
+                 "tables": []},
+        }
+        frag = ("q17's completely different explanation of q17's topic with lots more "
+                "detail and then even more\nand the fragment continues here")
+        orphans = [{"chapter_id": "PSY-016", "batch_start": 0, "pdf_pages": [1],
+                    "new_pages": [1], "carry_q_no": None, "cut_part": None,
+                    "last_qn_in_batch": 16,
+                    "item": {"q_no": None, "question_text": None, "options": None,
+                             "correct_option": None, "solution_text": frag,
+                             "tables": [], "has_figure_in_question": False,
+                             "has_figure_in_solution": False}}]
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "chapter_id": "PSY-016"}
+        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
+        # the fragment must NOT be appended to q16
+        self.assertNotIn("q17's completely", recs[16]["solution_text"])
+        self.assertIn("q17's completely", recs[17]["solution_text"])
+        # and must be kept for review with a blocked reason
+        self.assertEqual(len(remaining), 1)
+        self.assertIn("blocked_reason", remaining[0])
+        self.assertIn("foreign", remaining[0]["blocked_reason"])
+        self.assertEqual(stats["foreign_fragments_blocked"], 1)
+
+    def test_genuine_continuation_still_appends(self):
+        recs = {
+            16: {"q_no": 16, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                 "question_text": "q16 stem", "correct_option": "B",
+                 "solution_text": "q16's own partial explanation", "tables": []},
+        }
+        frag = "and here the genuine continuation continues without any overlap"
+        orphans = [{"chapter_id": "PSY-016", "batch_start": 0, "pdf_pages": [1],
+                    "new_pages": [1], "carry_q_no": None, "cut_part": None,
+                    "last_qn_in_batch": 16,
+                    "item": {"q_no": None, "solution_text": frag, "tables": [],
+                             "question_text": None, "options": None,
+                             "correct_option": None}}]
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "chapter_id": "PSY-016"}
+        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
+        self.assertIn("genuine continuation", recs[16]["solution_text"])
+        self.assertEqual(remaining, [])
+        self.assertEqual(stats["orphans_recovered"], 1)
+
+
 class GeminiJsonParserTests(unittest.TestCase):
     def test_parses_one_array(self):
         self.assertEqual(parse_gemini_json_array('[{"q_no": 1}]'), [{"q_no": 1}])

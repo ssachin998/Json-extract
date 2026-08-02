@@ -2253,10 +2253,24 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
             remaining.append({**orph, "blocked_reason":
                               "foreign Option-line head (wrong-owner guard); "
                               f"suspected owner differs from q{owner}"})
+        sol_blocked = False
         if item.get("solution_text") and not blocked_sol:
             frag = item["solution_text"].strip()
             if frag and not _frag_mostly_present(frag, rec.get("solution_text") or ""):
-                rec["solution_text"] = ((rec.get("solution_text") or "") + " " + frag).strip()
+                # Wrong-owner guard (same audit class as the retry append):
+                # rule 3's "PARTIAL owner append" must not glue a NEIGHBOUR's
+                # solution onto this record just because the overlap is low
+                # (the audit's foreign-tail candidates: 006-014, 011-017,
+                # 011-026, 012-002, 014-015, 022-008).
+                foreign = _solution_fragment_foreign(frag, owner, rec, chapter_records)
+                if foreign:
+                    stats["foreign_fragments_blocked"] = stats.get("foreign_fragments_blocked", 0) + 1
+                    print(f"  [WARN] [ORPHAN] blocked foreign solution fragment for q{owner} "
+                          f"({foreign}) -- fragment kept in orphans.jsonl for review")
+                    remaining.append({**orph, "blocked_reason": f"foreign solution fragment: {foreign}"})
+                    sol_blocked = True
+                else:
+                    rec["solution_text"] = ((rec.get("solution_text") or "") + " " + frag).strip()
         if item.get("options"):
             rec["options"] = rec["options"] or {}
             for k, v in item["options"].items():
@@ -2274,9 +2288,10 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
         qid = f"{subject}-{chapter_no:03d}-{owner:03d}"
         merged_something = bool(
             item.get("options") or item.get("question_text") or item.get("correct_option")
-            or item.get("tables") or (item.get("solution_text") and not blocked_sol))
+            or item.get("tables") or (item.get("solution_text") and not blocked_sol and not sol_blocked))
         if merged_something:
-            note = " (+ a foreign solution fragment was blocked, kept aside)" if blocked_sol else ""
+            note = (" (+ a foreign solution fragment was blocked, kept aside)"
+                    if (blocked_sol or sol_blocked) else "")
             print(f"  [ORPHAN] Recovered orphan: page={page} assigned_to={qid} reason={reason}{note}")
             stats["orphans_recovered"] += 1
             if "carry-forward" in reason:
