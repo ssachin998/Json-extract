@@ -126,11 +126,12 @@ Two ladders protecting two call sites:
 
 - `extract_real_images()`: pypdf XObject walk per page, skip watermark id, save `webp` under `assets/questions/{SUBJECT}/` with temp names `PSY-p{page}-{seq}.webp`.
 - `image_positions_on_page()`: 2D affine CTM composition (`_mat_mult`) → y-positions, so images on a page can be ordered against question numbers printed on the same page (`pdftotext`).
-- **Claim pass 1** (`claim_page_images_one_to_one`, during batches): one-to-one assignment by page-order vs the questions already known; respects per-question caps.
+- **Solution-block mapping (claim pass 0, `claim_solution_page_images`)**: every figure drawn under a printed `Solution to Question N:` header is assigned to THAT solution by real PDF y-position — the CLOSEST header whose baseline sits above the figure's bottom edge (`solution_headers_on_page` locates headers with pypdf's text visitor, same bottom-left coordinate space as the image positions; no extra subprocess). When a header cannot be located, the figure is left unclaimed instead of guessed. This replaces the old single-owner shortcut, which attached EVERY image of a page to the ONE header the (partially garbled) text layer happened to decode — the "7 figures collapsed into 2 solutions" user report.
+- **Claim pass 1** (`claim_page_images_one_to_one`, during batches): leftover figures from pass 0; one-to-one assignment by page-order vs the questions already known; respects per-question caps.
 - **Claim pass 2** (chapter end): retry leftovers now that all records exist (plates often print just before their question).
 - **Claim pass 3** (0 tokens): if `pdftotext` shows EXACTLY ONE of this chapter's questions printed on the image's page → that question is owner (side picked by "fig/diagram" in stem vs solution presence); rename via `_rename_for_slot` (collision-proof `_Q_01/_Q_02…` suffixes, tiny-file guard, cap guard).
 - **Claim pass 4** (Gemini, ONE image/call): `attribute_orphan_image()` returns `{q_no, slot}` or `decorative:true`; decorative → `decorative_images.jsonl`; undecided → stays unmatched; quota brake stops gracefully.
-- **Guards everywhere**: `MIN_IMAGE_BYTES = 1500` (<1.5 KB webp ≈ broken crop — ref dropped everywhere, never shipped broken), `MAX_QUESTION_IMAGES = 3` (over-attribution sweep de-references extras to `unmatched` with reason — fired 4× in prod), `IMG_PATH_RE` filename validation, missing-file ref drop at build time.
+- **Guards everywhere**: `MIN_IMAGE_BYTES = 1500` (<1.5 KB webp ≈ broken crop — ref dropped everywhere, never shipped broken), `MAX_QUESTION_IMAGES = 3` (over-attribution sweep de-references extras to `unmatched` with reason — fired 4× in prod), `MAX_SOLUTION_IMAGES = 2` (solution-side cap at the `_rename_for_slot` choke point + sweep step 4b — a solution block citing >2 figures means under-detected headers stacked neighbours' figures onto it), `IMG_PATH_RE` filename validation, missing-file ref drop at build time.
 - Naming convention (locked): `assets/questions/{SUBJECT}/{SUBJECT}-{CH:03d}-{Q:03d}_{Q|SOL|OPT_A..|TABLE}_{NN}.webp`.
 - Still-unclaimed → `unmatched_images.jsonl` for human review (current known residual: 3 page-groups in the trial book).
 
@@ -148,7 +149,7 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 - **duplicated wrong-owner stems**: two records sharing a stem → coherence resolver strips the provably-foreign one.
 - **foreign `Option` heads in solutions** (`_foreign_option_line`): a solution containing another question's "Option X:" rebuttal block is clipped at the foreign marker.
 - **truncated solutions** (`looks_truncated_solution`): dangling-colon/mid-flow endings; **suppressed if the row has tables/images** that legitimately continue the text (book layout = "…listed below:" + table). Mid-flow truncation (trailing-space/joiner evidence) stays REAL.
-- **over-attributed images** (>3 question-side) → de-reference extras with ledger entry.
+- **over-attributed images** (>3 question-side, or >2 solution-side) → de-reference extras with ledger entry (`question_images_trimmed` / `solution_images_trimmed`).
 - Outputs `forced_solution_qns` → targeted retry re-asks those solutions even if the 60 % gate wouldn't.
 - Sweep findings → `integrity_flags.jsonl` with `kind`, evidence, `matched` bool.
 
@@ -177,7 +178,7 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 ### 4.13 Offline validation (`qbank_validator.py`)
 
 `run_hybrid(output_root, audit=False)`:
-- **Deterministic layer (0 tokens)** over rows + chapters + sidecars. Flag kinds (severity high/low): `truncated_solution`, `suspect_truncated_table`, `foreign_solution_segment` (shingle-8 overlap ≥400 chars between sibling solutions → suspect = longer row), `option_solution_disagree`, `answer_mismatch`, `duplicate_text` (cross-row stem dup with coherence suspect), `duplicate_id`, `duplicate_table`, `empty_question`, `bad_options`, `missing_answer`, `missing_solution`, `numbering_gap`, `numbering_start`, `source_gap`, `short_bare_solution`, `solution_header_furniture`, `solution_recitation_dump`, `foreign_option_head`, `image_ref_missing`, `suspicious_tiny_image`, `over_attributed_images`, `image_unclaimed`, `stray_answer_key_table`, `orphan_unresolved`, `answer_key_only_suppressed`, `suspect_density` (per-chapter anomaly density).
+- **Deterministic layer (0 tokens)** over rows + chapters + sidecars. Flag kinds (severity high/low): `truncated_solution`, `suspect_truncated_table`, `foreign_solution_segment` (shingle-8 overlap ≥400 chars between sibling solutions → suspect = longer row), `option_solution_disagree`, `answer_mismatch`, `duplicate_text` (cross-row stem dup with coherence suspect), `duplicate_id`, `duplicate_table`, `empty_question`, `bad_options`, `missing_answer`, `missing_solution`, `numbering_gap`, `numbering_start`, `source_gap`, `short_bare_solution`, `solution_header_furniture`, `solution_recitation_dump`, `foreign_option_head`, `image_ref_missing`, `suspicious_tiny_image`, `over_attributed_images`, `over_attributed_solution_images`, `image_unclaimed`, `stray_answer_key_table`, `orphan_unresolved`, `answer_key_only_suppressed`, `suspect_density` (per-chapter anomaly density).
 - **Audit mode** (opt-in, capped calls): sends only flagged rows (+ context) to Gemini for semantic verdicts (`audit_missing_question`, `audit_ghost_question`, `audit_component_missing`, `verified_clean`, etc.) — human review funnel without full-dataset cost.
 - Output: `data/validation_report.json` (generated_at, flags_total, by kind, by chapter) + dashboard log box rendering.
 
@@ -229,6 +230,7 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 | `SOLUTION_GATE_MIN_SHARE` | 0.6 | distinguishes "prints solutions" vs answer-only chapters |
 | `MAX_CALLS_PER_DAY` | 1400 | 7 % buffer under 1500/day free tier |
 | `MAX_QUESTION_IMAGES` | 3 | >3 question-side figures ≈ mis-attribution |
+| `MAX_SOLUTION_IMAGES` | 2 | >2 solution-side figures ≈ under-detected headers stacking neighbours' figures |
 | `MIN_IMAGE_BYTES` | 1500 | <1.5 KB webp ≈ broken crop |
 | Render DPI | 150 (recovery: higher) | readability/cost |
 | Backoffs | 65 s (429), 20 s (transient 5xx) | RPM-burst vs daily-cap disambiguation |
@@ -298,6 +300,31 @@ trial book under two subject codes = 868 rows; 47 flags):
    archives `data/`, `assets/`, `state.json` into `_archive/<ts>/` INSIDE the
    volume (nothing deleted), giving each new book a clean slate. Reset is
    400-blocked without a mounted Volume or while a run is processing.
+
+---
+
+### 4.17 Changelog — 2026-08-02 (solutions-page figure mapping fix)
+
+Triggered by the user report: a solutions page holding 7 figures came back
+with all of them mapped into just 2 solutions.
+
+1. **Position-based solution-block mapping** — the header-binding added
+   earlier treated a page's ONE decoded `Solution to Question N:` header as
+   the page's owner and attached EVERY figure on the page to it (the text
+   layer of scanned books decodes headers sporadically, so a 7-block page
+   often surfaced a single header). New `claim_solution_page_images` assigns
+   each figure to the CLOSEST header drawn above it using real PDF
+   y-positions (`solution_headers_on_page` via pypdf's text visitor — same
+   bottom-left coordinate space as `image_positions_on_page`, no extra
+   subprocess, no coordinate conversion). Figures with no locatable header
+   above them are left unclaimed (model/manual pass) instead of guessed.
+   Applied in `process_pdf` and in `--recover` mode.
+2. **`MAX_SOLUTION_IMAGES = 2`** — solution-side over-attribution cap at the
+   `_rename_for_slot` choke point (mirrors `MAX_QUESTION_IMAGES = 3`): when
+   headers are under-detected, only the first two figures under a header are
+   auto-claimed; the rest flow to the model/manual passes instead of stacking
+   a whole page on one solution. Integrity sweep step 4b heals rows from runs
+   before the cap; validator gains `over_attributed_solution_images`.
 
 ---
 

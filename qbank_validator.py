@@ -62,6 +62,9 @@ HIGH, LOW = "high", "low"
 # deliberately isolated from qbank_pipeline's import graph).
 MIN_IMAGE_BYTES = 1500        # <1.5KB webp = broken crop (PSY-003-014 shipped 414B)
 MAX_QUESTION_IMAGES = 3       # >3 question-side figures = over-attribution suspect
+MAX_SOLUTION_IMAGES = 2       # >2 solution-side figures = over-attribution suspect
+                              # (user report: 7 figures on one solutions page
+                              # collapsed into 2 solutions)
 DANGLING_END_RE = re.compile(r"(:|\u2014|\u2013|\u2022)\s*$")
 TERMINAL_PUNCT = ".!?)\"'\u201d\u00bb"
 OPTION_LINE_START_RE = re.compile(r"^\s*Option\s+([A-D])\b\s*[:.)]\s*", re.IGNORECASE)
@@ -260,6 +263,11 @@ def check_row(row, assets_questions):
         flags.append(flag(cid, "over_attributed_images",
                           f"{row.get('id')}: {len(row['question']['images'])} question-side images "
                           f"(> {MAX_QUESTION_IMAGES}) -- over-attribution suspect", qn, LOW))
+    if len((row.get("solution") or {}).get("images") or []) > MAX_SOLUTION_IMAGES:
+        flags.append(flag(cid, "over_attributed_solution_images",
+                          f"{row.get('id')}: {len(row['solution']['images'])} solution-side images "
+                          f"(> {MAX_SOLUTION_IMAGES}) -- over-attribution suspect "
+                          f"(solutions-page figures mapped by block position)", qn, LOW))
     # duplicate tables inside one solution (PSY-012-008/009-005)
     tbls = sol.get("tables") or []
     seen_tbl, dup_tbl = set(), 0

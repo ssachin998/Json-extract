@@ -280,3 +280,27 @@ The hybrid validator's stage-2 witness (--audit) enumerates every printed
 question/component per chapter pages and CODE diffs it against the JSONL --
 that IS the page-by-page comparison; it now also diffs the figure component
 (a figure the witness saw but JSON lacks -> audit_component_missing).
+
+--------------------------------------------------------------------------------
+## 5. Run-5 audit — solutions-page figure mapping (2026-08-02)
+
+### A5-1 — Whole solutions page dumped onto ONE decoded header (user report:
+### "maps 7 figures into 2 solutions") **[PROVEN mechanism]**
+The header-binding shortcut (`sol_owners == 1` → attach every image of the
+page to that solution) fired whenever the text layer decoded exactly ONE
+`Solution to Question N:` header. The PSY book's body-page text layer is
+partially garbled (documented in §1 of this file), so a page with SEVEN
+solution blocks routinely surfaced a single header; two such pages → 7
+figures collapsed into 2 solutions. Also reachable via the one-to-one
+matcher when a stray line-start number made `qns_printed_on_page` return a
+single q_no on a solutions page.
+**Fix:** `claim_solution_page_images` — each figure is assigned to the
+CLOSEST header whose baseline sits above its bottom edge, using real PDF
+y-positions from pypdf's text visitor (`solution_headers_on_page`) and the
+existing content-stream image positions (same bottom-left coordinate space,
+no extra subprocess, no coordinate conversion). Figures with no locatable
+header above them are left unclaimed → model/manual pass (never guessed).
+Applied in process_pdf AND in --recover mode. `MAX_SOLUTION_IMAGES = 2`
+caps the deterministic path at the `_rename_for_slot` choke point; sweep
+step 4b trims older rows' excess; validator: over_attributed_solution_images
+(LOW). Regression tests: test_pipeline_json.py::SolutionFigureMappingTests.

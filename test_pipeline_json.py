@@ -1,6 +1,138 @@
+import tempfile
 import unittest
+import zlib
+from pathlib import Path
 
+import qbank_pipeline as qp
 from qbank_pipeline import _dedupe_tables, _normalize_solution_payload, looks_truncated_solution, parse_gemini_json_array
+
+
+def _write_test_pdf(path, texts, images):
+    """Build a tiny single-page PDF (612x792) with Helvetica text at
+    (x, y) -- y in PDF user space, origin bottom-left -- and one red image
+    XObject per (obj_num, name, x, y). Pure-python; no poppler needed."""
+    objects = {}
+    stream_parts = []
+    for i, (t, x, y, sz) in enumerate(texts):
+        stream_parts.append(f"BT /F1 {sz} Tf {x} {y} Td ({t}) Tj ET".encode("latin-1"))
+    w, h = 20, 10
+    img_data = zlib.compress(b"\xff\x00\x00" * (w * h))
+    xobjs = {}
+    for obj_num, name, x, y in images:
+        objects[obj_num] = (f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} "
+                            f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode "
+                            f"/Length {len(img_data)} >>\nstream\n{img_data.decode('latin-1')}\nendstream")
+        xobjs[name] = f"{obj_num} 0 R"
+        stream_parts.append(f"q {w} 0 0 {h} {x} {y} cm /{name} Do Q".encode("latin-1"))
+    objects[5] = "<< /Length %d >>\nstream\n%s\nendstream" % (
+        sum(len(p) + 1 for p in stream_parts), b"\n".join(stream_parts).decode("latin-1"))
+    objects[1] = "<< /Type /Catalog /Pages 2 0 R >>"
+    objects[2] = "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"
+    xres = " ".join(f"/{n} {r}" for n, r in xobjs.items())
+    objects[3] = (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                  f"/Resources << /Font << /F1 4 0 R >> /XObject << {xres} >> >> /Contents 5 0 R >>")
+    objects[4] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    out = b"%PDF-1.4\n"
+    offsets = {}
+    for num in sorted(objects):
+        offsets[num] = len(out)
+        out += f"{num} 0 obj\n".encode() + objects[num].encode("latin-1") + b"\nendobj\n"
+    xref_pos = len(out)
+    n = len(objects) + 1
+    out += f"xref\n0 {n}\n".encode() + b"0000000000 65535 f \n"
+    for num in sorted(objects):
+        out += f"{offsets[num]:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode()
+    path.write_bytes(out)
+
+
+class SolutionFigureMappingTests(unittest.TestCase):
+    """Regression tests for the solutions-page figure mapping fix
+    (user report: a 7-figure solutions page collapsed into 2 solutions
+    because a single decoded header swallowed every image on the page)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets = qp.ASSETS_DIR
+        qp.ASSETS_DIR = self.tmp / "assets"
+        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
+        self.subj_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR = self._old_assets
+
+    def _claim(self, pdf, oids, recs, page=1):
+        rels = []
+        for oid in oids:
+            fname = f"PSY-p{page}-{oid}.webp"
+            (self.subj_dir / fname).write_bytes(b"x" * 3000)  # > MIN_IMAGE_BYTES
+            rels.append(f"PSY/{fname}")
+        image_files_by_q = {}
+        leftover = qp.claim_page_images(rels, pdf, page, "PSY", 1, recs, image_files_by_q)
+        return leftover, image_files_by_q
+
+    def test_headers_located_with_positions_top_first(self):
+        pdf = self.tmp / "solutions.pdf"
+        _write_test_pdf(pdf, [
+            ("Solution to Question 3:", 72, 700, 12),
+            ("Explanation text for q3", 72, 660, 10),
+            ("Solution to Question 7:", 72, 550, 12),
+            ("Solution to Question 2:", 72, 400, 12),
+        ], [])
+        self.assertEqual(qp.solution_headers_on_page(pdf, 1, {2: {}, 3: {}, 7: {}}),
+                         [(3, 700.0), (7, 550.0), (2, 400.0)])
+        # a header whose q_no is not in the chapter is ignored
+        self.assertEqual(qp.solution_headers_on_page(pdf, 1, {3: {}}), [(3, 700.0)])
+
+    def test_each_figure_maps_to_its_own_solution_block(self):
+        # 3 headers at y=700/550/400, one figure under each (y=640/490/340)
+        pdf = self.tmp / "three_blocks.pdf"
+        _write_test_pdf(pdf, [
+            ("Solution to Question 3:", 72, 700, 12),
+            ("Solution to Question 7:", 72, 550, 12),
+            ("Solution to Question 2:", 72, 400, 12),
+        ], [(6, "Im6", 300, 640), (7, "Im7", 300, 490), (8, "Im8", 300, 340)])
+        recs = {2: {"has_figure_in_solution": True},
+                3: {"has_figure_in_solution": True},
+                7: {"has_figure_in_solution": True}}
+        leftover, owned = self._claim(pdf, [6, 7, 8], recs)
+        self.assertEqual(leftover, [])
+        # each figure lands on the solution whose header is drawn above it
+        self.assertEqual(owned[3]["solution"], ["PSY/PSY-001-003_SOL_01.webp"])
+        self.assertEqual(owned[7]["solution"], ["PSY/PSY-001-007_SOL_01.webp"])
+        self.assertEqual(owned[2]["solution"], ["PSY/PSY-001-002_SOL_01.webp"])
+
+    def test_under_detected_headers_no_longer_swallow_the_page(self):
+        # ONE decoded header but FIVE figures below it (the old code dumped
+        # all five onto that one solution) -> cap at MAX_SOLUTION_IMAGES,
+        # the rest stay unclaimed for the model/manual pass.
+        pdf = self.tmp / "one_block.pdf"
+        _write_test_pdf(pdf, [
+            ("Solution to Question 3:", 72, 700, 12),
+            ("Explanation text for q3", 72, 660, 10),
+        ], [(6, "Im6", 300, 640), (7, "Im7", 300, 600), (8, "Im8", 300, 560),
+            (9, "Im9", 300, 520), (10, "Im10", 300, 480)])
+        leftover, owned = self._claim(pdf, [6, 7, 8, 9, 10], {3: {"has_figure_in_solution": True}})
+        self.assertEqual(len(owned[3]["solution"]), qp.MAX_SOLUTION_IMAGES)
+        self.assertEqual(len(leftover), 3)
+
+    def test_figure_above_all_headers_is_not_guessed(self):
+        # figure drawn ABOVE the only header -> no deterministic owner
+        pdf = self.tmp / "above_header.pdf"
+        _write_test_pdf(pdf, [
+            ("Solution to Question 5:", 72, 400, 12),
+        ], [(6, "Im6", 300, 500)])
+        leftover, owned = self._claim(pdf, [6], {5: {"has_figure_in_solution": True}})
+        self.assertEqual(leftover, ["PSY/PSY-p1-6.webp"])
+        self.assertEqual((owned.get(5) or {}).get("solution") or [], [])
+
+    def test_no_headers_means_no_auto_claim(self):
+        pdf = self.tmp / "no_headers.pdf"
+        _write_test_pdf(pdf, [("Plain text with no headers", 72, 700, 12)],
+                        [(6, "Im6", 300, 500)])
+        leftover, owned = self._claim(pdf, [6], {5: {"has_figure_in_solution": True}})
+        self.assertIn("PSY/PSY-p1-6.webp", leftover)
+        self.assertEqual((owned.get(5) or {}).get("solution") or [], [])
 
 
 class GeminiJsonParserTests(unittest.TestCase):

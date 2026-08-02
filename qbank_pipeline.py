@@ -1008,6 +1008,26 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
         print(f"  [SWEEP] q{qn}: de-referenced {len(extras)} over-attributed question "
               f"image(s) -- logged to unmatched_images.jsonl")
 
+    # 4b. over-attributed SOLUTION images (same class on the solution side:
+    #     user report -- 7 figures on one solutions page collapsed into 2
+    #     solutions; the sweep also heals rows from runs before the cap).
+    for qn in qns:
+        entry = image_files_by_q.get(qn)
+        if not entry or len(entry.get("solution") or []) <= MAX_SOLUTION_IMAGES:
+            continue
+        extras = entry["solution"][MAX_SOLUTION_IMAGES:]
+        del entry["solution"][MAX_SOLUTION_IMAGES:]
+        _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
+                      {"subject": subject, "chapter_id": f"{subject}-{chapter_no:03d}",
+                       "page": None, "files": extras,
+                       "reason": f"over-attribution sweep (> {MAX_SOLUTION_IMAGES} solution "
+                                 f"images on one question) -- de-referenced for review"})
+        iflag("solution_images_trimmed", qn,
+              f"had {len(extras) + MAX_SOLUTION_IMAGES} solution images; kept first "
+              f"{MAX_SOLUTION_IMAGES}, de-referenced {len(extras)}")
+        print(f"  [SWEEP] q{qn}: de-referenced {len(extras)} over-attributed solution "
+              f"image(s) -- logged to unmatched_images.jsonl")
+
     if flags:
         stats["integrity_flags"] = stats.get("integrity_flags", 0) + len(flags)
     return forced_solution
@@ -1298,12 +1318,55 @@ def probe_batch_pages(pdf_path, window_pages):
             "probe_failed": False}
 
 
-def solution_qns_printed_on_page(pdf_path, true_page, chapter_records):
-    """Deterministic owners for figures printed inside a solution block."""
-    text = pdftotext_page(pdf_path, true_page)
-    found = {int(m.group(1)) for m in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", text, re.I)
-             if int(m.group(1)) in chapter_records}
-    return sorted(found)
+def solution_headers_on_page(pdf_path, file_page, chapter_records):
+    """Locate every printed "Solution to Question N:" header on a page WITH
+    its vertical position. Returns [(q_no, y_baseline)] in reading order
+    (top of page first), where y is the header's baseline in PDF user space
+    (origin at the page BOTTOM-left -- the SAME space image_positions_on_page
+    reports, so no coordinate conversion is needed).
+
+    Implementation: pypdf's text visitor (no extra subprocess) -- words are
+    grouped into lines by baseline and matched against the header pattern;
+    headers whose q_no is not in chapter_records are ignored (foreign chapter
+    references). Returns [] when the text layer is missing/garbled or no
+    header survives the chapter filter.
+
+    Why positions matter: the old owner lookup returned q_nos WITHOUT
+    positions, so a page whose text layer decoded only ONE of seven headers
+    let the caller dump ALL seven figures onto that one solution. With
+    positions, each figure can be matched to the header actually drawn above
+    it -- and when a header cannot be located, the caller claims NOTHING for
+    that figure instead of guessing."""
+    try:
+        page = PdfReader(pdf_path).pages[file_page - 1]
+    except Exception:
+        return []
+    words = []
+
+    def _visitor(text, _cm, tm, _font_dict, _font_size):
+        t = (text or "").strip()
+        if t:
+            # tm[4]=x, tm[5]=baseline y from the PDF bottom-left origin
+            words.append((round(float(tm[5]), 1), round(float(tm[4]), 1), t))
+
+    try:
+        page.extract_text(visitor_text=_visitor)
+    except Exception:
+        return []
+    if not words:
+        return []
+    lines = {}
+    for y, x, t in words:
+        lines.setdefault(y, []).append((x, t))
+    headers, seen = [], set()
+    for y in sorted(lines, reverse=True):   # larger y == higher on the page
+        line = " ".join(t for _, t in sorted(lines[y]))
+        for m in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", line, re.IGNORECASE):
+            qn = int(m.group(1))
+            if qn in chapter_records and qn not in seen:
+                seen.add(qn)
+                headers.append((qn, y))
+    return headers
 
 
 def qns_printed_on_page(pdf_path, true_page, chapter_records):
@@ -1711,6 +1774,13 @@ SECTION_HEADING_RE = re.compile(
 MAX_QUESTION_IMAGES = 3       # >3 question-side figures on ONE question is almost
                               # certainly wrong-owner attribution (PSY-022-003
                               # collected SEVEN via repeated model-confirmed passes).
+MAX_SOLUTION_IMAGES = 2       # a solution block cites at most a figure or two;
+                              # >2 on ONE solution from the deterministic path means
+                              # under-detected headers dumped neighbours' figures onto
+                              # it (user report: a 7-figure solutions page collapsed
+                              # into just 2 solutions -- the old single-owner
+                              # shortcut attached EVERY page image to the one header
+                              # the text layer happened to decode).
 MIN_IMAGE_BYTES = 1500        # <1.5 KB webp is virtually always an empty/broken crop
                               # (PSY-003-014_Q_01 was 414 bytes of nothing and shipped).
 STEM_COHERENCE_MARGIN = 0.15  # stem-conflict resolver: stem<->payload coherence scores
@@ -2609,6 +2679,15 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q):
         print(f"  [WARN] over-attribution guard: {qid} already has {MAX_QUESTION_IMAGES} "
               f"question images -- refusing {rel}; left for model/manual review")
         return None
+    # Same guard on the solution side (user report: a 7-figure solutions page
+    # collapsed into 2 solutions because a single decoded header swallowed
+    # every image under it). A solution block legitimately cites a figure or
+    # two; beyond that the deterministic matcher is stacking neighbours'
+    # figures -- refuse and let the model/manual pass decide on content.
+    if kind == "solution" and len(entry["solution"]) >= MAX_SOLUTION_IMAGES:
+        print(f"  [WARN] over-attribution guard: {qid} already has {MAX_SOLUTION_IMAGES} "
+              f"solution images -- refusing {rel}; left for model/manual review")
+        return None
     letter = "Q" if kind == "question" else "SOL"
     idx = len(entry[kind]) + 1
     new_name = f"{qid}_{letter}_{idx:02d}.webp"
@@ -2689,6 +2768,100 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
             print(f"  [IMG] one-to-one: {rel} -> {qid} ({kind} slot #{i + 1})")
         else:
             leftover.append(rel)
+    return leftover
+
+
+def claim_solution_page_images(imgs, pdf_path, file_page, subject, chapter_no,
+                               chapter_records, image_files_by_q):
+    """Deterministic owner for figures printed inside solution blocks.
+
+    Every image on a solutions page belongs to the block it is DRAWN UNDER:
+    the last "Solution to Question N:" header whose baseline sits above the
+    image's bottom edge. Images and headers are matched by real PDF y
+    positions (same coordinate space), never by count or by a single
+    text-layer hit.
+
+    This replaces the old shortcut that attached EVERY image of a page to the
+    ONE solution header the text layer happened to decode -- the exact bug
+    behind the user report of a 7-figure solutions page collapsing into just
+    2 solutions (the text layer of scanned books decodes headers
+    sporadically, and a single decoded header was treated as "the page's
+    owner").
+
+    Safety rules (each returns the image unclaimed rather than guessing):
+      * no locatable header on the page -> claim NOTHING;
+      * image position unparsable -> claim NOTHING;
+      * image with no header ABOVE it (block started on the previous page,
+        figure-above-header layout) -> claim NOTHING;
+      * MAX_SOLUTION_IMAGES per solution (enforced in _rename_for_slot): the
+        first figures under a header are kept, extras flow to the model/
+        manual pass instead of stacking a whole page on one solution.
+    Returns the files STILL unclaimed."""
+    headers = solution_headers_on_page(pdf_path, file_page, chapter_records)
+    if not headers:
+        # No locatable header -- a question page, or a scanned solutions page
+        # whose text layer cannot be read. Claim NOTHING by position (a
+        # whole-page dump is exactly the bug being fixed); the leftovers flow
+        # to the one-to-one matcher and the model/manual passes, which is the
+        # same safe path the pipeline used before header binding existed.
+        return list(imgs)
+    pos = image_positions_on_page(pdf_path, file_page)
+    if not pos:
+        print(f"  [IMG] page {file_page}: image positions unparsable -- solution "
+              f"figures left for model/manual attribution (no positional auto-claim)")
+        return list(imgs)
+    leftover = []
+    for rel in imgs:
+        try:
+            oid = int(Path(rel).stem.rsplit("-", 1)[-1])
+        except (ValueError, IndexError):
+            leftover.append(rel)
+            continue
+        info = pos.get(oid)
+        if info is None:
+            leftover.append(rel)
+            continue
+        y_img, _didx = info[0], info[1]
+        # The owner is the CLOSEST header drawn above the image, i.e. the
+        # last one in reading order whose baseline still sits above the
+        # image's bottom edge. Iterate headers bottom-first and take the
+        # first hit -- taking the topmost header above the image instead
+        # would hand every figure on the page to the first solution block.
+        owner = next((qn for qn, y_hdr in reversed(headers) if y_hdr > y_img), None)
+        if owner is None:
+            leftover.append(rel)   # no block starts above this figure
+            continue
+        new_rel = _rename_for_slot(rel, owner, "solution", subject, chapter_no,
+                                   image_files_by_q)
+        if new_rel:
+            image_files_by_q.setdefault(owner, {"question": [], "solution": []})["solution"].append(new_rel)
+            qid = f"{subject}-{chapter_no:03d}-{owner:03d}"
+            print(f"  [IMG] page {file_page}: solution-block position -> {rel} -> {qid} (solution)")
+        else:
+            leftover.append(rel)
+    return leftover
+
+
+def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
+                      chapter_records, image_files_by_q):
+    """Two-stage deterministic claimer for one page's images:
+
+      1. solution-header mapping -- every image drawn under a printed
+         "Solution to Question N:" header goes to THAT solution (position
+         evidence; see claim_solution_page_images). This fixes the
+         whole-page-dump: a single decoded header no longer swallows every
+         figure of a multi-solution page.
+      2. leftovers fall to the one-to-one matcher (exactly one printed q_no +
+         exactly one needy slot, else nothing is claimed).
+
+    Returns the files STILL unclaimed (they reach the second pass / model
+    attribution / manual review)."""
+    leftover = claim_solution_page_images(imgs, pdf_path, file_page, subject,
+                                          chapter_no, chapter_records, image_files_by_q)
+    if leftover:
+        leftover = claim_page_images_one_to_one(leftover, pdf_path, file_page,
+                                                subject, chapter_no, chapter_records,
+                                                image_files_by_q)
     return leftover
 
 
@@ -2941,24 +3114,16 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 if not imgs:
                     continue
                 # A figure between "Solution to Question N" and the next
-                # header belongs to that solution, not to whichever question
-                # happens to be pending in reading order. This fixes figures
-                # like Alice-in-Wonderland on q6 being shown under q2.
-                sol_owners = solution_qns_printed_on_page(pdf_path, file_page_num, chapter_records)
-                if len(sol_owners) == 1:
-                    qn = sol_owners[0]
-                    entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
-                    leftover = []
-                    for rel in imgs:
-                        renamed = _rename_for_slot(rel, qn, "solution", subject, ch["chapter_no"], image_files_by_q)
-                        if renamed:
-                            entry["solution"].append(renamed)
-                        else:
-                            leftover.append(rel)
-                    print(f"  [IMG] page {file_page_num}: solution-header ownership -> q{qn}")
-                else:
-                    leftover = claim_page_images_one_to_one(imgs, pdf_path, file_page_num, subject,
-                                                            ch["chapter_no"], chapter_records, image_files_by_q)
+                # header belongs to THAT solution, not to whichever question
+                # happens to be pending in reading order. Match by POSITION
+                # (each image goes to the header drawn above it), never by a
+                # single text-layer hit: when the text layer decodes only ONE
+                # of several headers, the old shortcut dumped every figure of
+                # the page onto that one solution (user report: 7 figures
+                # collapsed into 2 solutions). Images with no locatable header
+                # above them are left for the later passes.
+                leftover = claim_page_images(imgs, pdf_path, file_page_num, subject,
+                                             ch["chapter_no"], chapter_records, image_files_by_q)
                 if leftover:
                     unmatched_images.append({"page": file_page_num, "files": leftover})
                     print(f"  [INFO] Page {file_page_num}: image(s) {leftover} unclaimed for now "
@@ -2978,9 +3143,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         # records are complete now -- retry every leftover once.
         n_unmatched = 0
         for um in unmatched_images:
-            leftover2 = claim_page_images_one_to_one(um["files"], pdf_path, um["page"],
-                                                     subject, ch["chapter_no"],
-                                                     chapter_records, image_files_by_q)
+            # Full two-stage claimer again: chapter records are now complete,
+            # so a solution header whose q_no was missing at first-pass time
+            # becomes usable for position mapping; leftovers still fall to the
+            # one-to-one matcher.
+            leftover2 = claim_page_images(um["files"], pdf_path, um["page"],
+                                          subject, ch["chapter_no"],
+                                          chapter_records, image_files_by_q)
             um["files"] = leftover2
             if not leftover2:
                 print(f"  [INFO] second pass: page {um['page']} image(s) matched to a question")
@@ -3317,9 +3486,9 @@ def recover_pages(plan_path):
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id,
                                            subject, ASSETS_DIR / "questions")
                 if imgs:
-                    rec_leftover = claim_page_images_one_to_one(imgs, pdf_path, file_page_num,
-                                                                subject, chapter_no,
-                                                                records, image_files_by_q)
+                    rec_leftover = claim_page_images(imgs, pdf_path, file_page_num,
+                                                     subject, chapter_no,
+                                                     records, image_files_by_q)
                     if rec_leftover:
                         unmatched_images.append({"page": file_page_num, "files": rec_leftover})
 
@@ -3356,9 +3525,9 @@ def recover_pages(plan_path):
         targeted_retry(model, page_files, records, state,
                        force_solution_qns=forced, chapter_id=chapter_id)
         for um in unmatched_images:
-            rec_leftover = claim_page_images_one_to_one(um["files"], pdf_path, um["page"],
-                                                        subject, chapter_no,
-                                                        records, image_files_by_q)
+            rec_leftover = claim_page_images(um["files"], pdf_path, um["page"],
+                                             subject, chapter_no,
+                                             records, image_files_by_q)
             if rec_leftover:
                 _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
                               {"subject": subject, "chapter_id": chapter_id,
