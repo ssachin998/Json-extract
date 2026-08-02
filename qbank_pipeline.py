@@ -2619,11 +2619,30 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
     With 0 or 1 needy slot, degenerates to the old greedy behavior (all
     page images go to that one slot) -- which is correct for a page whose
     images all belong to a single question."""
+    # Never distribute page images across chapter-wide "pending" slots by
+    # reading order alone. That heuristic silently mapped diagrams to the
+    # wrong questions whenever a page had several nearby questions. Auto-claim
+    # only with deterministic page evidence: exactly one printed q_no on this
+    # page and exactly one matching needy slot. Everything else is retained
+    # for the later explicit attribution/manual-review path.
     slots = pending_image_slots(chapter_records, image_files_by_q)
     if not slots:
         return list(imgs)
-    if len(slots) == 1 or len(imgs) == 1:
-        qn, kind = slots[0]
+    try:
+        printed = qns_printed_on_page(pdf_path, file_page, chapter_records)
+    except Exception:
+        printed = []
+    if len(printed) != 1:
+        print(f"  [IMG] page {file_page}: ambiguous printed owners {printed or '-'}; "
+              "not auto-attaching image(s)")
+        return list(imgs)
+    candidates = [(qn, kind) for qn, kind in slots if qn == printed[0]]
+    if len(candidates) != 1:
+        print(f"  [IMG] page {file_page}: q{printed[0]} has {len(candidates)} eligible image slots; "
+              "not auto-attaching image(s)")
+        return list(imgs)
+    if len(candidates) == 1:
+        qn, kind = candidates[0]
         entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
         leftover = []
         for rel in imgs:
