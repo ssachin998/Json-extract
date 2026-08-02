@@ -1298,6 +1298,14 @@ def probe_batch_pages(pdf_path, window_pages):
             "probe_failed": False}
 
 
+def solution_qns_printed_on_page(pdf_path, true_page, chapter_records):
+    """Deterministic owners for figures printed inside a solution block."""
+    text = pdftotext_page(pdf_path, true_page)
+    found = {int(m.group(1)) for m in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", text, re.I)
+             if int(m.group(1)) in chapter_records}
+    return sorted(found)
+
+
 def qns_printed_on_page(pdf_path, true_page, chapter_records):
     """Which of this chapter's q_nos are printed on this page, read from the
     text layer (0 tokens). Conservative: a hit counts only if the number
@@ -2932,8 +2940,25 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
                 if not imgs:
                     continue
-                leftover = claim_page_images_one_to_one(imgs, pdf_path, file_page_num, subject,
-                                                        ch["chapter_no"], chapter_records, image_files_by_q)
+                # A figure between "Solution to Question N" and the next
+                # header belongs to that solution, not to whichever question
+                # happens to be pending in reading order. This fixes figures
+                # like Alice-in-Wonderland on q6 being shown under q2.
+                sol_owners = solution_qns_printed_on_page(pdf_path, file_page_num, chapter_records)
+                if len(sol_owners) == 1:
+                    qn = sol_owners[0]
+                    entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+                    leftover = []
+                    for rel in imgs:
+                        renamed = _rename_for_slot(rel, qn, "solution", subject, ch["chapter_no"], image_files_by_q)
+                        if renamed:
+                            entry["solution"].append(renamed)
+                        else:
+                            leftover.append(rel)
+                    print(f"  [IMG] page {file_page_num}: solution-header ownership -> q{qn}")
+                else:
+                    leftover = claim_page_images_one_to_one(imgs, pdf_path, file_page_num, subject,
+                                                            ch["chapter_no"], chapter_records, image_files_by_q)
                 if leftover:
                     unmatched_images.append({"page": file_page_num, "files": leftover})
                     print(f"  [INFO] Page {file_page_num}: image(s) {leftover} unclaimed for now "
