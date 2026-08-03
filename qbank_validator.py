@@ -71,6 +71,54 @@ OPTION_LINE_START_RE = re.compile(r"^\s*Option\s+([A-D])\b\s*[:.)]\s*", re.IGNOR
 OPTION_LINE_ANY_RE = re.compile(r"Option\s+([A-D])\b\s*[:.)]", re.IGNORECASE)
 SOLUTION_TO_Q_RE = re.compile(r"Solution\s+to\s+Question\s+(\d{1,3})", re.IGNORECASE)
 
+# ---- run-7 cross-field contamination mirrors -------------------------------
+# A non-empty question_text is NOT automatically a valid stem: if it opens
+# with explanation language, or its tokens are substantially contained in the
+# row's own solution, it is solution prose that contaminated the stem field.
+CONTAMINATION_TOKEN_SHARE = 0.8
+EXPLANATION_START_RE = re.compile(
+    r"^\s*(?:option\s+[a-d]\s*[:.)\-]|ans(?:wer)?\s*[:.)\-]|the\s+correct\s+(?:answer|option)\b|"
+    r"(?:hence|thus|therefore|so)\s*,\s*(?:the\s+)?(?:correct\s+)?option\b|"
+    r"correct\s+answer\s+is\b|the\s+(?:correct\s+)?answer\s+is\b|"
+    r"solution\s*[:.)\-]|explanation\s*[:.)\-]|answer\s*[:.)\-]|"
+    r"solution\s+to\s+question\s+\d+|explanation\s+of\s+question\s+\d+)",
+    re.IGNORECASE)
+_OCR_NOISE_LINE_RES = [
+    re.compile(r"^\s*[-–—.·]?\s*\d{1,4}\s*[-–—.·]?\s*$"),          # 12 / -12- / 12.
+    re.compile(r"^\s*page\s*\d{1,4}\s*(of\s*\d{1,4})?\s*$", re.I),  # Page 12 of 300
+    re.compile(r"^\s*(https?://|www\.)\S+\s*$", re.I),              # urls
+    re.compile(r"^\s*(©|\(c\)|copyright).*$", re.I),                # copyright
+]
+
+
+def _stem_contamination_reason(qtext, stext):
+    """Cross-field contamination proof for a final row's question_text.
+    Returns a reason string, or None when the text plausibly IS a stem."""
+    t = (qtext or "").strip()
+    if not t:
+        return None
+    if EXPLANATION_START_RE.match(t):
+        return "opens with explanation-style language"
+    s = (stext or "").strip()
+    if s and len(t) >= 60 and token_overlap(t, s) >= CONTAMINATION_TOKEN_SHARE:
+        return (f"{token_overlap(t, s):.0%} of its tokens appear in the "
+                f"row's own solution (>= {CONTAMINATION_TOKEN_SHARE:.0%})")
+    return None
+
+
+def _ocr_noise_lines(stext):
+    """Lines of a solution that are page-level OCR noise (page numbers,
+    footers, watermarks) -- run-7 hardening #5/#6. Returns the offending
+    lines (conservative: whole-line matches only, prose never touched)."""
+    bad = []
+    for ln in (stext or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if any(r.match(s) for r in _OCR_NOISE_LINE_RES):
+            bad.append(s[:60])
+    return bad[:5]
+
 
 def _payload_coherence(stem, row):
     """Share of stem tokens present in the row's own options+solution (which
@@ -175,6 +223,23 @@ def check_row(row, assets_questions):
                           f"{row.get('id')}: correct option {correct} not among option ids {sorted(opt_ids)}", qn))
     sol_text = (sol.get("text") or "")
     sol_strip = sol_text.strip()
+    # ---- run-7 cross-field contamination checks ---------------------------
+    # "Field is populated" is NOT treated as "field is valid": a question_text
+    # that is really solution prose, or a solution carrying page-level OCR
+    # noise, is flagged for retry/manual review instead of passing silently.
+    if (qtext or "").strip():
+        qcontam = _stem_contamination_reason(qtext, sol_text)
+        if qcontam:
+            flags.append(flag(cid, "contaminated_question",
+                              f"{row.get('id')}: question_text is not a stem "
+                              f"({qcontam}) -- cross-field contamination "
+                              f"suspect, needs retry/review", qn, HIGH))
+    if sol_strip:
+        noise = _ocr_noise_lines(sol_text)
+        if noise:
+            flags.append(flag(cid, "ocr_noise_solution",
+                              f"{row.get('id')}: solution contains page-level "
+                              f"OCR noise line(s): {noise}", qn))
     if not sol_strip:
         flags.append(flag(cid, "missing_solution", f"{row.get('id')}: empty solution text", qn))
     else:

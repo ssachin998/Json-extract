@@ -488,6 +488,204 @@ class FigureMapTests(unittest.TestCase):
         self.assertNotIn("PSY/PSY-p1-7.webp", remaining[1])
 
 
+class CrossFieldContaminationTests(unittest.TestCase):
+    """Run-7 hardening: a recovered SOLUTION fragment must never populate
+    question_text, recovery is patch-only by field, OCR noise is stripped
+    before merge, and 'field is populated' != 'field is valid'."""
+
+    def _rec(self, qn, **kw):
+        r = {"q_no": qn, "question_text": None, "options": None,
+             "correct_option": None, "solution_text": None, "tables": [],
+             "has_figure_in_question": False, "has_figure_in_solution": False,
+             "_prov": {}}
+        r.update(kw)
+        return r
+
+    # -- 1. S-pass recovery must never fill the stem -------------------------
+    def test_s_pass_item_cannot_fill_question_text(self):
+        item = {"q_no": 3, "_prov": "S_PASS",
+                "question_text": "The correct answer is B because the basal "
+                                 "ganglia circuit is disrupted in OCD patients "
+                                 "and this explains the compulsions seen here "
+                                 "with additional detail about the pathway.",
+                "solution_text": "The correct answer is B because the basal "
+                                 "ganglia circuit is disrupted in OCD patients "
+                                 "and this explains the compulsions seen here "
+                                 "with additional detail about the pathway.",
+                "options": None, "correct_option": "B", "tables": []}
+        recs, _ = qp.merge_question_records({}, [item], stats := {"chapter_id": "PSY-016"})
+        self.assertIsNone(recs[3]["question_text"])   # stem NEVER populated
+        self.assertEqual(recs[3]["solution_text"], item["solution_text"])
+
+    def test_ocr_s_item_cannot_fill_question_text(self):
+        item = {"q_no": 7, "_prov": "OCR_S",
+                "question_text": "Ans. is C. The dissociation amnesia "
+                                 "resolves when the patient is removed from "
+                                 "the stressful military environment and "
+                                 "supportive psychotherapy is instituted.",
+                "solution_text": "Ans. is C. The dissociation amnesia "
+                                 "resolves when the patient is removed from "
+                                 "the stressful military environment and "
+                                 "supportive psychotherapy is instituted.",
+                "options": None, "correct_option": "C", "tables": []}
+        recs, _ = qp.merge_question_records({}, [item], {"chapter_id": "PSY-017"})
+        self.assertIsNone(recs[7]["question_text"])
+
+    # -- 2. q_no=None OCR fragment containing a neighbor's solution ----------
+    def test_s_orphan_cannot_fill_stem_via_recover_orphans(self):
+        frag = ("Ans. is A. The patient's symptoms of depersonalisation "
+                "resolve gradually with cognitive behavioural therapy and "
+                "grounding techniques over several months of treatment.")
+        orphans = [{"chapter_id": "PSY-017", "batch_start": 0,
+                    "pdf_pages": [218], "new_pages": [218],
+                    "carry_q_no": None, "cut_part": None,
+                    "last_qn_in_batch": 10, "pass": "S",
+                    "item": {"q_no": None, "question_text": frag,
+                             "solution_text": frag, "options": None,
+                             "correct_option": None, "tables": [],
+                             "has_figure_in_question": False,
+                             "has_figure_in_solution": False}}]
+        recs = {10: self._rec(10, question_text="Real stem ten",
+                              solution_text="partial solution ten")}
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "contaminated_stems_blocked": 0,
+                 "chapter_id": "PSY-017"}
+        qp.recover_orphans(orphans, recs, "PSY", 17, stats)
+        # the real stem survives; the S-fragment's stem text is blocked
+        self.assertEqual(recs[10]["question_text"], "Real stem ten")
+        self.assertIn("partial solution ten", recs[10]["solution_text"])
+        self.assertGreaterEqual(stats["contaminated_stems_blocked"], 0)
+
+    # -- 3. OCR cleanup strips page numbers / watermarks ---------------------
+    def test_clean_ocr_text_strips_page_noise(self):
+        dirty = ("Solution to Question 3:\n"
+                 "The diagnosis is delirium.\n"
+                 "12\n"
+                 "- 45 -\n"
+                 "Page 12 of 300\n"
+                 "www.example-qbank.com\n"
+                 "© 2026 Example Publishers\n")
+        clean = qp._clean_ocr_text(dirty)
+        self.assertIn("The diagnosis is delirium.", clean)
+        self.assertNotIn("\n12\n", "\n" + clean + "\n")
+        self.assertNotIn("- 45 -", clean)
+        self.assertNotIn("Page 12 of 300", clean)
+        self.assertNotIn("www.example", clean)
+        self.assertNotIn("©", clean)
+        self.assertIn("Solution to Question 3:", clean)  # header preserved
+
+    def test_clean_ocr_text_preserves_prose(self):
+        text = ("The key feature is that the mood episode is not better "
+                "explained by substance use.\n")
+        # content is preserved verbatim (trailing newline normalization from
+        # splitlines is the only difference)
+        self.assertEqual(qp._clean_ocr_text(text).strip(), text.strip())
+
+    # -- 4. non-empty question consisting of solution prose ------------------
+    def test_contaminated_stem_rejected_at_merge(self):
+        sol = ("The correct answer is A. In Korsakoff syndrome the amnesia "
+               "is characterised by anterograde and retrograde memory loss "
+               "with confabulation, and the pathology lies in the mammillary "
+               "bodies and the dorsomedial nucleus of the thalamus with "
+               "severe vitamin B1 deficiency being the underlying cause.")
+        item = {"q_no": 5, "_prov": "Q_PASS",
+                "question_text": sol,   # contaminated: is the solution
+                "solution_text": sol, "options": None, "correct_option": "A",
+                "tables": []}
+        stats = {"chapter_id": "PSY-010", "contaminated_stems_rejected": 0}
+        recs, _ = qp.merge_question_records({}, [item], stats)
+        self.assertIsNone(recs[5]["question_text"])   # rejected, not shipped
+        self.assertEqual(recs[5]["solution_text"], sol)
+        self.assertEqual(stats["contaminated_stems_rejected"], 1)
+
+    def test_find_incomplete_treats_contaminated_stem_as_missing(self):
+        sol = ("The correct answer is B. Body dysmorphic disorder involves "
+               "a preoccupation with an imagined defect in appearance that "
+               "causes clinically significant distress and impaired "
+               "functioning with repetitive checking behaviours.")
+        recs = {9: self._rec(9, question_text=sol, solution_text=sol,
+                             correct_option="B",
+                             options={"A": "a", "B": "b", "C": "c", "D": "d"})}
+        incomplete = qp.find_incomplete_records(recs)
+        self.assertTrue(any(qn == 9 and "question" in missing
+                            for qn, missing in incomplete))
+
+    # -- 5. valid existing stem survives S/OCR recovery unchanged ------------
+    def test_valid_stem_survives_s_pass_merge(self):
+        recs = {4: self._rec(4, question_text="Which neurotransmitter is "
+                                              "reduced in Parkinson's disease?",
+                             solution_text="Dopamine is reduced.")}
+        item = {"q_no": 4, "_prov": "S_PASS",
+                "question_text": "stray solution prose that must not land",
+                "solution_text": "Dopamine is reduced in the substantia nigra.",
+                "options": None, "correct_option": "A", "tables": []}
+        qp.merge_question_records(recs, [item], {"chapter_id": "PSY-027"})
+        self.assertEqual(recs[4]["question_text"],
+                         "Which neurotransmitter is reduced in Parkinson's disease?")
+
+    # -- 6. drain scope: an A-drain cannot patch solutions -------------------
+    def test_recovery_scope_limits_fields(self):
+        item = {"q_no": 2, "question_text": "stem?", "options": {"A": "a"},
+                "correct_option": "C", "solution_text": "sol", "tables": []}
+        out = qp._apply_recovery_scope(dict(item), qp._RECOVERY_SCOPE["S"], "OCR_S")
+        self.assertIsNone(out["question_text"])
+        self.assertIsNone(out["options"])
+        self.assertEqual(out["solution_text"], "sol")
+        self.assertEqual(out["_prov"], "OCR_S")
+        out2 = qp._apply_recovery_scope(dict(item), qp._RECOVERY_SCOPE["A"], "DRAIN_A")
+        self.assertEqual(out2["correct_option"], "C")
+        self.assertIsNone(out2["solution_text"])
+
+
+class ValidatorContaminationTests(unittest.TestCase):
+    """qbank_validator must flag cross-field contamination and OCR noise in
+    the FINAL rows (run-7 hardening #3/#6)."""
+
+    def _row(self, qtext, stext):
+        return {"id": "PSY-001-001", "chapter_id": "PSY-001",
+                "question": {"text": qtext, "images": []},
+                "options": [{"id": "A", "text": "a", "images": []},
+                            {"id": "B", "text": "b", "images": []},
+                            {"id": "C", "text": "c", "images": []},
+                            {"id": "D", "text": "d", "images": []}],
+                "correct_options": ["B"],
+                "solution": {"text": stext, "images": [], "tables": []}}
+
+    def test_contaminated_question_flagged(self):
+        import qbank_validator as qv
+        sol = ("The correct answer is C. The patient has schizophrenia "
+               "with predominantly negative symptoms which respond poorly "
+               "to typical antipsychotics and require clozapine trial.")
+        flags = qv.check_row(self._row(sol, sol), Path("/nonexistent"))
+        kinds = {f["kind"] for f in flags}
+        self.assertIn("contaminated_question", kinds)
+
+    def test_explanation_opening_flagged(self):
+        import qbank_validator as qv
+        flags = qv.check_row(self._row("Option B: explanation text here",
+                                       "real solution"), Path("/nonexistent"))
+        kinds = {f["kind"] for f in flags}
+        self.assertIn("contaminated_question", kinds)
+
+    def test_ocr_noise_solution_flagged(self):
+        import qbank_validator as qv
+        flags = qv.check_row(self._row("Real stem question text here?",
+                                       "The answer is A.\nPage 12 of 300\n"
+                                       "www.qbank.example\nend"),
+                             Path("/nonexistent"))
+        kinds = {f["kind"] for f in flags}
+        self.assertIn("ocr_noise_solution", kinds)
+
+    def test_clean_row_not_flagged(self):
+        import qbank_validator as qv
+        flags = qv.check_row(self._row("Which drug is first line in ADHD?",
+                                       "Methylphenidate is first line."),
+                             Path("/nonexistent"))
+        kinds = {f["kind"] for f in flags}
+        self.assertNotIn("contaminated_question", kinds)
+        self.assertNotIn("ocr_noise_solution", kinds)
+
+
 class GeminiJsonParserTests(unittest.TestCase):
     def test_parses_one_array(self):
         self.assertEqual(parse_gemini_json_array('[{"q_no": 1}]'), [{"q_no": 1}])

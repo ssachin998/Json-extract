@@ -430,6 +430,51 @@ left over). Two root causes + the section-aware batching they asked for:
 
 ---
 
+### 4.21 Changelog — 2026-08-02 (cross-field contamination hardening, run-7 audit)
+
+Audit finding: on OCR/recovery pages, a recovered SOLUTION fragment could be
+written into `question_text`, and OCR garbage (page numbers, watermarks,
+footers) could enter `solution_text` -- the record still passed because
+"field is populated" was treated as "field is valid". All 7 hardening points
+implemented:
+
+1. **Question-field protection** — `merge_question_records` is now
+   provenance-aware: an item tagged `S_*`/`A_*` (solution/answer pass,
+   retry, or OCR recovery) has its `question_text`/`options` DROPPED before
+   anything merges. A solution recovery can never populate a stem.
+2. **Patch-only recovery by field** — `_RECOVERY_SCOPE` per pass
+   (Q→question/options, A→answer, S→solution/tables [+ the "Ans: B" line
+   printed inside the solution block]). `drain_failed_pages` applies the
+   scope of the pass that FAILED (persisted on the failed-page entry) to
+   every drained/OCR item before merge; `targeted_retry` already patched
+   only requested fields and now records provenance per patch.
+3. **Cross-field contamination validator** — `qbank_validator.check_row`
+   flags `contaminated_question` (HIGH): question_text that opens with
+   explanation language or has ≥80% of its tokens inside the row's own
+   solution is not a stem.
+4. **Provenance tracking** — every record keeps `_prov` = {field: source}
+   (`Q_PASS`, `S_PASS`, `A_PASS`, `Q_RETRY`/`A_RETRY`/`S_RETRY`,
+   `OCR_S`/`OCR_Q`, `DRAIN_*`, `ORPHAN_*`, `RESCUE`, `RECOVER`). An
+   `OCR_S`/`S_*` fragment is structurally unable to populate a stem (see
+   #1); the sweep and `find_incomplete_records` use the recorded source when
+   they strip/retry.
+5. **OCR cleanup** — `_clean_ocr_text` (inside `ocr_fallback_text`, one
+   choke point) strips whole-line page numbers, "Page N of M", urls,
+   copyright lines and short repeated headers BEFORE anything merges;
+   medical prose is preserved verbatim.
+6. **Semantic completeness** — `find_incomplete_records` treats a
+   contaminated stem as missing (`question`+`answer`+`options` re-ask), and
+   the integrity sweep (step 5) strips contaminated stems so the retry
+   refills them from the pages; the validator flags a non-empty solution
+   carrying OCR noise (`ocr_noise_solution`).
+7. **Regression tests** — `CrossFieldContaminationTests` (S/OCR-S can't fill
+   stems, S-orphan blocked via recover_orphans, OCR cleanup, contaminated
+   stem rejected at merge + treated missing, valid stem survives S-pass) and
+   `ValidatorContaminationTests` (contaminated_question, explanation-opening,
+   ocr_noise_solution, clean row). 53 tests total.
+
+---
+
 ## 11. What feedback is wanted from the reviewer
 
 - Correctness bugs / race conditions / data-loss paths in `qbank_pipeline.py` (merge, resume, quota exits).

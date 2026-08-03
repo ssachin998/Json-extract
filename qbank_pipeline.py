@@ -761,9 +761,134 @@ def normalize_ocr_fallback_item(raw_item):
     }
 
 
+# ---------------------------------------------------------------------------
+# Cross-field contamination hardening (run-7 audit): OCR text can carry page
+# numbers / watermarks / footers, and a recovered SOLUTION fragment can
+# contaminate question_text. Every recovery path below is field-scoped and
+# provenance-tagged so a solution recovery can never populate a stem.
+# ---------------------------------------------------------------------------
+CONTAMINATION_TOKEN_SHARE = 0.8   # >=80% of a stem's tokens in its own
+                                  # solution = the "stem" is really solution
+                                  # prose (cross-field contamination class)
+
+_OCR_NOISE_LINE_RES = [
+    re.compile(r"^\s*[-–—.·]?\s*\d{1,4}\s*[-–—.·]?\s*$"),          # 12 / -12- / 12.
+    re.compile(r"^\s*page\s*\d{1,4}\s*(of\s*\d{1,4})?\s*$", re.I),  # Page 12 of 300
+    re.compile(r"^\s*(https?://|www\.)\S+\s*$", re.I),              # urls
+    re.compile(r"^\s*(©|\(c\)|copyright).*$", re.I),                # copyright
+    re.compile(r"^\s*(\[?\s*no\.?\s*\]?\s*)?\d{1,4}\s*$", re.I),    # bare "12"
+]
+
+# Explanation-style OPENERS that can never start a real question stem
+# (mirrors/extends SOLUTION_STYLE_STEM_RE -- kept here for the contamination
+# validator so the two modules stay independent).
+_EXPLANATION_START_RE = re.compile(
+    r"^\s*(?:option\s+[a-d]\s*[:.)\-]|ans(?:wer)?\s*[:.)\-]|the\s+correct\s+(?:answer|option)\b|"
+    r"(?:hence|thus|therefore|so)\s*,\s*(?:the\s+)?(?:correct\s+)?option\b|"
+    r"correct\s+answer\s+is\b|the\s+(?:correct\s+)?answer\s+is\b|"
+    r"solution\s*[:.)\-]|explanation\s*[:.)\-]|answer\s*[:.)\-]|"
+    r"solution\s+to\s+question\s+\d+|explanation\s+of\s+question\s+\d+)",
+    re.IGNORECASE)
+
+
+def _clean_ocr_text(text):
+    """Strip page-level noise from OCR text BEFORE it is merged or spliced
+    (run-7 hardening #5). Conservative: removes whole lines only, never
+    rewrites prose. Detected:
+      * standalone page numbers ("12", "- 12 -", "12.")
+      * "Page 12 of 300" footers
+      * urls, copyright lines, ISBNs
+      * a short line repeated >=3 times in the block (running header/footer)
+    Medical wording is preserved verbatim."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    counts = {}
+    for ln in lines:
+        s = ln.strip()
+        if s and len(s) <= 40:
+            counts[s] = counts.get(s, 0) + 1
+    out = []
+    n_stripped = 0
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            out.append(ln)
+            continue
+        if any(r.match(s) for r in _OCR_NOISE_LINE_RES):
+            n_stripped += 1
+            continue
+        if counts.get(s, 0) >= 3 and len(s) <= 40:
+            # repeated short line (running header/footer) -- but never strip
+            # a "Solution to Question N:" header the recovery relies on
+            if not re.match(r"Solution\s+to\s+Question\s+\d", s, re.I):
+                n_stripped += 1
+                continue
+        out.append(ln)
+    if n_stripped:
+        print(f"  [OCR_CLEAN] stripped {n_stripped} page-noise line(s) "
+              f"(page numbers / footers / watermarks)")
+    return "\n".join(out)
+
+
+def _stem_reject_reason(qtext, rec=None):
+    """Cross-field contamination proof for a would-be question stem
+    (run-7 hardening #3/#6). Returns a short reason string, or None when the
+    text plausibly IS a stem. A stem is rejected when it:
+      1. opens with explanation-style language ("Option A:", "Ans. is B",
+         "The correct answer is", "Solution to Question N:" ...);
+      2. is substantially contained in the record's OWN solution text
+         (>=CONTAMINATION_TOKEN_SHARE of its tokens appear there) -- a real
+         stem shares clinical vocabulary but never ~80% of its tokens with
+         its own explanation.
+    Conservative by design: short/ambiguous text is never rejected here (the
+    validator + find_incomplete treat 'missing' as retry-eligible, so a false
+    rejection only costs a re-ask, while a false ACCEPT ships corruption)."""
+    t = (qtext or "").strip()
+    if not t:
+        return None
+    if _EXPLANATION_START_RE.match(t):
+        return "opens with explanation-style language"
+    if rec and len(t) >= 60:
+        sol = (rec.get("solution_text") or "").strip()
+        if sol and _frag_mostly_present(t, sol, CONTAMINATION_TOKEN_SHARE):
+            return "stem text substantially contained in this record's own solution"
+    return None
+
+
+# field scopes per recovery pass (run-7 hardening #2: patch-only recovery).
+# A recovery response may ONLY modify the fields its pass was invoked to
+# recover -- everything else is dropped at the merge boundary.
+_RECOVERY_SCOPE = {
+    "Q": {"question_text", "options"},
+    "A": {"correct_option"},
+    # S includes correct_option pragmatically: the printed "Ans: B" line sits
+    # INSIDE the solution block and no other pass may ever see this page
+    # (recitation-blocked); question_text/options are NEVER touched.
+    "S": {"solution_text", "tables", "correct_option"},
+}
+
+
+def _apply_recovery_scope(item, scope, prov):
+    """Null every field of a recovered item that its recovery pass is NOT
+    allowed to produce (run-7 hardening #2), and tag the item with its
+    provenance. scope: None = unrestricted (normal batches)."""
+    if scope is not None:
+        for f in list(item.keys()):
+            if f not in scope and f not in ("q_no", "_prov",
+                                            "has_figure_in_question",
+                                            "has_figure_in_solution"):
+                item[f] = None
+    item["_prov"] = prov
+    return item
+
+
 def ocr_fallback_text(image_path):
-    """Non-generative final fallback for recitation-blocked page imagery."""
-    return pytesseract.image_to_string(Image.open(image_path))
+    """Non-generative final fallback for recitation-blocked page imagery.
+    Output is cleaned of page-level noise (page numbers, watermarks,
+    footers) before anything merges it (run-7 hardening #5)."""
+    raw = pytesseract.image_to_string(Image.open(image_path))
+    return _clean_ocr_text(raw)
 
 
 def call_gemini_text_only(model, prompt):
@@ -855,8 +980,12 @@ def retry_batch_page_by_page(model, batch, state, ctx=None, prompt=None):
             entry = {"page_file": pf.name, "true_page": int(pf.stem.split("-")[-1]),
                      "reason": t2[:200], "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
             if ctx:
+                # persist WHICH pass failed (run-7 hardening #2): the drain
+                # must recover only the fields that pass was supposed to
+                # produce (Q->question/options, A->answer, S->solution).
                 entry.update({"subject": ctx.get("subject"), "chapter_no": ctx.get("chapter_no"),
-                              "chapter_id": ctx.get("chapter_id")})
+                              "chapter_id": ctx.get("chapter_id"),
+                              "pass": ctx.get("pass")})
             failed = state.setdefault("failed_pages", [])
             # Q and S passes can fail on the same recitation-blocked page.
             # Drain it once; duplicate entries caused duplicate OCR splices.
@@ -1059,6 +1188,31 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
         print(f"  [SWEEP] q{qn}: de-referenced {len(extras)} over-attributed solution "
               f"image(s) -- logged to unmatched_images.jsonl")
 
+    # 5. contaminated stems (run-7 cross-field contamination class): a
+    #    question_text that OPENS with explanation language or is
+    #    substantially contained in its own solution is solution prose, not a
+    #    stem (the audit's pattern: "question_text contains a paragraph from
+    #    that question's or a neighbor's solution"). Strip it so the targeted
+    #    retry REFILLS the stem from the pages (Gap-1 anchor: the solution
+    #    names its question) instead of shipping a populated-but-wrong field.
+    #    "Field is populated" is NOT treated as "field is valid".
+    for qn in qns:
+        rec = chapter_records[qn]
+        qt = (rec.get("question_text") or "").strip()
+        if not qt:
+            continue
+        reason = _stem_reject_reason(qt, rec)
+        if not reason:
+            continue
+        chapter_records[qn]["question_text"] = None
+        stats["contaminated_stems_stripped"] = stats.get("contaminated_stems_stripped", 0) + 1
+        iflag("contaminated_stem_stripped", qn,
+              f"question_text was solution prose ({reason}; prov="
+              f"{rec.get('_prov', {}).get('question_text')}) -- stripped, "
+              f"retry refills the real stem")
+        print(f"  [SWEEP] q{qn}: stripped contaminated stem ({reason}) -- "
+              f"targeted retry will refill it")
+
     if flags:
         stats["integrity_flags"] = stats.get("integrity_flags", 0) + len(flags)
     return forced_solution
@@ -1091,7 +1245,23 @@ def find_incomplete_records(chapter_records, force_solution_qns=(), printed_solu
     """
     incomplete = []
     for qn, rec in chapter_records.items():
-        if not (rec.get("question_text") or "").strip():
+        # SEMANTIC COMPLETENESS (run-7 hardening #6): a non-empty
+        # question_text that is really solution prose is NOT a valid stem --
+        # treat it as missing so the retry replaces it instead of the record
+        # shipping a populated-but-wrong field. The sweep strips these before
+        # retry; this check is the net for records the sweep never saw.
+        qt = (rec.get("question_text") or "").strip()
+        if qt and _stem_reject_reason(qt, rec):
+            missing = ["question"]
+            if not rec.get("correct_option"):
+                missing.append("answer")
+            options = rec.get("options") or {}
+            if len(options) < 4 or any(not str(v or "").strip() for v in options.values()):
+                missing.append("options")
+            if (rec.get("solution_text") or "").strip() or rec.get("correct_option") or options:
+                incomplete.append((qn, missing))
+            continue
+        if not qt:
             # Stem-less records USED to be skipped here ("nothing to anchor a
             # retry to") -- wrong: a present solution_text/correct_option IS
             # the anchor. The stem and its own solution never share lexical
@@ -1248,11 +1418,30 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
             requested = requested_by_qn.get(qn, set())
             if rec is None or not requested:
                 continue
+            # PATCH-ONLY + PROVENANCE (run-7 hardening #2/#4): a retry
+            # response may only touch the fields that were requested, and
+            # every patched field records its provenance (Q_RETRY / A_RETRY /
+            # S_RETRY). A Q-retry's returned stem is additionally checked
+            # for solution-prose contamination before it is accepted.
+            req_prov = ("Q_RETRY" if "question" in requested
+                        else ("A_RETRY" if "answer" in requested else "S_RETRY"))
             if "question" in requested and fix.get("question_text") and not (rec.get("question_text") or "").strip():
-                rec["question_text"] = str(fix["question_text"]).strip()
-                fixed_this_round += 1
+                incoming_q = str(fix["question_text"]).strip()
+                stem_reason = _stem_reject_reason(incoming_q, rec)
+                if stem_reason:
+                    stats.setdefault("contaminated_stems_blocked", 0)
+                    stats["contaminated_stems_blocked"] += 1
+                    print(f"  [RETRY] blocked contaminated stem for q{qn} "
+                          f"({stem_reason}) -- kept for review, still stem-missing")
+                    _log_blocked_retry_fragment(chapter_id, qn, f"contaminated stem: {stem_reason}",
+                                                incoming_q)
+                else:
+                    rec["question_text"] = incoming_q
+                    rec["_prov"]["question_text"] = req_prov
+                    fixed_this_round += 1
             if "answer" in requested and fix.get("correct_option") and not rec.get("correct_option"):
                 rec["correct_option"] = str(fix["correct_option"]).strip().upper()
+                rec["_prov"]["correct_option"] = req_prov
                 fixed_this_round += 1
             sol_existing = (rec.get("solution_text") or "").strip()
             incoming_text, incoming_tables = _normalize_solution_payload(
@@ -1269,6 +1458,7 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                               f"(empty solution): {foreign}")
                     else:
                         rec["solution_text"] = incoming_text
+                        rec["_prov"]["solution_text"] = req_prov
                         fixed_this_round += 1
                 elif qn in forced:
                     # Targeted prompt asks for the missing continuation, so
@@ -1276,6 +1466,7 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                     # replacing it with a regenerated full solution.
                     if incoming_text.startswith(sol_existing) and len(incoming_text) > len(sol_existing):
                         rec["solution_text"] = incoming_text
+                        rec["_prov"]["solution_text"] = req_prov
                         fixed_this_round += 1
                     elif not _frag_mostly_present(incoming_text, sol_existing, 0.9):
                         # Wrong-owner guard (external-audit 2026-08-02:
@@ -1291,6 +1482,7 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                                   f"(existing solution untouched; fragment logged)")
                         else:
                             rec["solution_text"] = sol_existing.rstrip() + "\n" + incoming_text
+                            rec["_prov"]["solution_text"] = req_prov
                             fixed_this_round += 1
             if "solution" in requested and incoming_tables:
                 before_tables = rec.get("tables") or []
@@ -1446,6 +1638,9 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
             print(f"  [RESCUE] page {page_no} call failed ({e}) -- skipping page")
             continue
         items, _meta = extract_batch_meta(raw)
+        for it in items:
+            if isinstance(it, dict):
+                it["_prov"] = "RESCUE"   # page-focused rescue provenance
         chapter_records, skipped = merge_question_records(chapter_records, items, stats,
                                                           fill_only=True)
         for it in skipped:
@@ -1848,6 +2043,11 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
             print("Daily Gemini call limit reached during failed-page drain. Saving, exiting.")
             save_state(state)
             sys.exit(0)
+        # PATCH-ONLY RECOVERY (run-7 hardening #2): this page failed WHICH
+        # pass? Recover only the fields that pass is allowed to produce.
+        # Unknown pass -> unrestricted (None scope) but still provenance-tagged.
+        scope = _RECOVERY_SCOPE.get(entry.get("pass"))
+        drain_prov = f"DRAIN_{entry.get('pass') or 'S'}"
         pf = page_dir / entry["page_file"]
         if not pf.exists() and pdf_path is not None:
             # cross-day run: /tmp may be wiped -- re-render just this page.
@@ -1892,12 +2092,14 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                         all_ok = False
                         continue
                     items2, _ = extract_batch_meta(raw)
+                    items2 = [_apply_recovery_scope(dict(it), scope, drain_prov)
+                              for it in items2 if isinstance(it, dict)]
                     if items2:
                         any_items = True
                     chapter_records, skipped2 = merge_question_records(
                         chapter_records, items2, stats, fill_only=True)
                     for it in skipped2:
-                        new_orphans.append({"chapter_id": entry.get("chapter_id"), "batch_start": -1,
+                        new_orphans.append({"chapter_id": entry.get("chapter_id"), "batch_start": -1, "pass": entry.get("pass"),
                                             "pdf_pages": [int(entry["true_page"])], "new_pages": [],
                                             "carry_q_no": None, "item": it})
                     print(f"  [DRAIN] {entry['page_file']} {crop_label}: {len(items2)} item(s)")
@@ -1928,6 +2130,13 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                         items2, _ = extract_batch_meta(raw)
                         items2 = [normalize_ocr_fallback_item(item) for item in items2
                                   if isinstance(item, dict)]
+                        # OCR recovery is field-scoped by the failed pass
+                        # (run-7 hardening #2/#4): an OCR_S fragment carries
+                        # solution-only content; its stray question/option
+                        # text is dropped BEFORE anything can merge.
+                        items2 = [_apply_recovery_scope(
+                            it, scope, f"OCR_{entry.get('pass') or 'S'}")
+                            for it in items2]
                         for item in items2:
                             owner_qn = _ocr_content_owner(item, chapter_records)
                             owner = chapter_records.get(owner_qn) if owner_qn is not None else None
@@ -1945,7 +2154,7 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                                 item["q_no"] = owner_qn
                         print(f"  [OCR_FALLBACK] {entry['page_file']}: normalized {len(items2)} OCR item(s)")
                         chapter_records, skipped2 = merge_question_records(chapter_records, items2, stats, fill_only=True)
-                        new_orphans.extend({"chapter_id": entry.get("chapter_id"), "item": it,
+                        new_orphans.extend({"chapter_id": entry.get("chapter_id"), "pass": entry.get("pass"), "item": it,
                                             "pdf_pages": [entry["true_page"]]} for it in skipped2)
                         healed.append(entry)
                         ladder_healed = True
@@ -1957,9 +2166,11 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
             continue
         print(f"  [DRAIN] {entry['page_file']} recovered on second chance")
         items, _meta = extract_batch_meta(raw)
+        items = [_apply_recovery_scope(dict(it), scope, drain_prov)
+                 for it in items if isinstance(it, dict)]
         chapter_records, skipped = merge_question_records(chapter_records, items, stats, fill_only=True)
         for it in skipped:
-            new_orphans.append({"chapter_id": entry.get("chapter_id"), "batch_start": -1,
+            new_orphans.append({"chapter_id": entry.get("chapter_id"), "batch_start": -1, "pass": entry.get("pass"),
                                 "pdf_pages": [int(entry["true_page"])], "new_pages": [],
                                 "carry_q_no": None, "item": it})
         healed.append(entry)
@@ -2511,9 +2722,11 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                 elif (item.get("solution_text") and existing and frag
                       and not _frag_mostly_present(frag, existing)):
                     owner, reason = last_qn, "solution continuation (PARTIAL owner append)"
-                elif item.get("options") and not rec.get("options"):
+                elif item.get("options") and not rec.get("options") \
+                        and orph.get("pass") in ("Q", None):
                     owner, reason = last_qn, "options continuation"
-                elif item.get("question_text") and not rec.get("question_text"):
+                elif item.get("question_text") and not rec.get("question_text") \
+                        and orph.get("pass") in ("Q", None):
                     owner, reason = last_qn, "question continuation"
         # ---- rule 4: positional certainty (Gap-1). An orphan carrying the
         # STEM (+options) can only belong to a record that is MISSING its
@@ -2521,8 +2734,10 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
         # always ~0 (they never overlap lexically), so similarity-based
         # matching provably fails here (prod: PSY-001-003 stayed stemless
         # with answer+solution intact). When the chapter has EXACTLY ONE
-        # stem-less record, position alone is the proof.
-        if owner is None and item.get("question_text") and item.get("options"):
+        # stem-less record, position alone is the proof. Gated to Q-pass
+        # fragments: a solution/OCR fragment must never claim the stem slot.
+        if owner is None and item.get("question_text") and item.get("options") \
+                and orph.get("pass") in ("Q", None):
             stemless = [qn for qn, r in chapter_records.items()
                         if not (r.get("question_text") or "").strip()]
             if len(stemless) == 1:
@@ -2564,14 +2779,42 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                     sol_blocked = True
                 else:
                     rec["solution_text"] = ((rec.get("solution_text") or "") + " " + frag).strip()
-        if item.get("options"):
+        orph_prov = f"ORPHAN_{str(orph.get('pass') or '?')}"
+        # patch-only recovery (run-7 hardening #2): a fragment's question/
+        # option content may ONLY merge when the fragment came from a Q-pass.
+        # An S-pass/OCR solution fragment carrying stray question/option text
+        # is blocked (cross-field contamination class), never merged.
+        can_fill_question = orph.get("pass") in ("Q", None)
+        if item.get("options") and can_fill_question:
             rec["options"] = rec["options"] or {}
             for k, v in item["options"].items():
                 rec["options"].setdefault(str(k).strip().upper(), v)
+            rec["_prov"]["options"] = orph_prov
         if item.get("question_text") and not rec.get("question_text"):
-            rec["question_text"] = item["question_text"]
+            if not can_fill_question:
+                stats.setdefault("contaminated_stems_blocked", 0)
+                stats["contaminated_stems_blocked"] += 1
+                print(f"  [WARN] [ORPHAN] blocked {orph_prov} fragment from "
+                      f"filling q{owner}'s stem (patch-only recovery) -- kept "
+                      f"for review")
+                remaining.append({**orph, "blocked_reason":
+                                  f"{orph_prov} fragment carried question_text "
+                                  f"(cross-field contamination) -- blocked"})
+            else:
+                stem_reason = _stem_reject_reason(item["question_text"], rec)
+                if stem_reason:
+                    stats.setdefault("contaminated_stems_blocked", 0)
+                    stats["contaminated_stems_blocked"] += 1
+                    print(f"  [WARN] [ORPHAN] blocked contaminated stem for q{owner} "
+                          f"({stem_reason}) -- kept for review")
+                    remaining.append({**orph, "blocked_reason":
+                                      f"contaminated stem: {stem_reason}"})
+                else:
+                    rec["question_text"] = item["question_text"]
+                    rec["_prov"]["question_text"] = orph_prov
         if item.get("correct_option") and not rec.get("correct_option"):
             rec["correct_option"] = str(item["correct_option"]).strip().upper()
+            rec["_prov"]["correct_option"] = orph_prov
         if item.get("tables"):
             have = {t.get("markdown") for t in rec["tables"]}
             for t in item["tables"]:
@@ -2694,6 +2937,21 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
             print(f"  [WARN] Gemini returned a non-numeric q_no ({raw_qn!r}), skipping")
             skipped.append(item)
             continue
+        # ---- PROVENANCE + PATCH-ONLY RECOVERY (run-7 hardening #1/#2/#4):
+        # every item carries _prov (set by the pass that produced it, e.g.
+        # "Q_PASS", "S_PASS", "A_RETRY", "OCR_S", "RECOVER"). A SOLUTION or
+        # ANSWER recovery may ONLY patch solution/answer fields -- its
+        # question_text/options are dropped here so a recovered solution
+        # fragment can NEVER populate a stem (the cross-field contamination
+        # class the audit found).
+        prov = str(item.get("_prov") or "GEMINI")
+        if prov.startswith("S") or prov.startswith("A"):
+            if item.get("question_text") or item.get("options"):
+                print(f"  [PROV] q{qn}: {prov} item carried question/option "
+                      f"content -- dropped (patch-only recovery; a {prov} "
+                      f"fragment must never fill a stem)")
+                item = {**item, "question_text": None, "options": None}
+
         # Enforce the solution schema before any overlap merge.  A retry or
         # normal pass may put markdown tables in prose; route them to tables
         # so the final record never carries the same table twice.
@@ -2702,27 +2960,34 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                 item.get("solution_text"), item.get("tables") or [], qn)
             item = {**item, "solution_text": clean_sol, "tables": item_tables}
 
-        # ---- solution-style stem guard (backup net for the stale carry
-        # bug): an unresolved carry context that survives into the Solutions
-        # section can talk the model into CONTINUING the carried q_no with
-        # solution PROSE as its question_text ("Option A: ...", "Answer: ...",
-        # "Solution to Question 4: ..."). That text is not a stem -- reject
-        # just this field (the item's real payload -- solution_text/options/
-        # answer -- still merges below). A new record hit by this keeps its
-        # other fields, stays stem-less, and becomes targeted-retry eligible
-        # via the Gap-1 anchor rule instead of keeping a poisoned stem.
-        if looks_like_solution_style_stem(item.get("question_text")):
-            stats.setdefault("poison_stems_rejected", 0)
-            stats["poison_stems_rejected"] += 1
-            print(f"  [WARN] q{qn}: question_text is solution prose "
-                  f"('{str(item['question_text'])[:60]}...') -- rejected as stem "
-                  f"(stale carry-merge guard); other fields still merge")
-            item = {**item, "question_text": None}
         rec = existing.setdefault(qn, {
             "q_no": qn, "question_text": None, "options": None,
             "correct_option": None, "solution_text": None, "tables": [],
             "has_figure_in_question": False, "has_figure_in_solution": False,
+            "_prov": {},   # per-field provenance (run-7 hardening #4)
         })
+        if "_prov" not in rec:
+            rec["_prov"] = {}
+
+        # ---- semantic stem guard (run-7 hardening #3/#6): a would-be stem
+        # that OPENS with explanation language, or whose text is substantially
+        # contained in this record's OWN solution, is not a stem -- reject the
+        # field so the record stays stem-missing and becomes retry-eligible
+        # (Gap-1 anchor: the solution names its question). Valid stems are
+        # never touched.
+        stem_reason = _stem_reject_reason(item.get("question_text"), rec)
+        if stem_reason:
+            stats.setdefault("contaminated_stems_rejected", 0)
+            stats["contaminated_stems_rejected"] += 1
+            _append_jsonl(DATA_DIR / "integrity_flags.jsonl",
+                          {"kind": "contaminated_stem_rejected", "q_no": qn,
+                           "chapter_id": stats.get("chapter_id"),
+                           "detail": stem_reason,
+                           "prov": prov,
+                           "text": str(item["question_text"])[:300]})
+            print(f"  [WARN] q{qn}: rejected contaminated stem ({stem_reason}; "
+                  f"prov={prov}) -- field kept empty for retry")
+            item = {**item, "question_text": None}
         # ---- duplicate / conflict classification for overlap pages ----
         old_q, new_q = rec.get("question_text"), item.get("question_text")
         if old_q and new_q:
@@ -2778,6 +3043,7 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                 if fill_only and rec.get(k):
                     continue  # recovery: never overwrite existing content
                 rec[k] = item[k]
+                rec["_prov"][k] = prov   # provenance of every patched field
 
         # Options can arrive across TWO different batches when a question
         # straddles a page break (e.g. options A/B on one page, C/D on the
@@ -2797,10 +3063,12 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                     rec["options"].setdefault(key, opt_text)
                 else:
                     rec["options"][key] = opt_text
+            rec["_prov"]["options"] = prov
 
         if item.get("correct_option"):
             if not (fill_only and rec.get("correct_option")):
                 rec["correct_option"] = str(item["correct_option"]).strip().upper()
+                rec["_prov"]["correct_option"] = prov
 
         if item.get("tables"):
             # Overlap captures can be byte-identical OR a shorter prefix when
@@ -3601,6 +3869,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                               f"tail(s) clipped in S-pass output (sibling item "
                               f"present -- provably zero-loss)")
                 items, batch_meta = extract_batch_meta(raw_items)
+                # provenance of every normal-pass item (run-7 hardening #4):
+                # used by merge to enforce patch-only recovery and to reject
+                # contamination (an S/A item's stray stem is never merged).
+                for it in items:
+                    if isinstance(it, dict):
+                        it["_prov"] = f"{pass_name}_PASS"
                 if batch_meta.get("figure_map"):
                     # Q-pass sees question-side figures, S-pass solution-side;
                     # keep the first non-empty map per pass for this window.
@@ -4035,6 +4309,7 @@ def final_q_to_record(q):
                    for t in q["solution"].get("tables", [])],
         "has_figure_in_question": bool(q["question"]["images"]),
         "has_figure_in_solution": bool(q["solution"]["images"]),
+        "_prov": {},   # provenance resets on re-import; new merges re-tag
     }
     owned = {"question": [i["file"] for i in q["question"]["images"]],
              "solution": [i["file"] for i in q["solution"]["images"]]}
@@ -4129,6 +4404,12 @@ def recover_pages(plan_path):
                 if not raw:
                     continue
             items, _meta = extract_batch_meta(raw)
+            # recovery items are provenance-tagged so merge applies the
+            # semantic stem guard to anything that looks like solution prose
+            # (run-7 hardening #4).
+            for it in items:
+                if isinstance(it, dict):
+                    it["_prov"] = "RECOVER"
             records, skipped = merge_question_records(records, items, stats, fill_only=True)
             for it in skipped:
                 orphans.append({"chapter_id": chapter_id, "batch_start": win_start,

@@ -282,6 +282,37 @@ that IS the page-by-page comparison; it now also diffs the figure component
 (a figure the witness saw but JSON lacks -> audit_component_missing).
 
 --------------------------------------------------------------------------------
+## 6. Run-7 audit — cross-field contamination (2026-08-02)
+
+### A7-1 — Recovered SOLUTION fragment written into question_text **[PROVEN mechanism]**
+On pages where normal extraction fails (crop-ladder / OCR restructure), a
+solution fragment can come back inside `question_text` (Gemini fills both
+fields, or an S-pass/OCR item carries a stray stem). The old merge wrote any
+non-empty `question_text` into the record, so a populated-but-wrong stem
+shipped and passed the completeness validator ("field is populated" == "field
+is valid").
+**Fix:** provenance-aware merge — every item carries `_prov` (Q_PASS/S_PASS/
+A_PASS, *_RETRY, OCR_*, DRAIN_*, ORPHAN_*, RESCUE, RECOVER); S/A items have
+`question_text`/`options` dropped before merging; `recover_orphans` gates
+stem/option fills to Q-pass fragments; drain/OCR applies the failed pass's
+field scope (`_RECOVERY_SCOPE`); targeted retry rejects contaminated stems
+and records provenance per patch. Validator: `contaminated_question` (HIGH).
+
+### A7-2 — OCR garbage (page numbers / watermarks / footers) in solution **[PROVEN mechanism]**
+Tesseract text was merged raw; standalone page numbers, "Page N of M",
+urls and copyright lines could land inside solution_text and still pass
+non-empty.
+**Fix:** `_clean_ocr_text` strips whole-line page noise at the
+`ocr_fallback_text` choke point before any merge/splice (prose preserved
+verbatim); validator flags leftovers as `ocr_noise_solution`.
+
+### A7-3 — Semantic completeness (stem that is really a solution)
+`find_incomplete_records` treats a contaminated stem as missing
+(question+answer+options re-ask) and the integrity sweep (step 5) strips it
+for same-run refill; `_stem_reject_reason` = explanation-style opener OR
+>=80% token containment in the record's own solution (>=60 chars).
+
+--------------------------------------------------------------------------------
 ## 5. Run-5 audit — solutions-page figure mapping (2026-08-02)
 
 ### A5-1 — Whole solutions page dumped onto ONE decoded header (user report:
