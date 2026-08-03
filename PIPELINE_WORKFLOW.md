@@ -225,7 +225,10 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 |---|---|---|
 | `GEMINI_MODEL` | `gemini-3.1-flash-lite-preview` | free-tier, confirmed working |
 | `PAGES_PER_GEMINI_CALL` | 6 | accuracy/cost balance |
-| `BATCH_OVERLAP_PAGES` | 2 | boundary items seen whole ≥1× |
+| `BATCH_OVERLAP_PAGES` | 2 | fallback fixed-window overlap (used only when the text layer can't be read) |
+| `QUESTIONS_CHUNK_PAGES` | 10 | whole questions section in 1-2 calls (all questions share one context) |
+| `SOLUTIONS_CHUNK_PAGES` | 5 | recitation-safe solution chunks (long verbatim spans = finish_reason=4) |
+| `SECTION_OVERLAP_PAGES` | 1 | intra-section overlap only; overlap waste 33% -> 10% |
 | `TARGETED_RETRY_MAX_ROUNDS` | 2 | diminishing returns after |
 | `SOLUTION_GATE_MIN_SHARE` | 0.6 | distinguishes "prints solutions" vs answer-only chapters |
 | `MAX_CALLS_PER_DAY` | 1400 | 7 % buffer under 1500/day free tier |
@@ -362,6 +365,44 @@ flags) -- fixing the defect classes that would multiply across 20 books:
    wins (idempotent across 20 books).
 7. **Summary line** now reports `rescue: N filled / M calls` and
    `anchorless dropped: N` per chapter.
+
+---
+
+### 4.19 Changelog — 2026-08-02 (RPM + token-efficiency, run-6 user ask)
+
+User report: the free tier's **15 requests/minute** was being exceeded, and
+tokens were being wasted (the daily call budget died with context budget
+left over). Two root causes + the section-aware batching they asked for:
+
+1. **RPM burst root cause (PROVEN from the run log)** — `attribute_orphan_image`
+   (the 4th-pass image attributor) called `generate_content` DIRECTLY,
+   bypassing the 5s pacing every other path enforces. The log shows three
+   attribution calls in the SAME microsecond (14:08:48.0293 ×3) and several
+   ~1.1s apart (14:14:36-40) — exactly the burst that trips the 15 RPM
+   window. Now paced like every other call.
+2. **Section-aware batching (the user's idea: "pehle questions ek saath,
+   phir answer table, phir solutions")** — `build_section_windows` reads the
+   chapter's text layer ONCE, finds the Solutions-section start (≥2
+   "Solution to Question N:" headers), and sends the chapter in
+   section-sized windows:
+   * the whole questions+answers stretch in QUESTIONS_CHUNK_PAGES=10 windows
+     with 1-page overlap (1-2 calls per chapter instead of 3-6; every
+     question shares one context → no boundary splits, no cross-window
+     option drops);
+   * the Solutions section in SOLUTIONS_CHUNK_PAGES=5 windows (recitation-
+     safe — long verbatim spans are what trigger finish_reason=4).
+   Overlap-token waste drops from 2/6 (33%) to 1/10 (10%), and fewer calls
+   mean the 15 RPM window and the daily quota both last longer.
+   **Safety:** pass activation is UNCHANGED (probe-based + extraction
+   boundary, exactly like the old fixed windows) — the section labels only
+   SIZE the windows and hard-reset the carry context at the Solutions
+   boundary; a page the text layer mislabels can never have its Q-pass
+   skipped (ch1 had 3 questions tailing into the first solution pages).
+   Scanned-only chapters (no readable text layer) fall back to the old
+   6-page fixed windows unchanged.
+3. **Malformed-JSON + fallback windows** — the fixed-window fallback keeps
+   its original 2-page overlap (fixed a regression where the new
+   section-aware overlap logic zeroed it).
 
 ---
 

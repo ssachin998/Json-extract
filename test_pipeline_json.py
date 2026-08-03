@@ -327,6 +327,87 @@ class DedupeQuestionsTests(unittest.TestCase):
         self.assertEqual(by_id, {"PSY-001-001": 2, "PSY-001-002": 1})
 
 
+class SectionWindowTests(unittest.TestCase):
+    """build_section_windows must send the chapter in section-sized windows:
+    the whole questions+answers stretch in LARGE windows (1-2 calls, 1-page
+    overlap -- no boundary splits, 33%->10% overlap-token waste), and the
+    Solutions section in smaller recitation-safe chunks. Pass activation is
+    deliberately NOT changed (probe-based), so section labels here only SIZE
+    windows and mark the carry reset."""
+
+    def setUp(self):
+        self.files = [Path(f"/tmp/s-{n:03d}.jpg") for n in range(3, 17)]
+
+    def _fake_text(self, mapping):
+        orig = qp.pdftotext_page
+        qp.pdftotext_page = lambda pdf, page: mapping.get(page, "")
+        self.addCleanup(setattr, qp, "pdftotext_page", orig)
+
+    def test_questions_and_solutions_planned(self):
+        # ch1-like: questions pp.3-10 (answer key interleaved at 7-8),
+        # solutions pp.11-16
+        text = {p: "1. Question\n2. Question\n" for p in range(3, 11)}
+        text.update({p: "ANSWER KEY\n| Question No. | Correct Option |" for p in (7, 8)})
+        text.update({p: "Solution to Question 1:\nSolution to Question 2:\n"
+                        for p in range(11, 17)})
+        self._fake_text(text)
+        wins = qp.build_section_windows(self.files, "pdf")
+        sections = [s for _, s in wins]
+        self.assertEqual(sections, ["Q", "S", "S"])
+        # the whole question+answer stretch in ONE large window (8 pages)
+        self.assertEqual(wins[0][0], list(range(3, 11)))
+        # solutions chunked with 1-page intra-section overlap
+        self.assertEqual(wins[1][0], [11, 12, 13, 14, 15])
+        self.assertEqual(wins[2][0], [15, 16])
+        # no cross-section overlap
+        self.assertEqual(set(wins[0][0]) & set(wins[1][0]), set())
+
+    def test_big_question_section_chunked_too(self):
+        # 12 question pages -> 2 Q windows with 1-page overlap, then solutions
+        text = {p: "1. Question\n" for p in range(3, 15)}
+        text.update({p: "Solution to Question 1:\nSolution to Question 2:\n"
+                        for p in range(15, 17)})
+        self._fake_text(text)
+        wins = qp.build_section_windows(self.files, "pdf")
+        q_wins = [w for w, s in wins if s == "Q"]
+        self.assertEqual(len(q_wins), 2)
+        self.assertEqual(len(q_wins[0]), qp.QUESTIONS_CHUNK_PAGES)
+        self.assertEqual(q_wins[0][-1], q_wins[1][0])  # 1-page overlap
+
+    def test_answer_key_only_chapter_falls_back(self):
+        # no solutions section at all -> fixed-window fallback ([] means the
+        # caller keeps the old 6-page loop, which never skips a pass)
+        files = [Path(f"/tmp/s-{n:03d}.jpg") for n in range(3, 11)]
+        text = {p: "1. Question\n" for p in range(3, 9)}
+        text[9] = "ANSWER KEY\n| Question No. | Correct Option |"
+        text[10] = "ANSWER KEY\n| Question No. | Correct Option |"
+        self._fake_text(text)
+        self.assertEqual(qp.build_section_windows(files, "pdf"), [])
+
+    def test_no_sections_detected_falls_back(self):
+        self._fake_text({p: "just prose\n" for p in range(3, 17)})
+        self.assertEqual(qp.build_section_windows(self.files, "pdf"), [])
+
+    def test_garbled_text_layer_falls_back(self):
+        self._fake_text({})
+        self.assertEqual(qp.build_section_windows(self.files, "pdf"), [])
+
+    def test_solutions_chunked_with_intra_section_overlap(self):
+        # 8 solution pages (pp.6-13) -> 2 S windows, 1 overlap page
+        files = [Path(f"/tmp/s-{n:03d}.jpg") for n in range(3, 14)]
+        text = {p: "1. Q\n" for p in (3, 4)}
+        text[5] = "ANSWER KEY\n| Q No | Answer |"
+        text.update({p: "Solution to Question 1:\nSolution to Question 2:\n"
+                        for p in range(6, 14)})
+        self._fake_text(text)
+        wins = qp.build_section_windows(files, "pdf")
+        s_wins = [w for w, s in wins if s == "S"]
+        self.assertEqual(len(s_wins), 2)
+        self.assertEqual(len(s_wins[0]), qp.SOLUTIONS_CHUNK_PAGES)
+        # 1-page overlap between the two S windows (page 10 = 6+5-1)
+        self.assertEqual(s_wins[0][-1], s_wins[1][0])
+
+
 class GeminiJsonParserTests(unittest.TestCase):
     def test_parses_one_array(self):
         self.assertEqual(parse_gemini_json_array('[{"q_no": 1}]'), [{"q_no": 1}])

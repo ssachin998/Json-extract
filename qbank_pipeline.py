@@ -103,6 +103,27 @@ MIN_SECONDS_BETWEEN_CALLS = 5   # free tier = ~15 requests/minute (1 per 4s).
                                  # and the 65s backoff ladder stops firing.
 _last_call_ts = 0.0
 
+# --- SECTION-AWARE BATCHING (run-6 user ask: "pehle questions ek saath, phir
+# answer table, phir solutions") ------------------------------------------
+# Instead of walking the chapter in fixed 6-page windows (33% of pages re-sent
+# as overlap), the Solutions-section start is detected ONCE from the text
+# layer and the chapter is sent in section-sized windows: the whole
+# questions+answers stretch in LARGE windows (1-2 calls -> every question
+# shares one context, so boundary splits and cross-window option drops
+# disappear, and fewer calls = less 15-RPM pressure + the daily quota lasts),
+# and the Solutions section in recitation-safe chunks (long verbatim spans
+# are what trigger finish_reason=4, page 218 class). Pass activation stays
+# probe-based -- the section labels only SIZE the windows, they never skip a
+# pass, so a mislabeled page can't lose a question.
+QUESTIONS_CHUNK_PAGES = 10     # a chapter's question section usually fits in
+                               # 1-2 calls; all questions share one context
+SOLUTIONS_CHUNK_PAGES = 5      # smaller spans = recitation-safe (page 218
+                               # class: a whole-section S-pass fails as a unit)
+SECTION_OVERLAP_PAGES = 1      # tiny intra-section overlap (a question split
+                               # across a chunk boundary is still seen whole);
+                               # overlap drops from 2/6 (33%) to 1/10 (10%) --
+                               # the token waste the old fixed windows had
+
 def _pace_gemini_call():
     """Sleep just enough that consecutive Gemini requests stay
     MIN_SECONDS_BETWEEN_CALLS apart. Called at the two choke points EVERY
@@ -1474,6 +1495,73 @@ def probe_batch_pages(pdf_path, window_pages):
             "probe_failed": False}
 
 
+def build_section_windows(page_files, pdf_path):
+    """Section-aware window planner (run-6 user ask).
+
+    Reads the chapter's text layer ONCE (zero-token) to find where the
+    Solutions section starts (first page with >=2 'Solution to Question N:'
+    headers), then builds windows so:
+      * the whole questions+answers stretch is sent in LARGE
+        QUESTIONS_CHUNK_PAGES windows with 1-page overlap (a chapter's
+        question section usually fits in 1-2 calls -- every question shares
+        one context, so boundary splits and cross-window option drops
+        disappear, and fewer calls = less 15-RPM pressure + less token
+        waste: overlap drops from 2/6 (33%) to 1/10 (10%));
+      * the Solutions section is sent in SMALLER SOLUTIONS_CHUNK_PAGES
+        windows with 1-page overlap (long verbatim spans are what trigger
+        finish_reason=4 recitation -- page 218 class).
+
+    Pass ACTIVATION is NOT changed: each window still runs the probe-based
+    Q/A/S decision (and the sticky extraction boundary), so a question page
+    that the text layer mislabels can never be skipped -- section labels
+    here only SIZE the windows and mark the carry hard-reset at the
+    Solutions boundary. Returns a list of (page_numbers, section_label)
+    tuples in reading order, or [] when the text layer cannot be read / no
+    solutions section is detected -- the caller then falls back to the
+    fixed 6-page window loop (unchanged safe path)."""
+    pages = []
+    for p in page_files:
+        try:
+            pages.append(int(p.stem.split("-")[-1]))
+        except (ValueError, IndexError):
+            pass
+    if not pages:
+        return []
+    try:
+        text_by_page = {p: (pdftotext_page(pdf_path, p) or "") for p in pages}
+    except Exception:
+        return []
+    if not any(t.strip() for t in text_by_page.values()):
+        return []
+    solutions_start = None
+    for p in sorted(pages):
+        t = text_by_page[p]
+        if t.strip() and len(SOLUTION_PROBE_RE.findall(t)) >= 2:
+            solutions_start = p
+            break
+    if solutions_start is None:
+        return []  # no solutions section detectable -> fixed-window fallback
+
+    def chunks(pagenos, size, overlap):
+        wins, i, step = [], 0, max(1, size - overlap)
+        while i < len(pagenos):
+            wins.append(pagenos[i:i + size])
+            i += step
+        return wins
+
+    ordered = sorted(pages)
+    windows = []
+    q_pages = [p for p in ordered if p < solutions_start]
+    if q_pages:
+        for w in chunks(q_pages, QUESTIONS_CHUNK_PAGES, SECTION_OVERLAP_PAGES):
+            windows.append((w, "Q"))
+    s_pages = [p for p in ordered if p >= solutions_start]
+    if s_pages:
+        for w in chunks(s_pages, SOLUTIONS_CHUNK_PAGES, SECTION_OVERLAP_PAGES):
+            windows.append((w, "S"))
+    return windows
+
+
 def solution_headers_on_page(pdf_path, file_page, chapter_records):
     """Locate every printed "Solution to Question N:" header on a page WITH
     its vertical position. Returns [(q_no, y_baseline)] in reading order
@@ -2522,6 +2610,13 @@ def attribute_orphan_image(model, rel_path, chapter_records, state):
     ) or "(no question text available)"
     prompt = IMAGE_ATTRIBUTION_PROMPT.replace("{Q_LIST}", q_list)
     img_file = ASSETS_DIR / "questions" / rel_path
+    # PACE THIS CALL (run-5 evidence): attribute_orphan_image calls
+    # generate_content DIRECTLY, bypassing the 5s pacing every other path
+    # enforces -- a page with 3 leftover images fired 3 calls in ~1.5s, and
+    # a multi-page chapter fired several in the SAME microsecond (log:
+    # 14:08:48.0293 x3). That burst is what pushes the free tier past its
+    # 15 RPM window and triggers the 429s. Every Gemini call must be paced.
+    _pace_gemini_call()
     try:
         resp = model.generate_content(
             [prompt, Image.open(img_file)],
@@ -3205,25 +3300,82 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         solutions_section_seen = False             # sticky once the Solutions section begins
         prev_window_last_page = None
 
-        overlap = max(0, min(BATCH_OVERLAP_PAGES, PAGES_PER_GEMINI_CALL - 1))
-        batch_step = PAGES_PER_GEMINI_CALL - overlap
-        for batch_start in range(0, len(page_files), batch_step):
-            if batch_start and batch_start + overlap >= len(page_files):
-                break  # trailing window would contain ONLY overlap pages
-                       # (nothing new) -- don't spend a quota call on it
-            batch = page_files[batch_start:batch_start + PAGES_PER_GEMINI_CALL]
+        # SECTION-AWARE WINDOWS (run-6): detect questions/answers/solutions
+        # boundaries from the text layer ONCE and send each section in its own
+        # larger windows (whole question section in 1-2 calls -> no boundary
+        # splits, no overlap waste; answers in one call; solutions in
+        # recitation-safe chunks). Falls back to the fixed 6-page window loop
+        # when the text layer can't be read (scanned-only pages).
+        section_windows = build_section_windows(page_files, pdf_path)
+        if section_windows:
+            page_by_no = {int(p.stem.split("-")[-1]): p for p in page_files}
+            window_specs = []
+            for page_nos, sec in section_windows:
+                batch = [page_by_no[n] for n in page_nos if n in page_by_no]
+                if batch:
+                    window_specs.append((batch, sec))
+            if not window_specs:
+                section_windows = []  # degenerate -> fall back below
+        if not section_windows:
+            overlap = max(0, min(BATCH_OVERLAP_PAGES, PAGES_PER_GEMINI_CALL - 1))
+            batch_step = PAGES_PER_GEMINI_CALL - overlap
+            window_specs = []
+            for batch_start in range(0, len(page_files), batch_step):
+                if batch_start and batch_start + overlap >= len(page_files):
+                    break  # trailing window would contain ONLY overlap pages
+                           # (nothing new) -- don't spend a quota call on it
+                window_specs.append(
+                    (page_files[batch_start:batch_start + PAGES_PER_GEMINI_CALL], None))
+        prev_section = None
+        for batch, section in window_specs:
             window_pages = [int(p.stem.split("-")[-1]) for p in batch]
-            overlap_pages = [pn for pn in window_pages
-                             if prev_window_last_page is not None and pn <= prev_window_last_page]
+            if section is None:
+                # fixed-window fallback: keep the original overlap semantics
+                overlap_pages = [pn for pn in window_pages
+                                 if prev_window_last_page is not None
+                                 and pn <= prev_window_last_page]
+            elif section == prev_section:
+                # intra-section overlap only -- cross-section windows share
+                # NOTHING (that was the token waste: fixed windows re-sent the
+                # previous section's tail pages in every new window)
+                overlap_pages = [pn for pn in window_pages
+                                 if prev_window_last_page is not None
+                                 and pn <= prev_window_last_page]
+            else:
+                overlap_pages = []  # first window of a section: no overlap
             new_pages = [pn for pn in window_pages if pn not in overlap_pages]
+            if not new_pages:
+                continue  # trailing window = pure overlap; nothing new
             stats["batches"] += 1
 
+            if section == "S" and not solutions_section_seen:
+                # text-layer section boundary: hard-reset ALL carry context
+                # before the Solutions section, exactly like the extraction-
+                # based boundary guard, so question/solution prose can never
+                # cross-merge (the stale-carry class). NOTE: we deliberately do
+                # NOT flip solutions_section_seen here -- Q-pass stays active
+                # until the EXTRACTION-based boundary fires (probe below),
+                # exactly like the old fixed windows, so the handful of
+                # questions that tail into the first solution pages (ch1 class:
+                # 3 questions on pages 11-16) are never skipped by a text-layer
+                # guess.
+                had_pending = any(v is not None for v in carry_by_pass.values()) \
+                    or any(carry_trackers.values())
+                carry_by_pass = {"Q": None, "S": None}
+                carry_trackers = {"Q": {}, "S": {}}
+                print(f"  [SECTION] solutions section begins at page "
+                      f"{window_pages[0]} (text-layer detected) -- ALL carry "
+                      f"context HARD-RESET"
+                      f"{' (dropped pending context)' if had_pending else ''}; "
+                      f"pass activation unchanged (extraction boundary decides)")
             # V2 pass activation (zero-token pdftotext probe + sticky section
-            # state): questions-section batch -> Q-pass only; solutions
-            # section -> S-pass only; key tables / solution headers detected
-            # on THESE pages -> +A-pass / S-pass. This keeps the call count
-            # near v1 levels while every call is narrower. A probe failure
-            # (scanned-only PDF) returns all-True -> all passes run (safe).
+            # state) -- IDENTICAL for section and fallback windows: questions-
+            # section batch -> Q-pass only; solutions section -> S-pass only;
+            # key tables / solution headers on THESE pages -> +A-pass / S-pass.
+            # A probe failure (scanned-only PDF) returns all-True -> all passes
+            # run (safe). Never let a window-sizer disable a pass -- the text
+            # layer of scanned books mislabels pages, and a skipped Q-pass
+            # would silently drop those questions.
             probe = probe_batch_pages(pdf_path, window_pages)
             do_s = solutions_section_seen or probe["solutions"]
             do_a = probe["key_table"]
@@ -3406,6 +3558,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                       f" | items: {len(items)} | orphans buffered: {len(skipped)}")
 
             prev_window_last_page = max(window_pages)
+            prev_section = section
 
             # extract real (non-watermark) images from this batch's pages.
             # pdftoppm names output files using the ACTUAL pdf page number
