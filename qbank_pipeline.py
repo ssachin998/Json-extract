@@ -463,6 +463,16 @@ _BATCH_META_BLOCK = """- BATCH META (required): after the last object, append ON
                    "cut_part": "question"|"options"|"solution"|null,
                    "tail_text": "<verbatim last ~25 words at the bottom of
                                  the last page, else empty string>"}}
+- FIGURE MAP (required whenever ANY figure, photo, diagram or chart is
+  visible on these pages): append ONE more control object
+  {"_figure_map": [{"q_no": <int|null>, "slot": "question"|"solution"|null}, ...]}
+  with EXACTLY ONE entry per figure, in top-to-bottom reading order page by
+  page. q_no = the question the figure belongs to (null if it is
+  decorative/unrelated/watermark). slot = "question" if the figure appears
+  with or above the question stem, "solution" if it appears inside that
+  question's explanation region (null when q_no is null). Every visible
+  figure MUST have an entry -- the pipeline uses this map to attach each
+  extracted image to its question. If no figures at all: {"_figure_map": []}
 - Output ONLY the JSON array, no commentary, no markdown code fences.
 """
 
@@ -1961,14 +1971,25 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
 # ============================================================
 
 def extract_batch_meta(items):
-    """Peel the {"_batch_meta": {...}} control object out of Gemini's array.
-    Returns (question_items, meta_dict). Meta of a failed/absent call = {}."""
+    """Peel the {"_batch_meta": {...}} and {"_figure_map": [...]} control
+    objects out of Gemini's array. Returns (question_items, meta_dict).
+    Meta of a failed/absent call = {}. The figure map (q_no+slot per figure
+    in reading order, run-6 user ask) rides along under meta["figure_map"]."""
     questions, meta = [], {}
     for it in items:
         if isinstance(it, dict) and "_batch_meta" in it:
             m = it.get("_batch_meta")
             if isinstance(m, dict):
+                # keep a figure_map that arrived BEFORE the batch-meta object
+                # (response order is not guaranteed)
+                if meta.get("figure_map"):
+                    m = {**m, "figure_map": meta["figure_map"]}
                 meta = m          # last one wins (single-page retries)
+            continue
+        if isinstance(it, dict) and "_figure_map" in it:
+            fm = it.get("_figure_map")
+            if isinstance(fm, list) and not meta.get("figure_map"):
+                meta["figure_map"] = fm   # first non-empty map wins
             continue
         questions.append(it)
     return questions, meta
@@ -3218,6 +3239,80 @@ def claim_solution_page_images(imgs, pdf_path, file_page, subject, chapter_no,
     return leftover
 
 
+def _order_imgs_by_position(imgs, pos):
+    """Sort extracted image rel paths top->bottom by their drawn y-position
+    (PDF content stream), falling back to resource order when positions are
+    unparsable. Both the figure-map pass and the one-to-one matcher rely on
+    this ordering matching Gemini's top-to-bottom reading order."""
+    def order_key(rel):
+        try:
+            oid = int(Path(rel).stem.rsplit("-", 1)[-1])
+        except (ValueError, IndexError):
+            oid = None
+        y, didx = pos.get(oid, (None, 10**6))
+        return (-(y if y is not None else float("-inf")), didx)
+    return sorted(imgs, key=order_key)
+
+
+def claim_figure_map_images(fig_map, window_rows, subject, chapter_no,
+                            chapter_records, image_files_by_q):
+    """Run-6 user ask ("bta ye image kis question ki h"): claim every image
+    of a window using Gemini's OWN _figure_map (one {q_no, slot} entry per
+    figure, in top-to-bottom reading order page by page, returned by the
+    extraction prompt).
+
+    window_rows: [(file_page_num, [rel paths in top-to-bottom order]), ...]
+    with pages in window order.
+
+    EXACT-COUNT GUARD: the map only fires when len(fig_map) == the total
+    number of images extracted for the window -- then the alignment is exact
+    because both lists are top-to-bottom, page by page. ANY mismatch
+    (watermark skipped, tiny crop dropped by the guard, model double-counted
+    or missed a figure) skips the whole pass safely; those images stay for
+    the deterministic positional passes and the 4th-pass model attribution.
+    Returns {page_no: [rels still unclaimed]}."""
+    if not fig_map:
+        return {p: rels for p, rels in window_rows}
+    total_imgs = sum(len(rels) for _, rels in window_rows)
+    if total_imgs != len(fig_map):
+        print(f"  [IMG] figure-map count mismatch ({len(fig_map)} declared vs "
+              f"{total_imgs} extracted) -- skipping model figure-map claim; "
+              f"left for positional/model passes")
+        return {p: rels for p, rels in window_rows}
+    remaining = {}
+    it = iter(fig_map)
+    for page_no, rels in window_rows:
+        still = []
+        for rel in rels:
+            entry = next(it, None)
+            if not entry:
+                still.append(rel)
+                continue
+            try:
+                qn = int(entry.get("q_no"))
+            except (TypeError, ValueError):
+                still.append(rel)
+                continue
+            if qn not in chapter_records:
+                still.append(rel)
+                continue
+            slot = entry.get("slot")
+            if slot not in ("question", "solution"):
+                still.append(rel)
+                continue
+            new_rel = _rename_for_slot(rel, qn, slot, subject, chapter_no,
+                                       image_files_by_q)
+            if new_rel:
+                image_files_by_q.setdefault(qn, {"question": [], "solution": []})[slot].append(new_rel)
+                qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
+                print(f"  [IMG] figure-map: {rel} -> {qid} ({slot} side, model-declared)")
+            else:
+                still.append(rel)   # tiny-crop / over-attribution guard refused
+        if still:
+            remaining[page_no] = still
+    return remaining
+
+
 def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
                       chapter_records, image_files_by_q):
     """Two-stage deterministic claimer for one page's images:
@@ -3329,6 +3424,10 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         prev_section = None
         for batch, section in window_specs:
             window_pages = [int(p.stem.split("-")[-1]) for p in batch]
+            # provenance anchor used by the log lines / orphan records below
+            # (the fixed-window loop used its index; the section loop uses the
+            # window's first PDF page -- equally unique per window)
+            batch_start = window_pages[0] if window_pages else 0
             if section is None:
                 # fixed-window fallback: keep the original overlap semantics
                 overlap_pages = [pn for pn in window_pages
@@ -3396,6 +3495,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                         routed_pages.add(pf)
                         print(f"  [PREFLIGHT_OCR] {pf.name}: header-routed {n} solution(s); Gemini skipped")
 
+            fig_map_by_pass = {}   # this window's _figure_map control objects
             for pass_name, prompt, active in (
                     ("Q", SCHEMA_PROMPT_Q, do_q),
                     ("A", SCHEMA_PROMPT_A, do_a),
@@ -3501,6 +3601,10 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                               f"tail(s) clipped in S-pass output (sibling item "
                               f"present -- provably zero-loss)")
                 items, batch_meta = extract_batch_meta(raw_items)
+                if batch_meta.get("figure_map"):
+                    # Q-pass sees question-side figures, S-pass solution-side;
+                    # keep the first non-empty map per pass for this window.
+                    fig_map_by_pass[pass_name] = batch_meta["figure_map"]
                 chapter_records, skipped = merge_question_records(chapter_records, items, stats)
                 try:
                     last_qn_in_batch = max(int(it.get("q_no")) for it in items
@@ -3564,6 +3668,9 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             # pdftoppm names output files using the ACTUAL pdf page number
             # (e.g. page-005.jpg for real page 5) -- read it directly from
             # the filename, don't recompute it relative to ch["file_start"].
+            # First collect every page's images (top-to-bottom order) for the
+            # window, THEN claim: figure-map first, positional after.
+            window_rows = []
             for pf in batch:
                 file_page_num = int(pf.stem.split("-")[-1])
                 if file_page_num in pages_imaged:
@@ -3571,6 +3678,24 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 pages_imaged.add(file_page_num)
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
                 if not imgs:
+                    continue
+                pos = image_positions_on_page(pdf_path, file_page_num)
+                ordered = _order_imgs_by_position(imgs, pos)
+                window_rows.append((file_page_num, ordered))
+
+            # FIGURE-MAP pass (run-6 user ask: "bta ye image kis question ki
+            # h") -- Gemini's own _figure_map declares q_no+slot per figure in
+            # reading order. Claim those first (exact-count guard inside: any
+            # mismatch skips safely). This is what stops images from sitting
+            # "unclaimed": the model that READ the page tells us the owner.
+            window_fig_map = fig_map_by_pass.get("Q") or fig_map_by_pass.get("S") or None
+            fig_leftover = claim_figure_map_images(
+                window_fig_map, window_rows, subject, ch["chapter_no"],
+                chapter_records, image_files_by_q)
+
+            for file_page_num, _rels in window_rows:
+                leftover = fig_leftover.get(file_page_num) or []
+                if not leftover:
                     continue
                 # A figure between "Solution to Question N" and the next
                 # header belongs to THAT solution, not to whichever question
@@ -3581,7 +3706,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 # the page onto that one solution (user report: 7 figures
                 # collapsed into 2 solutions). Images with no locatable header
                 # above them are left for the later passes.
-                leftover = claim_page_images(imgs, pdf_path, file_page_num, subject,
+                leftover = claim_page_images(leftover, pdf_path, file_page_num, subject,
                                              ch["chapter_no"], chapter_records, image_files_by_q)
                 if leftover:
                     unmatched_images.append({"page": file_page_num, "files": leftover})
@@ -3669,7 +3794,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         for um in unmatched_images:
             if um.get("matched"):
                 continue
-            still, brake_hit = [], False
+            still, brake_hit, verdicts = [], False, {}
             for rel in um["files"]:
                 if brake_hit:
                     still.append(rel)
@@ -3694,6 +3819,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 if isinstance(qn_attr, bool) or not isinstance(qn_attr, int) \
                         or qn_attr not in chapter_records:
                     still.append(rel)   # weak/no match the model wouldn't stand behind
+                    verdicts[rel] = verdict
                     continue
                 slot = verdict.get("slot")
                 if slot not in ("question", "solution"):
@@ -3706,8 +3832,16 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     print(f"  [IMG] fourth pass: page {um['page']} {rel} -> {qid} "
                           f"({slot} side, model-attributed)")
                 else:
+                    # model DECLARED the owner but a guard (tiny-crop /
+                    # over-attribution cap) refused the rename -- keep the
+                    # verdict visible so nothing is silently unclaimed.
+                    verdicts[rel] = verdict
+                    print(f"  [IMG] fourth pass: page {um['page']} {rel} -> q{qn_attr} "
+                          f"({slot}) DECLARED by model but guard refused rename "
+                          f"-- verdict recorded, left for review")
                     still.append(rel)
             um["files"] = still
+            um["model_verdicts"] = verdicts
             if not still:
                 um["matched"] = True
             elif brake_hit:
@@ -3719,9 +3853,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 print(f"  [WARN] Page {um['page']}: extracted image(s) {um['files']} but no "
                       f"question/solution in this chapter claimed one -- left under its temp "
                       f"filename for manual review (see data/unmatched_images.jsonl).")
-                _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
-                              {"subject": subject, "chapter_id": chapter_id,
-                               "page": um["page"], "files": um["files"]})
+                entry = {"subject": subject, "chapter_id": chapter_id,
+                         "page": um["page"], "files": um["files"]}
+                if um.get("model_verdicts"):
+                    entry["model_verdicts"] = um["model_verdicts"]  # model's q_no/slot answers
+                _append_jsonl(DATA_DIR / "unmatched_images.jsonl", entry)
 
         # FAILED-PAGE DRAIN: second chance for recitation-skipped pages
         # BEFORE orphan recovery (drained fragments may join the orphan

@@ -406,6 +406,30 @@ left over). Two root causes + the section-aware batching they asked for:
 
 ---
 
+### 4.20 Changelog — 2026-08-02 (crash fix + model figure map)
+
+1. **Crash fix** — "cannot access local variable 'batch_start'" after the
+   section-aware rewire: the section loop no longer had the fixed-window
+   index variable, but the 429-path, batch-failure log and orphan records
+   still referenced it. `batch_start` is now the window's first PDF page.
+2. **Model figure map (user ask: "bta ye image kis question ki h")** — the
+   extraction prompts (Q/A/S) now require a `_figure_map` control object:
+   one `{q_no, slot}` entry per visible figure in top-to-bottom reading
+   order, page by page. `extract_batch_meta` peels it, and a new
+   `claim_figure_map_images` pass attaches every image of a window to the
+   question the model DECLARED (with an exact-count guard: if the declared
+   count differs from the extracted count, the pass is skipped so a
+   misalignment can never mis-attribute — those images still flow to the
+   positional + 4th-pass attribution). This directly reduces the
+   "unclaimed" images the user kept seeing.
+3. **Model verdicts recorded** — when the 4th pass declares an owner but a
+   guard (tiny-crop / over-attribution cap) refuses the rename, the model's
+   verdict is now written to `unmatched_images.jsonl` (`model_verdicts`)
+   and logged, so an image is never silently "unclaimed" — the reviewer
+   sees exactly which question the model said it belongs to.
+
+---
+
 ## 11. What feedback is wanted from the reviewer
 
 - Correctness bugs / race conditions / data-loss paths in `qbank_pipeline.py` (merge, resume, quota exits).

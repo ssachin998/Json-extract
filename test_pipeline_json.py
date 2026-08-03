@@ -408,6 +408,86 @@ class SectionWindowTests(unittest.TestCase):
         self.assertEqual(s_wins[0][-1], s_wins[1][0])
 
 
+class FigureMapTests(unittest.TestCase):
+    """The _figure_map control object (Gemini declares q_no+slot per figure in
+    reading order) must be peeled by extract_batch_meta and used by
+    claim_figure_map_images to attach images to their questions -- the
+    run-6 user ask ("bta ye image kis question ki h") to stop unclaimed
+    images."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets = qp.ASSETS_DIR
+        qp.ASSETS_DIR = self.tmp / "assets"
+        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
+        self.subj_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR = self._old_assets
+
+    def _rels(self, oids, page=1):
+        rels = []
+        for oid in oids:
+            fname = f"PSY-p{page}-{oid}.webp"
+            (self.subj_dir / fname).write_bytes(b"x" * 3000)
+            rels.append(f"PSY/{fname}")
+        return rels
+
+    def test_extract_batch_meta_peels_figure_map(self):
+        items, meta = qp.extract_batch_meta([
+            {"q_no": 1, "question_text": "s"},
+            {"_figure_map": [{"q_no": 1, "slot": "question"},
+                             {"q_no": None, "slot": None}]},
+            {"_batch_meta": {"last_q_no": 1, "ends_mid_content": False}},
+        ])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(meta["figure_map"][0], {"q_no": 1, "slot": "question"})
+        self.assertEqual(meta["last_q_no"], 1)
+
+    def test_exact_count_map_claims_every_image(self):
+        fig_map = [{"q_no": 3, "slot": "question"},
+                   {"q_no": 7, "slot": "solution"},
+                   {"q_no": None, "slot": None}]
+        rels = self._rels([6, 7, 8])
+        window_rows = [(1, rels)]
+        owned = {}
+        remaining = qp.claim_figure_map_images(fig_map, window_rows, "PSY", 1,
+                                               {3: {}, 7: {}}, owned)
+        self.assertEqual(owned[3]["question"], ["PSY/PSY-001-003_Q_01.webp"])
+        self.assertEqual(owned[7]["solution"], ["PSY/PSY-001-007_SOL_01.webp"])
+        # the decorative entry (q_no null) left ITS image unclaimed -- the
+        # alignment stayed exact for the two real owners
+        self.assertEqual(remaining[1], ["PSY/PSY-p1-8.webp"])
+
+    def test_count_mismatch_skips_entirely(self):
+        fig_map = [{"q_no": 3, "slot": "question"}]   # 1 declared, 2 extracted
+        rels = self._rels([6, 7])
+        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
+                                               {3: {}}, {})
+        self.assertEqual(set(remaining[1]), set(rels))  # nothing claimed
+
+    def test_unknown_q_or_bad_slot_stays_unclaimed(self):
+        fig_map = [{"q_no": 99, "slot": "question"},   # not in chapter
+                   {"q_no": 3, "slot": "sideways"}]    # invalid slot
+        rels = self._rels([6, 7])
+        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
+                                               {3: {}}, {})
+        self.assertEqual(set(remaining[1]), set(rels))
+
+    def test_guard_refused_image_stays_but_others_claimed(self):
+        # first image too small -> tiny-crop guard refuses rename
+        rels = self._rels([6, 7])
+        (self.subj_dir / "PSY-p1-6.webp").write_bytes(b"x" * 100)  # < MIN_IMAGE_BYTES
+        fig_map = [{"q_no": 3, "slot": "question"},
+                   {"q_no": 3, "slot": "question"}]
+        owned = {}
+        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
+                                               {3: {}}, owned)
+        # the tiny one refused -> stays; the other claimed
+        self.assertIn("PSY/PSY-p1-6.webp", remaining[1])
+        self.assertNotIn("PSY/PSY-p1-7.webp", remaining[1])
+
+
 class GeminiJsonParserTests(unittest.TestCase):
     def test_parses_one_array(self):
         self.assertEqual(parse_gemini_json_array('[{"q_no": 1}]'), [{"q_no": 1}])
