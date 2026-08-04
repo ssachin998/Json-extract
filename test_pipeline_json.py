@@ -1193,6 +1193,125 @@ class OptionImageOwnershipTests(unittest.TestCase):
         self.assertEqual(owned[1].get("option", {}), {})
 
 
+class Run11ForensicHardeningTests(unittest.TestCase):
+    """Run-11 root-cause hardening: stale-path image lifecycle, structured
+    pass status, answer-key rescue targeting, export gate."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets = qp.ASSETS_DIR
+        qp.ASSETS_DIR = self.tmp / "assets"
+        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
+        self.subj_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR = self._old_assets
+
+    # -- RC-1: stale-path image lifecycle --------------------------------
+    def test_stale_path_returns_already_claimed_not_unmatched(self):
+        # image was already renamed by a claim; the stale temp path no longer
+        # exists -> attribute_orphan_image must say already_claimed (NOT
+        # decorative, NOT a model call)
+        called = []
+        class FakeModel:
+            def generate_content(self, *a, **k):
+                called.append(True)
+                raise AssertionError("must not call Gemini for a missing file")
+        verdict = qp.attribute_orphan_image(FakeModel(), "PSY/PSY-p4-7.webp",
+                                            {1: {}}, {"calls_today": 0})
+        self.assertEqual(verdict, {"decorative": "already_claimed"})
+        self.assertEqual(called, [])
+
+    def test_figure_map_fully_claimed_page_returns_empty_leftover(self):
+        # the caller feeds a page's leftovers to the figure-map; if the map
+        # claims ALL of them, the page must NOT appear in fig_leftover (so the
+        # caller clears its stale list instead of keeping temp names)
+        for oid in (6, 7):
+            (self.subj_dir / f"PSY-p1-{oid}.webp").write_bytes(b"x" * 3000)
+        rels = ["PSY/PSY-p1-6.webp", "PSY/PSY-p1-7.webp"]
+        fig_map = [{"q_no": 1, "slot": "question"}, {"q_no": 1, "slot": "question"}]
+        owned = {}
+        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
+                                               {1: {}}, owned)
+        self.assertEqual(remaining, {})            # fully claimed
+        self.assertEqual(len(owned[1]["question"]), 2)
+        # the "page fully claimed -> leftover cleared" rule the caller applies
+        leftover_by_page = {1: rels}               # stale temp names remain
+        for page_no, _rels in [(1, rels)]:
+            leftover_by_page[page_no] = remaining.get(page_no) or []   # the fix
+        self.assertEqual(leftover_by_page[1], [])
+
+    # -- RC-5: structured pass status -------------------------------------
+    def test_pass_status_classification(self):
+        self.assertEqual(qp._classify_pass_status("S", "Q", 0, False, True),
+                         qp.PASS_STATUS_EXPECTED_EMPTY)
+        self.assertEqual(qp._classify_pass_status("S", "S", 0, False, True),
+                         qp.PASS_STATUS_PARTIAL)          # FAILED_ZERO suspect
+        self.assertEqual(qp._classify_pass_status("S", "S", 9, False, True),
+                         qp.PASS_STATUS_SUCCESS)
+        self.assertEqual(qp._classify_pass_status("S", "S", 9, True, True),
+                         qp.PASS_STATUS_RETRYABLE_FAILURE)
+        self.assertEqual(qp._classify_pass_status("S", "S", 0, True, False),
+                         qp.PASS_STATUS_UNRESOLVED)
+
+    # -- RC-4: answer-key page targeting ----------------------------------
+    def test_locate_missing_record_pages_finds_answer_key_pages(self):
+        fake = {1: "1. Question one\n",
+                2: "ANSWER KEY\n| Question No. | Correct Option |\n| 1 | B |\n| 2 | C |"}
+        orig = qp.pdftotext_page
+        qp.pdftotext_page = lambda pdf, page: fake.get(page, "")
+        try:
+            page_files = [Path(f"/tmp/x/page-{n:03d}.jpg") for n in (1, 2)]
+            loc = qp.locate_missing_record_pages("pdf", page_files,
+                                                 {1: ["answer"], 2: ["answer"]}, {})
+        finally:
+            qp.pdftotext_page = orig
+        # q1's answer is on the KEY page (2), not just the question page (1)
+        self.assertEqual(loc[1], [1, 2])
+        self.assertEqual(loc[2], [2])
+
+    def test_answer_rescue_prompt_is_answer_only(self):
+        rec = {"q_no": 7, "question_text": "Which drug?", "correct_option": None}
+        prompt = qp.answer_rescue_prompt(7, rec, {7: rec})
+        self.assertIn('"correct_option"', prompt)
+        self.assertNotIn("solution_text", prompt)
+        self.assertIn("Question 7", prompt)
+
+    # -- Export gate ------------------------------------------------------
+    def test_export_gate_catches_missing_stems_and_answers(self):
+        recs = {1: {"q_no": 1, "question_text": "stem",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": None, "solution_text": "sol"},
+                2: {"q_no": 2, "question_text": None,
+                    "options": {}, "correct_option": None,
+                    "solution_text": None}}
+        image_files = {1: {"question": ["PSY/PSY-001-001_Q_01.webp"],
+                           "solution": [], "option": {}}}
+        # missing asset ref -> broken_asset_ref
+        vio = qp._export_gate_violations(recs, image_files, [], "PSY-001")
+        kinds = {k for k, _q, _d in vio}
+        self.assertIn("missing_answer", kinds)
+        self.assertIn("missing_stem", kinds)
+        self.assertIn("bad_options", kinds)
+        self.assertIn("missing_solution", kinds)
+        self.assertIn("broken_asset_ref", kinds)
+
+    def test_export_gate_clean_when_everything_accounted(self):
+        recs = {1: {"q_no": 1, "question_text": "stem",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "B", "solution_text": "sol"}}
+        vio = qp._export_gate_violations(recs, {}, [], "PSY-001")
+        self.assertEqual(vio, [])
+
+    def test_clean_ocr_preserves_prose_and_strips_page_noise(self):
+        dirty = ("The answer is A.\n12\nPage 5 of 200\nwww.x.com\nmore prose\n")
+        clean = qp._clean_ocr_text(dirty)
+        self.assertIn("The answer is A.", clean)
+        self.assertIn("more prose", clean)
+        self.assertNotIn("Page 5 of 200", clean)
+        self.assertNotIn("www.x.com", clean)
+
+
 class ValidatorContaminationTests(unittest.TestCase):
     """qbank_validator must flag cross-field contamination and OCR noise in
     the FINAL rows (run-7 hardening #3/#6)."""

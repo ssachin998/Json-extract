@@ -475,6 +475,54 @@ implemented:
 
 ---
 
+### 4.25 Changelog — 2026-08-04 (forensic hardening pass, run-11)
+
+Full-book run ended `Validation: 96 flag(s) across 27/33 chapters`. A
+log-forensics + code pass (54-chunk Railway log parsed programmatically)
+found these root causes; the failure matrix is at `debug/root_cause_report.json`:
+
+1. **RC-1 STALE-PATH IMAGE LIFECYCLE (proven, dominant false "unmatched
+   image" source)** — the figure-map pass renames (moves) each claimed temp
+   file to its final slot name, but the run-9 window loop only updated
+   `leftover_by_page` for pages present in `fig_leftover`. A page whose
+   images were ALL claimed kept its STALE TEMP NAMES in the leftover list →
+   they flowed to `unmatched_images` → the 4th pass threw
+   `FileNotFoundError` (`attribution call failed ... No such file`) for
+   images that were ALREADY owned. Fix: every page fed to the figure-map is
+   cleared to its post-map leftover ([] when fully claimed);
+   `attribute_orphan_image` returns `already_claimed` for relocated files
+   (no Gemini call); the 4th pass drops already-claimed refs.
+2. **RC-3 missing-stem invisibility** — the contaminated-stem guard
+   correctly rejects solution-prose-as-stem, but when the real stem was never
+   captured the retry/rescue kept offering filtered text → records shipped
+   STEM-LESS while the summary printed "0 missing answer / 0 missing
+   solution". Chapter summary now reports `missing stem` + `bad options`.
+3. **RC-4 answer reconciliation** — A-pass can return fewer key rows than
+   the chapter's question count (ch7: 14 questions, 9 A-pass items → 4
+   missing answers). `locate_missing_record_pages` now also locates
+   ANSWER-KEY pages for answer-missing records, and rescue uses an
+   ANSWER-ONLY prompt (`answer_rescue_prompt`) for answer gaps.
+4. **RC-5 rescue 0-fields** — broad prompt + wrong target page + scope/
+   contamination filters. Field-specific rescue prompts + key-page targeting.
+5. **RC-6/13 structured page-pass status + page ledger** — every
+   window-pass attempt is classified SUCCESS / EXPECTED_EMPTY / PARTIAL /
+   RETRYABLE_FAILURE / UNRESOLVED and written to `data/page_ledger.jsonl`;
+   a zero-item pass on its own section is PARTIAL (possible FAILED_ZERO),
+   not silently SUCCESS.
+6. **RC-8 section boundary re-fire** — `solutions_section_announced` makes
+   the text-layer S boundary announce + carry-reset ONCE per chapter (was
+   re-logged on every S window).
+7. **EXPORT GATE** — `_export_gate_violations` checks before export:
+   zero missing stems/options/answers/solutions, zero broken asset refs,
+   zero unresolved passes; violations → `data/export_gate.jsonl` + loud
+   `[GATE]` log. "0 missing answer / 0 missing solution" is no longer
+   sufficient for a clean chapter.
+
+Tests: `Run11ForensicHardeningTests` (8 cases). 90 total, all green.
+Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
+
+---
+
 ### 4.24 Changelog — 2026-08-04 (option-level image ownership, run-10)
 
 Investigation (user asked: "do images that belong to MCQ options A/B/C/D get

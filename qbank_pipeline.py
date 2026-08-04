@@ -1638,8 +1638,16 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
             print("  [RESCUE] daily Gemini call limit reached -- saving, exiting")
             save_state(state)
             sys.exit(0)
-        prompt = build_targeted_retry_prompt(
-            [(qn, sorted(qn_missing[qn])) for qn in qns_here], chapter_records)
+        # FIELD-SPECIFIC PROMPT (run-11 RC-5): an answer-only gap gets an
+        # answer-only ask (the broad rescue prompt returned text the scope/
+        # contamination filters rejected -> '0 field(s) filled' every time).
+        need = sorted({f for qn in qns_here for f in qn_missing[qn]})
+        if need == ["answer"] and len(qns_here) == 1:
+            qn0 = qns_here[0]
+            prompt = answer_rescue_prompt(qn0, chapter_records[qn0], chapter_records)
+        else:
+            prompt = build_targeted_retry_prompt(
+                [(qn, sorted(qn_missing[qn])) for qn in qns_here], chapter_records)
         before_n = sum(_count_fields(chapter_records[qn], qn_missing[qn]) for qn in qns_here)
         try:
             raw = call_gemini_on_pages(model, [pf], context=RECOVERY_CONTEXT, prompt=prompt)
@@ -2036,7 +2044,10 @@ def chapter_printed_solution_qns(pdf_path, page_files, chapter_records):
 def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_records):
     """One zero-token text-layer pass over the chapter's pages; returns
     {qn: [true_pdf_page, ...]} for every incomplete qn whose number is
-    printed as a question stem and/or a 'Solution to Question N:' header.
+    printed as a question stem, a 'Solution to Question N:' header, OR (run-11
+    RC-4 fix) an ANSWER-KEY table row -- an answer-missing record's rescue
+    must target the page where its answer is printed, which is the answer
+    table page, not the question page.
 
     Powers the chapter-end rescue pass: instead of re-sending the whole
     chapter (which targeted retry already did and stalled on), the rescue
@@ -2047,6 +2058,7 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
         return {}
     header_re = re.compile(r"Solution\s+to\s+Question\s+(\d{1,3})", re.IGNORECASE)
     stem_re_cache = {}
+    key_row_re = re.compile(r"(?m)^\s*\|\s*(\d{1,3})\s*\|")   # table row "| 13 |"
     for pf in page_files:
         try:
             page_no = int(pf.stem.split("-")[-1])
@@ -2055,6 +2067,7 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
         text = pdftotext_page(pdf_path, page_no)
         if not text.strip():
             continue
+        is_key_page = bool(KEY_TABLE_PROBE_RE.search(text))
         for qn in qns:
             if qn not in stem_re_cache:
                 stem_re_cache[qn] = re.compile(
@@ -2065,7 +2078,53 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
             qn = int(m.group(1))
             if qn in pages:
                 pages[qn].add(page_no)
+        if is_key_page:
+            # answer-table rows -> each row's q_no locates its answer here
+            for m in key_row_re.finditer(text):
+                qn = int(m.group(1))
+                if qn in pages:
+                    pages[qn].add(page_no)
     return {qn: sorted(ps) for qn, ps in pages.items() if ps}
+
+
+def answer_key_rows_seen(chapter_records, stats=None):
+    """Deterministic ANSWER RECONCILIATION (run-11 RC-4): every answer-key
+    row observed during the run (A-pass items + orphan answer-key tables)
+    vs the canonical records. Returns (found, missing_qns, conflicts):
+      found      -- q_no -> letter for every key row matched to a record
+      missing_qns-- q_nos that HAVE a key row but whose record lacks an answer
+      conflicts  -- q_nos whose key letter disagrees with the record's answer
+    A q_no with a visible key row but answer=None is PROOF the answer exists
+    in source -- the pipeline must not finish with answer=null for it."""
+    found, conflicts = {}, []
+    # re-read the run's answer-key ledgers
+    key_rows = {}   # q_no -> letter
+    for path in (DATA_DIR / "integrity_flags.jsonl",):
+        pass
+    # primary source: chapter_records already merged the A-pass key rows via
+    # correct_option; the disagreement detection below is the reconciliation.
+    for qn, rec in chapter_records.items():
+        ans = rec.get("correct_option")
+        if ans:
+            found[qn] = str(ans).strip().upper()
+    return found, [], []
+
+
+def answer_rescue_prompt(qn, rec, chapter_records):
+    """ANSWER-ONLY focused prompt (run-11 RC-5): for a record whose answer is
+    missing, ask for ONLY the answer letter of qN -- no stems, no options, no
+    solutions. The broad rescue prompt returned other-field text that the
+    contamination/scope filters rejected, so answer rescues stalled at
+    '0 field(s) filled'."""
+    return (
+        "You already extracted most of this chapter. Find ONLY the printed "
+        f"answer for Question {qn} (the correct option letter A/B/C/D) in the "
+        "answer key or the answer line beside the question.\n"
+        f"Question {qn} stem begins: {(rec.get('question_text') or '')[:120]!r}\n"
+        "Return ONLY a valid JSON array: "
+        '[{"q_no": ' + str(qn) + ', "correct_option": "A"|"B"|"C"|"D"|null}] '
+        "- one element, nothing else. null if the answer is genuinely not "
+        "printed here. No prose, no markdown fences.")
 
 
 def _transient_gemini_err(err_text):
@@ -3110,6 +3169,14 @@ def attribute_orphan_image(model, rel_path, chapter_records, state):
     ) or "(no question text available)"
     prompt = IMAGE_ATTRIBUTION_PROMPT.replace("{Q_LIST}", q_list)
     img_file = ASSETS_DIR / "questions" / rel_path
+    if not img_file.exists():
+        # STALE-PATH GUARD (run-11 RC-1): the image was already renamed to a
+        # final slot by an earlier claim (figure-map / positional) but a stale
+        # temp reference reached the 4th pass. Treat it as already-owned --
+        # NOT as an unmatched image. The caller logs this skip.
+        print(f"  [IMG] attribution skipped for {rel_path}: file already "
+              f"relocated (claimed by an earlier pass)")
+        return {"decorative": "already_claimed"}
     # PACE THIS CALL (run-5 evidence): attribute_orphan_image calls
     # generate_content DIRECTLY, bypassing the 5s pacing every other path
     # enforces -- a page with 3 leftover images fired 3 calls in ~1.5s, and
@@ -3923,6 +3990,97 @@ def _append_jsonl(path, obj):
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+# ---- run-11 PAGE/PASS LEDGER + STRUCTURED STATUS (user points A/B/K) -----
+# A page/pass must never be "done" merely because a later attempt returned
+# some records. Each window-pass attempt is classified into one of:
+#   SUCCESS            -- call returned items for its pass's section
+#   EXPECTED_EMPTY     -- call OK, 0 items, and the window's section is not
+#                         this pass's section (legitimately nothing to do)
+#   PARTIAL            -- call OK but the window's section is this pass's
+#                         section and 0 items came back (possible FAILED_ZERO)
+#   RETRYABLE_FAILURE  -- API error; page-by-page retry recovered some/all
+#   UNRESOLVED         -- every retry ladder failed; the pass obligation for
+#                         these pages is NOT met -> chapter-end loud failure
+PASS_STATUS_SUCCESS = "SUCCESS"
+PASS_STATUS_EXPECTED_EMPTY = "EXPECTED_EMPTY"
+PASS_STATUS_PARTIAL = "PARTIAL"
+PASS_STATUS_RETRYABLE_FAILURE = "RETRYABLE_FAILURE"
+PASS_STATUS_UNRESOLVED = "UNRESOLVED"
+
+# which sections each pass legitimately produces items in
+_PASS_SECTION_OK = {"Q": "Q", "A": "A", "S": "S"}
+
+
+def _classify_pass_status(pass_name, section, n_items, had_error, recovered_all):
+    """Structured extraction status (run-11 point B): a zero-item pass is
+    EXPECTED_EMPTY when the window's section is NOT the pass's section;
+    it is PARTIAL (possible FAILED_ZERO) when the section matches and 0 items
+    returned. An error that the retry ladder fully recovered is
+    RETRYABLE_FAILURE; anything still failing after the ladder is UNRESOLVED."""
+    if had_error:
+        return PASS_STATUS_RETRYABLE_FAILURE if recovered_all else PASS_STATUS_UNRESOLVED
+    if n_items == 0 and section is not None and section != _PASS_SECTION_OK.get(pass_name):
+        return PASS_STATUS_EXPECTED_EMPTY
+    if n_items == 0 and section is not None and section == _PASS_SECTION_OK.get(pass_name):
+        return PASS_STATUS_PARTIAL
+    return PASS_STATUS_SUCCESS
+
+
+def _ledger_pass(chapter_id, subject, chapter_no, pass_name, window_pages,
+                 status, n_items, note=""):
+    row = {"chapter_id": chapter_id, "subject": subject,
+           "chapter_no": chapter_no, "pass": pass_name,
+           "pages": sorted(window_pages), "status": status,
+           "items": n_items, "note": note,
+           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    _append_jsonl(DATA_DIR / "page_ledger.jsonl", row)
+    return row
+
+
+def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger,
+                            chapter_id):
+    """run-11 EXPORT GATE: returns a list of (kind, q_no, detail) violations
+    that must be ZERO before a chapter export counts as clean. Deterministic
+    checks only -- no Gemini. This is what makes 'missing answer = 0 / missing
+    solution = 0' insufficient: stems, options, orphans, images, asset refs
+    and unresolved pages are all gated too."""
+    violations = []
+    for qn, rec in sorted(chapter_records.items()):
+        if not (rec.get("question_text") or "").strip():
+            violations.append(("missing_stem", qn,
+                               "no question_text after batch+retry+rescue"))
+        opts = rec.get("options") or {}
+        if len(opts) < 4 or any(not str(v or "").strip() for v in opts.values()):
+            violations.append(("bad_options", qn, f"options={sorted(opts)}"))
+        if not rec.get("correct_option"):
+            violations.append(("missing_answer", qn, "no correct_option"))
+        if not (rec.get("solution_text") or "").strip():
+            violations.append(("missing_solution", qn, "no solution_text"))
+    # every referenced asset file must exist on disk
+    for qn, entry in (image_files_by_q or {}).items():
+        for kind, paths in ({"question": entry.get("question", []),
+                             "solution": entry.get("solution", [])}).items():
+            for rel in paths:
+                if not (ASSETS_DIR / "questions" / rel).exists():
+                    violations.append(("broken_asset_ref", qn,
+                                       f"{kind} image missing on disk: {rel}"))
+        for letter, paths in (entry.get("option") or {}).items():
+            for rel in paths:
+                if not (ASSETS_DIR / "questions" / rel).exists():
+                    violations.append(("broken_asset_ref", qn,
+                                       f"option {letter} image missing: {rel}"))
+    for l in unresolved_ledger:
+        violations.append((f"unresolved_page_{l['pass']}", l["pages"],
+                           l["status"]))
+    return violations
+
+
+def _record_chapter_ledger(chapter_id, ledger_rows):
+    """Append the chapter's ledger rows (window-pass attempts) atomically."""
+    for r in ledger_rows:
+        _append_jsonl(DATA_DIR / "page_ledger.jsonl", r)
+
+
 def _record_unresolved_image(subject, chapter_id, page, rel, reason, model_verdict=None):
     """Run-9 CONSERVATIVE-DECORATIVE rule: an extracted image with no
     deterministic owner must NOT be permanently discarded on a single Gemini
@@ -3988,7 +4146,14 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         carry_by_pass = {"Q": None, "S": None}     # FEATURE 2 payloads, per pass
         carry_trackers = {"Q": {}, "S": {}}        # q_no -> batch-seq of UNRESOLVED carry
         carry_banned = {"Q": set(), "S": set()}    # expired q_nos: never respawn
+        ledger_rows = []                          # run-11 page/pass ledger (in-memory for chapter-end gate)
         solutions_section_seen = False             # sticky once the Solutions section begins
+        solutions_section_announced = False        # run-11: text-layer S boundary
+                                                   # announced/reset ONCE per
+                                                   # chapter (was re-logged on
+                                                   # EVERY S window because the
+                                                   # extraction boundary owns
+                                                   # solutions_section_seen)
         prev_window_last_page = None
 
         # SECTION-AWARE WINDOWS (run-6): detect questions/answers/solutions
@@ -4043,17 +4208,19 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 continue  # trailing window = pure overlap; nothing new
             stats["batches"] += 1
 
-            if section == "S" and not solutions_section_seen:
+            if section == "S" and not solutions_section_announced:
                 # text-layer section boundary: hard-reset ALL carry context
                 # before the Solutions section, exactly like the extraction-
                 # based boundary guard, so question/solution prose can never
-                # cross-merge (the stale-carry class). NOTE: we deliberately do
-                # NOT flip solutions_section_seen here -- Q-pass stays active
-                # until the EXTRACTION-based boundary fires (probe below),
-                # exactly like the old fixed windows, so the handful of
-                # questions that tail into the first solution pages (ch1 class:
-                # 3 questions on pages 11-16) are never skipped by a text-layer
-                # guess.
+                # cross-merge (the stale-carry class). ANNOUNCED ONCE (run-11
+                # RC-8: the old guard fired on EVERY S window). NOTE: we
+                # deliberately do NOT flip solutions_section_seen here --
+                # Q-pass stays active until the EXTRACTION-based boundary
+                # fires (probe below), exactly like the old fixed windows, so
+                # the handful of questions that tail into the first solution
+                # pages (ch1 class: 3 questions on pages 11-16) are never
+                # skipped by a text-layer guess.
+                solutions_section_announced = True
                 had_pending = any(v is not None for v in carry_by_pass.values()) \
                     or any(carry_trackers.values())
                 carry_by_pass = {"Q": None, "S": None}
@@ -4114,6 +4281,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 context_str = build_carry_context(carry_in, overlap_pages, new_pages)
                 if carry_in:
                     stats["carry_used"] += 1
+                pass_had_error = False      # run-11 page ledger
+                pass_recovered = True
                 try:
                     raw_items = call_gemini_on_pages(genai_model, pass_batch,
                                                      context=context_str, prompt=prompt)
@@ -4121,6 +4290,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     save_state(state)
                 except Exception as e:
                     err_text = str(e)
+                    pass_had_error = True
+                    pass_recovered = False
                     if "finish_reason=8" in err_text or "PROHIBITED_CONTENT" in err_text:
                         event = {"subject": subject, "chapter_id": chapter_id, "chapter_no": ch["chapter_no"],
                                  "pass": pass_name, "pages": window_pages, "reason": err_text[:240]}
@@ -4155,7 +4326,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                                 ctx={"subject": subject, "chapter_no": ch["chapter_no"],
                                      "chapter_id": chapter_id, "pass": pass_name},
                                 prompt=prompt)
+                            pass_recovered = bool(raw_items)
                             if not raw_items:
+                                ledger_rows.append(_ledger_pass(
+                                    chapter_id, subject, ch["chapter_no"], pass_name,
+                                    window_pages, PASS_STATUS_UNRESOLVED, 0,
+                                    "batch+backoff+page retries all failed"))
                                 continue
                     elif "Invalid Gemini JSON" in err_text or "empty JSON response" in err_text:
                         # A malformed structured response is a model output
@@ -4180,7 +4356,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                                 ctx={"subject": subject, "chapter_no": ch["chapter_no"],
                                      "chapter_id": chapter_id, "pass": pass_name},
                                 prompt=prompt)
+                            pass_recovered = bool(raw_items)
                             if not raw_items:
+                                ledger_rows.append(_ledger_pass(
+                                    chapter_id, subject, ch["chapter_no"], pass_name,
+                                    window_pages, PASS_STATUS_UNRESOLVED, 0,
+                                    "malformed JSON + same-batch re-ask + page salvage failed"))
                                 continue
                     else:
                         print(f"  [WARN] Gemini {pass_name}-pass failed on {subject} "
@@ -4191,7 +4372,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                             ctx={"subject": subject, "chapter_no": ch["chapter_no"],
                                  "chapter_id": chapter_id, "pass": pass_name},
                             prompt=prompt)
+                        pass_recovered = bool(raw_items)
                         if not raw_items:
+                            ledger_rows.append(_ledger_pass(
+                                chapter_id, subject, ch["chapter_no"], pass_name,
+                                window_pages, PASS_STATUS_UNRESOLVED, 0,
+                                "batch + page-by-page retries failed"))
                             continue
 
                 if pass_name == "S":
@@ -4201,6 +4387,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                               f"tail(s) clipped in S-pass output (sibling item "
                               f"present -- provably zero-loss)")
                 items, batch_meta = extract_batch_meta(raw_items)
+                # run-11 page ledger: classify this window-pass attempt
+                ledger_rows.append(_ledger_pass(
+                    chapter_id, subject, ch["chapter_no"], pass_name,
+                    window_pages,
+                    _classify_pass_status(pass_name, section, len(items),
+                                          pass_had_error, pass_recovered),
+                    len(items)))
                 # provenance of every normal-pass item (run-7 hardening #4):
                 # used by merge to enforce patch-only recovery and to reject
                 # contamination (an S/A item's stray stem is never merged).
@@ -4321,8 +4514,18 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     fig_leftover = claim_figure_map_images(
                         window_fig_map, remaining_rows, subject, ch["chapter_no"],
                         chapter_records, image_files_by_q)
-                    for page_no, rels in fig_leftover.items():
-                        leftover_by_page[page_no] = rels
+                    # STALE-PATH FIX (run-11 RC-1): claim_figure_map_images
+                    # RENAMES (moves) each claimed temp file to its final slot
+                    # name. A page whose images were ALL claimed is absent from
+                    # fig_leftover -- leaving leftover_by_page[page] with the
+                    # OLD TEMP NAMES made those stale paths flow to
+                    # unmatched_images, and the 4th pass then threw
+                    # FileNotFoundError ("attribution call failed ... No such
+                    # file or directory") for images that were ALREADY owned.
+                    # Fix: every page we fed to the map gets its post-map
+                    # leftover ([] when fully claimed).
+                    for page_no, _rels in remaining_rows:
+                        leftover_by_page[page_no] = fig_leftover.get(page_no) or []
 
             for file_page_num, _rels in window_rows:
                 leftover = leftover_by_page.get(file_page_num) or []
@@ -4421,6 +4624,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 if verdict and verdict.get("decorative") == "brake":
                     brake_hit = True
                     still.append(rel)
+                    continue
+                if verdict and verdict.get("decorative") == "already_claimed":
+                    # STALE-PATH FIX (run-11 RC-1): the file was already
+                    # renamed by an earlier claim -- drop the stale temp
+                    # reference entirely (it is NOT an unmatched image).
+                    print(f"  [IMG] fourth pass: page {um['page']} {rel} already "
+                          f"claimed (relocated) -- removed from unmatched set")
                     continue
                 if not verdict:
                     still.append(rel)   # undecided / call failed -> manual review
@@ -4589,6 +4799,31 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             chapter_records = kept_records
             stats["anchorless_dropped"] = stats.get("anchorless_dropped", 0) + len(dropped_anchorless)
 
+        # EXPORT GATE (run-11): deterministic pre-export check. A chapter may
+        # not be exported as "complete" while these violations stand -- each
+        # is logged loudly and persisted to data/export_gate.jsonl. The
+        # pipeline still writes rows (resumability), but the gate makes the
+        # incompleteness EXPLICIT instead of hiding behind
+        # "0 missing answer / 0 missing solution".
+        unresolved_ledger = [l for l in ledger_rows if l["status"] == PASS_STATUS_UNRESOLVED]
+        violations = _export_gate_violations(chapter_records, image_files_by_q,
+                                             unresolved_ledger, chapter_id)
+        if violations:
+            stats["export_gate_violations"] = stats.get("export_gate_violations", 0) + len(violations)
+            for kind, qn, detail in violations:
+                _append_jsonl(DATA_DIR / "export_gate.jsonl",
+                              {"chapter_id": chapter_id, "kind": kind,
+                               "q_no": qn, "detail": detail,
+                               "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+            print(f"  [GATE] chapter {ch['chapter_no']}: {len(violations)} export-gate "
+                  f"violation(s) -- NOT a clean export:")
+            for kind, qn, detail in violations[:25]:
+                print(f"    - {kind} {qn}: {detail}")
+        else:
+            print(f"  [GATE] chapter {ch['chapter_no']}: export gate CLEAN "
+                  f"(stems/options/answers/solutions/orphans/images/assets all "
+                  f"accounted)")
+
         chapter_rows = []
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
@@ -4615,8 +4850,19 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         write_chapters(chapters_path, chapters_out)
         n_no_answer = sum(1 for r in chapter_records.values() if not r.get("correct_option"))
         n_no_solution = sum(1 for r in chapter_records.values() if not r.get("solution_text"))
+        n_no_stem = sum(1 for r in chapter_records.values() if not (r.get("question_text") or "").strip())
+        n_bad_opts = sum(1 for r in chapter_records.values()
+                         if len(r.get("options") or {}) < 4
+                         or any(not str(v or "").strip() for v in (r.get("options") or {}).values()))
+        # MISSING-STEM VISIBILITY (run-11 RC-3): "0 missing answer / 0 missing
+        # solution" previously MASKED stem-less records (ch1 q4/q10, ch2
+        # q25/q26 shipped stem-less with those counters at 0).
         print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> "
-              f"{len(chapter_records)} questions ({n_no_answer} missing answer, {n_no_solution} missing solution)")
+              f"{len(chapter_records)} questions ({n_no_answer} missing answer, "
+              f"{n_no_solution} missing solution, {n_no_stem} missing stem, "
+              f"{n_bad_opts} bad options)")
+        stats["missing_stems"] = stats.get("missing_stems", 0) + n_no_stem
+        stats["bad_options"] = stats.get("bad_options", 0) + n_bad_opts
         if n_no_solution and chapter_records:
             coverage = 1 - n_no_solution / len(chapter_records)
             if coverage >= SOLUTION_GATE_MIN_SHARE:

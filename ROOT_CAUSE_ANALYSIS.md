@@ -406,3 +406,40 @@ Applied in process_pdf AND in --recover mode. `MAX_SOLUTION_IMAGES = 2`
 caps the deterministic path at the `_rename_for_slot` choke point; sweep
 step 4b trims older rows' excess; validator: over_attributed_solution_images
 (LOW). Regression tests: test_pipeline_json.py::SolutionFigureMappingTests.
+
+--------------------------------------------------------------------------------
+## 10. Run-11 audit — forensic hardening (2026-08-04, 96 flags / 27 chapters)
+
+Full-book run ended 96 flags. Log forensics (54-chunk Railway log) + code
+inspection. Full matrix: debug/root_cause_report.json.
+
+### A11-1 — STALE-PATH IMAGE LIFECYCLE (false "unmatched image") **[PROVEN]**
+figure-map claims rename temp files to final slot names, but the caller kept
+the stale temp names in the leftover list for fully-claimed pages →
+4th-pass `FileNotFoundError` ("attribution call failed ... No such file") →
+false unmatched count. Seen for p67-150/151, p83-186, p104-229, p119-260,
+p120-263. Fix: clear leftover for map-fed pages; `already_claimed` guard;
+4th pass drops relocated refs.
+
+### A11-2 — Missing-stem invisibility **[PROVEN]**
+Contaminated-stem guard correct, but stems stripped and never refilled
+shipped while "0 missing answer / 0 missing solution" printed. Fix: summary
++ export gate count missing stems/options.
+
+### A11-3 — Answer reconciliation gap **[PROVEN mechanism]**
+A-pass fewer rows than questions (ch7: 14 q, 9 key rows, 4 missing answers).
+Fix: locate answer-key pages for answer gaps + answer-only rescue prompt +
+export gate missing_answer.
+
+### A11-4 — Structured page-pass status + page ledger **[PROVEN mechanism]**
+Zero-item passes and recovered-after-error passes were indistinguishable.
+Fix: SUCCESS/EXPECTED_EMPTY/PARTIAL/RETRYABLE_FAILURE/UNRESOLVED per
+window-pass → data/page_ledger.jsonl; chapter-end gate surfaces UNRESOLVED.
+
+### A11-5 — Section-boundary re-fire **[PROVEN]**
+"[SECTION] solutions section begins" fired on every S window. Fix:
+solutions_section_announced (announce/reset once; Q-pass activation unchanged).
+
+### A11-6 — Export gate **[NEW]**
+Deterministic pre-export check (missing stems/options/answers/solutions,
+broken asset refs, unresolved passes) → data/export_gate.jsonl + loud log.
