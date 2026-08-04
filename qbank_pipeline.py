@@ -1342,7 +1342,8 @@ def _log_blocked_retry_fragment(chapter_id, qn, reason, fragment):
 
 
 def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
-                   force_solution_qns=None, chapter_id=None, printed_solution_qns=None):
+                   force_solution_qns=None, chapter_id=None, printed_solution_qns=None,
+                   stats=None):
     """
     Up to `max_rounds` small, focused re-asks for whatever answer/option
     fields are still missing after normal processing. Sends the chapter's
@@ -1354,8 +1355,12 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
     solutions are REPLACED by a longer verbatim re-ask (truncated heal).
     printed_solution_qns: q_nos whose printed 'Solution to Question N:'
     header exists in the chapter -- bypasses the 60% solution-gate for them.
+    stats: optional counter dict (chapter stats; used for the contaminated-
+    stem block counter). Defaults to a throwaway dict when not passed.
     Returns the total number of fields filled.
     """
+    if stats is None:
+        stats = {}
     total_fixed = 0
     first_check = True
     forced = set(force_solution_qns or ())
@@ -4193,7 +4198,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                                  state, max_rounds=TARGETED_RETRY_MAX_ROUNDS,
                                  force_solution_qns=forced_solution_qns,
                                  chapter_id=chapter_id,
-                                 printed_solution_qns=printed_sol_qns)
+                                 printed_solution_qns=printed_sol_qns,
+                                 stats=stats)
         if n_fixed:
             print(f"  [RETRY] closed {n_fixed} field(s) via targeted retry")
 
@@ -4461,7 +4467,8 @@ def recover_pages(plan_path):
                   and looks_truncated_solution(r["solution_text"],
                                                has_tables=bool(r.get("tables")))}
         targeted_retry(model, page_files, records, state,
-                       force_solution_qns=forced, chapter_id=chapter_id)
+                       force_solution_qns=forced, chapter_id=chapter_id,
+                       stats=stats)
         for um in unmatched_images:
             rec_leftover = claim_page_images(um["files"], pdf_path, um["page"],
                                              subject, chapter_no,
