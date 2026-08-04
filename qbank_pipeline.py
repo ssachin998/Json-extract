@@ -1779,6 +1779,36 @@ def build_section_windows(page_files, pdf_path):
     return windows
 
 
+def _page_word_lines(pdf_path, file_page):
+    """[(y, [(x, text), ...])] for a page, top-first (larger y first), from
+    pypdf's text visitor. (x, y) in PDF user space (origin bottom-left) --
+    the SAME coordinate space as image_positions_on_page. Shared by
+    question-header, solution-header and option-anchor detection (run-10);
+    the body-page pdftotext CLI is GARBLED on this book, the visitor is not."""
+    try:
+        page = PdfReader(pdf_path).pages[file_page - 1]
+    except Exception:
+        return []
+    words = []
+
+    def _visitor(text, _cm, tm, _font_dict, _font_size):
+        t = (text or "").strip()
+        if t:
+            # tm[4]=x, tm[5]=baseline y from the PDF bottom-left origin
+            words.append((round(float(tm[5]), 1), round(float(tm[4]), 1), t))
+
+    try:
+        page.extract_text(visitor_text=_visitor)
+    except Exception:
+        return []
+    if not words:
+        return []
+    lines = {}
+    for y, x, t in words:
+        lines.setdefault(y, []).append((x, t))
+    return [(y, sorted(lines[y])) for y in sorted(lines, reverse=True)]
+
+
 def question_headers_on_page(pdf_path, file_page, chapter_records):
     """Locate every printed question-stem heading ("1.", "1)", "Q1." etc.) on
     a page WITH its vertical position. Returns [(q_no, y_baseline)] in
@@ -1792,29 +1822,9 @@ def question_headers_on_page(pdf_path, file_page, chapter_records):
     visitor (the SAME tool the solution-header mapper uses successfully on
     page 33), so question-side figures get the same deterministic geometry
     treatment as solution-side ones."""
-    try:
-        page = PdfReader(pdf_path).pages[file_page - 1]
-    except Exception:
-        return []
-    words = []
-
-    def _visitor(text, _cm, tm, _font_dict, _font_size):
-        t = (text or "").strip()
-        if t:
-            words.append((round(float(tm[5]), 1), round(float(tm[4]), 1), t))
-
-    try:
-        page.extract_text(visitor_text=_visitor)
-    except Exception:
-        return []
-    if not words:
-        return []
-    lines = {}
-    for y, x, t in words:
-        lines.setdefault(y, []).append((x, t))
     headers, seen = [], set()
-    for y in sorted(lines, reverse=True):
-        line = " ".join(t for _, t in sorted(lines[y]))
+    for y, wl in _page_word_lines(pdf_path, file_page):
+        line = " ".join(t for _, t in wl)
         m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", line)
         if not m:
             continue
@@ -1842,6 +1852,116 @@ def block_headers_on_page(pdf_path, file_page, chapter_records):
     return sorted(qs + ss, key=lambda t: -t[2])
 
 
+# --- run-10 OPTION-LEVEL image ownership -----------------------------------
+# An "A." / "B." label line that begins a line inside a QUESTION block is an
+# option anchor. Anchors are computed ONLY inside question blocks (bounded by
+# the question heading above and the next block heading below), so "Option A:"
+# prose inside SOLUTION text, table cells or bullet lists can never become
+# anchors (the user's hard requirement).
+OPTION_LABEL_RE = re.compile(r"^\s*([A-D])\s*[.)]\s*(.*)$", re.IGNORECASE)
+_OPTION_ROW_TOL = 3.0      # labels on the same visual line share a baseline
+_OPTION_X_MARGIN = 20.0    # x-distance tie margin (ambiguous if too close)
+
+
+def option_anchors_in_block(pdf_path, file_page, y_head, y_bottom):
+    """[(letter, x, y)] option-label anchors ("A." etc.) inside ONE vertical
+    band [y_bottom, y_head] -- a question block's extent. Top-first (larger y
+    first). Empty when the page's text layer can't be read or the block has
+    no option labels.
+
+    Detection (all via pypdf's text visitor, no pdftotext):
+      1. a LINE-START label ("A. text") -> first anchor of that line;
+      2. if the line starts with a label, EMBEDDED word-start labels
+         ("A. text B. text" in a horizontal / 2x2 option row) -> second,
+         third, fourth anchors (each word carries its own x);
+      3. standalone label WORDS ("A." / "B)") on lines without a line-start
+         label.
+    Anchors are only collected inside a question block, so "Option A:" prose
+    in solutions, table cells or bullet lists can never become anchors."""
+    anchors = []
+    for y, wl in _page_word_lines(pdf_path, file_page):
+        if not (y_bottom < y <= y_head):
+            continue
+        line = " ".join(t for _, t in wl)
+        first = OPTION_LABEL_RE.match(line)
+        if first:
+            anchors.append((first.group(1).upper(), wl[0][0], y))
+            if len(wl) >= 2:                       # horizontal option row
+                for x, t in wl[1:]:
+                    m = re.match(r"^([A-D])\s*[.)]", t)
+                    if m:
+                        anchors.append((m.group(1).upper(), x, y))
+        else:
+            for x, t in wl:                        # standalone label words
+                if re.fullmatch(r"[A-D][.)]", t):
+                    anchors.append((t[0].upper(), x, y))
+    return anchors
+
+
+def _assign_option(anchors, x_img, y_img):
+    """Conservative deterministic option assignment for an image inside a
+    QUESTION block. Returns an option letter, or None (keep the image as a
+    question-level figure -- never guess, never drop).
+
+    Layout detection: anchors are grouped into rows by baseline (same-line
+    labels share y). For an image:
+      * rows strictly ABOVE the image's bottom edge are candidates; the
+        closest row above is the block the image sits in;
+      * a single-anchor row (vertical layout, e.g. "A. text" then [IMG])
+        -> that option;
+      * a multi-anchor row (horizontal / 2x2: "A [IMG] B [IMG]") -> nearest
+        anchor by x, but only when unambiguous (margin _OPTION_X_MARGIN);
+        an image left of the whole row or equidistant (a figure shared by
+        several options) stays question-level;
+      * no row above -> image is a stem figure (between the heading and
+        option A) -> question-level.
+    This never runs on SOLUTION blocks -- option anchors only exist inside
+    question blocks, so "Option A:" prose in a solution can never steal a
+    figure."""
+    if not anchors:
+        return None
+    rows = []
+    for a in sorted(anchors, key=lambda a: -a[2]):   # y desc, top first
+        if rows and abs(rows[-1][-1][2] - a[2]) <= _OPTION_ROW_TOL:
+            rows[-1].append(a)
+        else:
+            rows.append([a])
+    above = [r for r in rows if r[0][2] > y_img]
+    if not above:
+        return None                      # stem figure above all option labels
+    row = min(above, key=lambda r: r[0][2] - y_img)   # closest row above
+    if len(row) == 1:
+        return row[0][0]                 # vertical layout -> that option
+    # horizontal / 2x2 row: nearest anchor by x, unambiguous only
+    xs = sorted((a[1], a[0]) for a in row)
+    if x_img < xs[0][0] - _OPTION_X_MARGIN:
+        return None                      # image left of the whole row -> ambiguous
+    dists = sorted((abs(a_x - x_img), letter) for a_x, letter in xs)
+    if len(dists) >= 2 and abs(dists[0][0] - dists[1][0]) < _OPTION_X_MARGIN:
+        return None                      # equidistant (shared figure) -> ambiguous
+    return dists[0][1]
+
+
+def _option_for_image_in_block(pdf_path, file_page, headers, owner, x_img, y_img):
+    """Option-letter for an image already owned by a QUESTION block, or None.
+    Runs ONLY for question-kind owners; finds the owner's block extent from
+    the page's block headers (heading above, next heading below), collects
+    the option-label anchors inside that block, and applies the conservative
+    geometry rule. Solution blocks and cross-page carried blocks (no header
+    on this page) return None -> the image stays a question-level figure."""
+    kind, qn = owner
+    if kind != "question":
+        return None
+    idx = next((i for i, (k, q, _y) in enumerate(headers)
+                if k == kind and q == qn), None)
+    if idx is None:
+        return None                       # carried block: no header here
+    y_head = headers[idx][2]
+    y_bottom = headers[idx + 1][2] if idx + 1 < len(headers) else 0.0
+    anchors = option_anchors_in_block(pdf_path, file_page, y_head, y_bottom)
+    return _assign_option(anchors, x_img, y_img)
+
+
 def solution_headers_on_page(pdf_path, file_page, chapter_records):
     """Locate every printed "Solution to Question N:" header on a page WITH
     its vertical position. Returns [(q_no, y_baseline)] in reading order
@@ -1861,30 +1981,9 @@ def solution_headers_on_page(pdf_path, file_page, chapter_records):
     positions, each figure can be matched to the header actually drawn above
     it -- and when a header cannot be located, the caller claims NOTHING for
     that figure instead of guessing."""
-    try:
-        page = PdfReader(pdf_path).pages[file_page - 1]
-    except Exception:
-        return []
-    words = []
-
-    def _visitor(text, _cm, tm, _font_dict, _font_size):
-        t = (text or "").strip()
-        if t:
-            # tm[4]=x, tm[5]=baseline y from the PDF bottom-left origin
-            words.append((round(float(tm[5]), 1), round(float(tm[4]), 1), t))
-
-    try:
-        page.extract_text(visitor_text=_visitor)
-    except Exception:
-        return []
-    if not words:
-        return []
-    lines = {}
-    for y, x, t in words:
-        lines.setdefault(y, []).append((x, t))
     headers, seen = [], set()
-    for y in sorted(lines, reverse=True):   # larger y == higher on the page
-        line = " ".join(t for _, t in sorted(lines[y]))
+    for y, wl in _page_word_lines(pdf_path, file_page):
+        line = " ".join(t for _, t in wl)
         for m in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", line, re.IGNORECASE):
             qn = int(m.group(1))
             if qn in chapter_records and qn not in seen:
@@ -3307,7 +3406,12 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
               for t in _dedupe_tables(rec.get("tables", []))
               if not _is_printed_answer_key(t)]
 
-    option_rows = [{"id": str(k).strip().upper(), "text": v, "images": []}
+    # OPTION-LEVEL images (run-10): image_files["option"] = {letter: [rel,...]}
+    # populated by the deterministic option geometry; the per-option "images"
+    # array already existed in the schema (hardcoded [] before) -- now filled.
+    opt_imgs = image_files.get("option") or {}
+    option_rows = [{"id": str(k).strip().upper(), "text": v,
+                    "images": valid_images(opt_imgs.get(str(k).strip().upper(), []), "option")}
                    for k, v in (rec["options"] or {}).items()]
     # Last-resort release backfill: targeted retry above requests all options
     # when one is blank. If OCR/model extraction still leaves the *correct*
@@ -3379,11 +3483,14 @@ def _mat_mult(m1, m2):
 
 
 def image_positions_on_page(pdf_path, file_page):
-    """Best-effort map {image object idnum -> (y, draw_index)} for every
+    """Best-effort map {image object idnum -> (y, x, draw_index)} for every
     image XObject drawn on a page, by walking the content stream and
-    tracking the cm matrix before each `Do`. y = height from page bottom
-    (PDF origin), so LARGER y == HIGHER on the page. Returns {} on any
-    parse hiccup -- callers then fall back to plain reading order."""
+    tracking the cm matrix before each `Do`. (x, y) = the image's BOTTOM-LEFT
+    corner in PDF user space (origin at the page bottom-left), so LARGER y ==
+    HIGHER on the page and LARGER x == further RIGHT. x is used by the
+    option-image geometry (horizontal / 2x2 option layouts, run-10).
+    Returns {} on any parse hiccup -- callers then fall back to plain
+    reading order."""
     positions = {}
     try:
         page = PdfReader(pdf_path).pages[file_page - 1]
@@ -3425,7 +3532,7 @@ def image_positions_on_page(pdf_path, file_page):
                     if obj.get("/Subtype") == "/Image":
                         oid = getattr(names[name], "idnum", None)
                         key = oid if oid is not None else name
-                        positions[key] = (ctm[5], draw_idx)
+                        positions[key] = (ctm[5], ctm[4], draw_idx)
                         draw_idx += 1
                 num_buf = []
             i += 1
@@ -3454,16 +3561,18 @@ def pending_image_slots(chapter_records, image_files_by_q):
     return slots
 
 
-def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q):
+def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
+                     option_letter=None):
     """Rename one extracted temp image into the locked convention for the
-    given (q_no, "question"|"solution") slot. kind letter: Q or SOL.
-    Returns the new rel path or None."""
+    given (q_no, "question"|"solution"|"option") slot. kind letters: Q, SOL,
+    or OPT_{L} (option_letter A-D). Returns the new rel path or None."""
     old_path = ASSETS_DIR / "questions" / rel
     if not old_path.exists():
         print(f"  [WARN] {rel} missing at rename time -- skipping (alias/dup ref)")
         return None
     qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
     entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+    entry.setdefault("option", {})
     # Broken-crop guard (run-4: PSY-003-014_Q_01 was 414 bytes): a sub-1.5KB
     # webp cannot hold a real MCQ figure. Do NOT auto-claim it -- the caller's
     # leftover path hands it to the model fourth-pass / manual review, which
@@ -3490,9 +3599,15 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q):
         print(f"  [WARN] over-attribution guard: {qid} already has {MAX_SOLUTION_IMAGES} "
               f"solution images -- refusing {rel}; left for model/manual review")
         return None
-    letter = "Q" if kind == "question" else "SOL"
-    idx = len(entry[kind]) + 1
-    new_name = f"{qid}_{letter}_{idx:02d}.webp"
+    if kind == "option":
+        opt = str(option_letter or "A").strip().upper()
+        bucket = entry["option"].setdefault(opt, [])
+        idx = len(bucket) + 1
+        new_name = f"{qid}_OPT_{opt}_{idx:02d}.webp"
+    else:
+        letter = "Q" if kind == "question" else "SOL"
+        idx = len(entry[kind]) + 1
+        new_name = f"{qid}_{letter}_{idx:02d}.webp"
     new_rel = f"{subject}/{new_name}"
     old_path.rename(ASSETS_DIR / "questions" / subject / new_name)
     return new_rel
@@ -3553,7 +3668,7 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
             oid = int(Path(rel).stem.rsplit("-", 1)[-1])
         except (ValueError, IndexError):
             oid = None
-        y, didx = pos.get(oid, (None, 10**6))
+        y, _x, didx = pos.get(oid, (None, None, 10**6))
         return (-(y if y is not None else float("-inf")), didx)
 
     ordered_imgs = sorted(imgs, key=order_key)
@@ -3624,7 +3739,7 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
         if info is None:
             leftover.append(rel)
             continue
-        y_img, _didx = info[0], info[1]
+        y_img, x_img, _didx = info
         # Closest header drawn ABOVE the image: iterate bottom-first, take
         # the first hit (the topmost header above would hand every figure on
         # the page to the first block).
@@ -3640,13 +3755,31 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
         if qn not in chapter_records:
             leftover.append(rel)
             continue
-        new_rel = _rename_for_slot(rel, qn, kind, subject, chapter_no,
-                                   image_files_by_q)
+        # OPTION-LEVEL ownership (run-10): inside a QUESTION block, an image
+        # that geometrically belongs to an option label row is assigned to
+        # THAT option (deterministic; Gemini never overrides). Only computed
+        # for question-kind owners; solution blocks are never option-scanned.
+        slot, opt_letter = kind, None
+        if kind == "question":
+            opt_letter = _option_for_image_in_block(
+                pdf_path, file_page, headers, owner, x_img, y_img)
+            if opt_letter is not None:
+                slot = "option"
+        new_rel = _rename_for_slot(rel, qn, slot, subject, chapter_no,
+                                   image_files_by_q, option_letter=opt_letter)
         if new_rel:
-            image_files_by_q.setdefault(qn, {"question": [], "solution": []})[kind].append(new_rel)
+            entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+            entry.setdefault("option", {})
+            if slot == "option":
+                entry["option"].setdefault(opt_letter, []).append(new_rel)
+            else:
+                entry[slot].append(new_rel)
             qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
             src = "active-block carry" if (owner is active_block) else "block position"
-            print(f"  [IMG] page {file_page}: {src} -> {rel} -> {qid} ({kind})")
+            if slot == "option":
+                print(f"  [IMG] page {file_page}: {src} -> {rel} -> {qid} option {opt_letter}")
+            else:
+                print(f"  [IMG] page {file_page}: {src} -> {rel} -> {qid} ({kind})")
         else:
             leftover.append(rel)
     return leftover
@@ -3670,7 +3803,7 @@ def _order_imgs_by_position(imgs, pos):
             oid = int(Path(rel).stem.rsplit("-", 1)[-1])
         except (ValueError, IndexError):
             oid = None
-        y, didx = pos.get(oid, (None, 10**6))
+        y, _x, didx = pos.get(oid, (None, None, 10**6))
         return (-(y if y is not None else float("-inf")), didx)
     return sorted(imgs, key=order_key)
 
@@ -4533,7 +4666,13 @@ def final_q_to_record(q):
         "_prov": {},   # provenance resets on re-import; new merges re-tag
     }
     owned = {"question": [i["file"] for i in q["question"]["images"]],
-             "solution": [i["file"] for i in q["solution"]["images"]]}
+             "solution": [i["file"] for i in q["solution"]["images"]],
+             "option": {}}
+    for o in q.get("options") or []:
+        oid = str(o.get("id") or "").strip().upper()
+        oimgs = [i["file"] for i in o.get("images") or []]
+        if oid and oimgs:
+            owned["option"][oid] = oimgs
     return rec, owned
 
 RECITATION_RECOVERY_CONTEXT = (

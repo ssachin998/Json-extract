@@ -475,6 +475,58 @@ implemented:
 
 ---
 
+### 4.24 Changelog — 2026-08-04 (option-level image ownership, run-10)
+
+Investigation (user asked: "do images that belong to MCQ options A/B/C/D get
+preserved correctly?"). Finding:
+
+- The output schema ALREADY had `options[].images` (per-option array) and
+  `IMG_PATH_RE` already permitted `_OPT_A_01.webp` names -- but nothing ever
+  populated them. `build_final_question` hardcoded `"images": []`.
+- After run-9's geometry-first claimer, an image under option A was claimed
+  by Q5's QUESTION block -> `Q5.question_images = [IMG A..D]`. Option-level
+  association was LOST even though question ownership was correct.
+
+Fix (deterministic, no new Gemini calls):
+
+1. `image_positions_on_page` now returns `(y, x, draw_idx)` -- x was added
+   for horizontal / 2x2 option rows (all 3 call sites updated).
+2. `_page_word_lines` -- shared pypdf text-visitor word collector (no
+   pdftotext); refactored `question_headers_on_page` and
+   `solution_headers_on_page` onto it.
+3. `option_anchors_in_block` -- option labels ("A." etc.) INSIDE a question
+   block's vertical extent only (never in solution prose / tables / bullets).
+   Detects line-start labels AND embedded word-start labels (horizontal rows)
+   AND standalone label words.
+4. `_assign_option` -- conservative geometry: an image belongs to the closest
+   option-label row ABOVE it; a single-anchor row -> that option (vertical);
+   a multi-anchor row -> nearest by x, only when unambiguous (margin
+   `_OPTION_X_MARGIN`); a shared/equidistant figure or one above all rows ->
+   stays QUESTION-LEVEL (never guessed, never dropped).
+5. `claim_block_images` -- for question-kind owners, computes the block
+   extent, finds option anchors, and assigns to `option` bucket
+   (`image_files_by_q[qn]["option"][letter]`); `_rename_for_slot` gained
+   kind="option" (`{QID}_OPT_{L}_{NN}.webp`). Solution blocks are NEVER
+   option-scanned (an "Option A:" line in solution prose can't steal a
+   figure).
+6. `build_final_question` fills `options[].images`; `final_q_to_record`
+   round-trips them (recovery preserves option ownership).
+7. Gemini still runs only on leftovers and can never override a
+   deterministic option assignment.
+
+Edge cases verified by tests: normal stem image -> question-level; image
+under option A -> option A; 4 vertical option images -> A/B/C/D; 2x2
+horizontal -> correct via x+y; two images in one option -> both preserved;
+image between stem and option A -> question-level; solution image with
+"Option A:" prose -> solution image; shared/ambiguous figure -> question-
+level (unresolved, not dropped); Gemini disagreement can't override;
+JSON round-trip preserves option images; schema backward compatible
+(options still have id/text, question images unchanged).
+
+Tests: `OptionImageOwnershipTests` (13 cases). 82 total, all green.
+
+---
+
 ### 4.23 Changelog — 2026-08-04 (geometry-first image ownership, run-9)
 
 User evidence: the SAME extracted figure (PSY-p4-7.webp) was mapped to

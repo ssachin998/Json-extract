@@ -15,7 +15,10 @@ def _write_test_pdf(path, texts, images, img_size=(20, 10)):
     objects = {}
     stream_parts = []
     for i, (t, x, y, sz) in enumerate(texts):
-        stream_parts.append(f"BT /F1 {sz} Tf {x} {y} Td ({t}) Tj ET".encode("latin-1"))
+        # leading "0 0 Td" resets the text line matrix: pypdf's visitor
+        # reports tm=(0,0) for a second run on the SAME baseline without it
+        # (needed for horizontal/2x2 option rows in the tests)
+        stream_parts.append(f"BT 0 0 Td /F1 {sz} Tf {x} {y} Td ({t}) Tj ET".encode("latin-1"))
     w, h = img_size
     img_data = zlib.compress(b"\xff\x00\x00" * (w * h))
     xobjs = {}
@@ -965,6 +968,229 @@ class GeometryFirstImageTests(unittest.TestCase):
             {1: {}, 2: {}}, owned)
         self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
         self.assertNotIn(2, owned)
+
+
+class OptionImageOwnershipTests(unittest.TestCase):
+    """Run-10: OPTION-LEVEL image ownership. An image geometrically inside an
+    option label's block (vertical) or on a horizontal/2x2 option row is
+    assigned to THAT option deterministically; everything else stays at
+    question level. Never guessed, never dropped, Gemini never overrides."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets = qp.ASSETS_DIR
+        qp.ASSETS_DIR = self.tmp / "assets"
+        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
+        self.subj_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR = self._old_assets
+
+    def _rels(self, oids, page=1):
+        rels = []
+        for oid in oids:
+            fname = f"PSY-p{page}-{oid}.webp"
+            (self.subj_dir / fname).write_bytes(b"x" * 3000)
+            rels.append(f"PSY/{fname}")
+        return rels
+
+    def _claim(self, pdf, oids, recs, page=1, active_block=None):
+        owned = {}
+        leftover = qp.claim_page_images(self._rels(oids, page), pdf, page,
+                                        "PSY", 1, recs, owned,
+                                        active_block=active_block)
+        return leftover, owned
+
+    # -- 1. normal question image (no option labels) -> question-level -----
+    def test_normal_question_image_stays_question_level(self):
+        pdf = self.tmp / "q1_no_opts.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Which diagnosis is shown?", 72, 700, 12),
+        ], [(6, "Im6", 300, 620)])
+        leftover, owned = self._claim(pdf, [6], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertEqual(owned[1].get("option", {}), {})
+
+    # -- 2. image under option A -> option A -------------------------------
+    def test_image_under_option_a_maps_to_option_a(self):
+        pdf = self.tmp / "opt_a.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 700, 12),
+            ("A. text", 72, 650, 10),
+            ("B. text", 72, 550, 10),
+        ], [(6, "Im6", 300, 620)])
+        leftover, owned = self._claim(pdf, [6], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["option"]["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
+        self.assertEqual(owned[1]["question"], [])
+
+    # -- 3. four vertical option images -> A/B/C/D -------------------------
+    def test_four_vertical_option_images_map_correctly(self):
+        pdf = self.tmp / "opt_abcd.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 720, 12),
+            ("A. text", 72, 650, 10), ("B. text", 72, 550, 10),
+            ("C. text", 72, 450, 10), ("D. text", 72, 350, 10),
+        ], [(6, "Im6", 300, 620), (7, "Im7", 300, 520),
+            (8, "Im8", 300, 420), (9, "Im9", 300, 320)])
+        leftover, owned = self._claim(pdf, [6, 7, 8, 9], {1: {}})
+        self.assertEqual(leftover, [])
+        opt = owned[1]["option"]
+        self.assertEqual(opt["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
+        self.assertEqual(opt["B"], ["PSY/PSY-001-001_OPT_B_01.webp"])
+        self.assertEqual(opt["C"], ["PSY/PSY-001-001_OPT_C_01.webp"])
+        self.assertEqual(opt["D"], ["PSY/PSY-001-001_OPT_D_01.webp"])
+        self.assertEqual(owned[1]["question"], [])
+
+    # -- 4. horizontal / 2x2 image options -> correct via x+y geometry -----
+    def test_2x2_horizontal_option_images_map_by_xy(self):
+        pdf = self.tmp / "opt_2x2.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 720, 12),
+            ("A. text", 72, 650, 10), ("B. text", 350, 650, 10),
+            ("C. text", 72, 550, 10), ("D. text", 350, 550, 10),
+        ], [(6, "Im6", 200, 620), (7, "Im7", 420, 620),
+            (8, "Im8", 200, 520), (9, "Im9", 420, 520)])
+        leftover, owned = self._claim(pdf, [6, 7, 8, 9], {1: {}})
+        self.assertEqual(leftover, [])
+        opt = owned[1]["option"]
+        self.assertEqual(opt["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
+        self.assertEqual(opt["B"], ["PSY/PSY-001-001_OPT_B_01.webp"])
+        self.assertEqual(opt["C"], ["PSY/PSY-001-001_OPT_C_01.webp"])
+        self.assertEqual(opt["D"], ["PSY/PSY-001-001_OPT_D_01.webp"])
+
+    # -- 5. two images in the same option -> both preserved ----------------
+    def test_two_images_in_same_option_both_preserved(self):
+        pdf = self.tmp / "opt_two.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 700, 12),
+            ("A. text", 72, 650, 10), ("B. text", 72, 550, 10),
+        ], [(6, "Im6", 300, 620), (7, "Im7", 300, 590)])
+        leftover, owned = self._claim(pdf, [6, 7], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(len(owned[1]["option"]["A"]), 2)
+
+    # -- 6. image between stem and option A -> question-level ---------------
+    def test_image_before_option_a_stays_question_level(self):
+        pdf = self.tmp / "stem_img.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 700, 12),
+            ("A. text", 72, 650, 10),
+        ], [(6, "Im6", 300, 670)])   # above A's label
+        leftover, owned = self._claim(pdf, [6], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertEqual(owned[1].get("option", {}), {})
+
+    # -- 7. solution image with "Option A:" prose -> solution image ---------
+    def test_solution_image_with_option_prose_stays_solution(self):
+        pdf = self.tmp / "sol_opt.pdf"
+        _write_test_pdf(pdf, [
+            ("Solution to Question 5:", 72, 700, 12),
+            ("Option A: the correct answer because", 72, 650, 10),
+        ], [(6, "Im6", 300, 600)])
+        leftover, owned = self._claim(pdf, [6], {5: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[5]["solution"], ["PSY/PSY-001-005_SOL_01.webp"])
+        self.assertEqual(owned[5].get("option", {}), {})
+
+    # -- 8. ambiguous option ownership (shared figure) -> question-level ----
+    def test_shared_figure_ambiguous_stays_question_level(self):
+        pdf = self.tmp / "shared.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 700, 12),
+            ("A. text", 72, 650, 10), ("B. text", 350, 650, 10),
+        ], [(6, "Im6", 211, 620)])   # x = midpoint(72, 350) -> equidistant
+        leftover, owned = self._claim(pdf, [6], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertEqual(owned[1].get("option", {}), {})
+
+    # -- 9. Gemini figure-map cannot override deterministic option ownership
+    def test_gemini_cannot_override_option_ownership(self):
+        pdf = self.tmp / "nooverride.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 700, 12),
+            ("A. text", 72, 650, 10), ("B. text", 72, 550, 10),
+        ], [(6, "Im6", 300, 620)])
+        rels = self._rels([6])
+        owned = {}
+        leftover = qp.claim_page_images(rels, pdf, 1, "PSY", 1, {1: {}}, owned)
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["option"]["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
+        # a contradictory figure-map runs on leftovers only (here: none) and
+        # cannot move the already-claimed image
+        qp.claim_figure_map_images([{"q_no": 1, "slot": "question"}], [(1, [])],
+                                   "PSY", 1, {1: {}}, owned)
+        self.assertEqual(owned[1]["option"]["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
+        self.assertEqual(owned[1]["question"], [])
+
+    # -- 10. JSON round-trip preserves option images ------------------------
+    def test_json_round_trip_preserves_option_images(self):
+        pdf = self.tmp / "rt.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 700, 12),
+            ("A. text", 72, 650, 10), ("B. text", 72, 550, 10),
+        ], [(6, "Im6", 300, 620), (7, "Im7", 300, 520)])
+        owned = {}
+        leftover = qp.claim_page_images(self._rels([6, 7]), pdf, 1, "PSY", 1,
+                                        {1: {}}, owned)
+        self.assertEqual(leftover, [])
+        rec = {"q_no": 1, "question_text": "Identify the structure",
+               "options": {"A": "text", "B": "text"}, "correct_option": "A",
+               "solution_text": "sol", "tables": [], "_prov": {}}
+        final = qp.build_final_question("PSY", "PSY-001", 1, 1, rec, owned[1])
+        opt_by_id = {o["id"]: o for o in final["options"]}
+        self.assertEqual([i["file"] for i in opt_by_id["A"]["images"]],
+                         ["PSY/PSY-001-001_OPT_A_01.webp"])
+        self.assertEqual([i["file"] for i in opt_by_id["B"]["images"]],
+                         ["PSY/PSY-001-001_OPT_B_01.webp"])
+        # round-trip through final_q_to_record preserves option ownership
+        rec2, owned2 = qp.final_q_to_record(final)
+        self.assertEqual(owned2["option"]["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
+        self.assertEqual(owned2["option"]["B"], ["PSY/PSY-001-001_OPT_B_01.webp"])
+        # schema backward compatible: options still have id/text, question
+        # images still on question
+        self.assertEqual([o["id"] for o in final["options"]], ["A", "B"])
+        self.assertEqual(final["question"]["images"], [])
+
+    # -- 11. block-level tests still green (option logic doesn't disturb) ---
+    def test_solution_block_geometry_unchanged(self):
+        pdf = self.tmp / "sol_only.pdf"
+        _write_test_pdf(pdf, [
+            ("Solution to Question 3:", 72, 700, 12),
+        ], [(6, "Im6", 300, 600)])
+        leftover, owned = self._claim(pdf, [6], {3: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[3]["solution"], ["PSY/PSY-001-003_SOL_01.webp"])
+
+    # -- 12. horizontal row, stem figure ABOVE the option row -> question --
+    def test_horizontal_stem_figure_above_row_stays_question_level(self):
+        pdf = self.tmp / "hstem.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 720, 12),
+            ("A. text", 72, 650, 10), ("B. text", 350, 650, 10),
+        ], [(6, "Im6", 200, 700)])   # above the option row
+        leftover, owned = self._claim(pdf, [6], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertEqual(owned[1].get("option", {}), {})
+
+    # -- 13. horizontal 4-across tight row -> ambiguous -> question-level ---
+    def test_tight_4across_ambiguous_stays_question_level(self):
+        pdf = self.tmp / "tight4.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Identify the structure", 72, 720, 12),
+            ("A. text", 72, 650, 10), ("B. text", 220, 650, 10),
+            ("C. text", 370, 650, 10), ("D. text", 520, 650, 10),
+        ], [(6, "Im6", 150, 620)])   # ~midway between A and B
+        leftover, owned = self._claim(pdf, [6], {1: {}})
+        self.assertEqual(leftover, [])
+        # geometry cannot safely prove which option -> question-level, never
+        # guessed and never dropped
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertEqual(owned[1].get("option", {}), {})
 
 
 class ValidatorContaminationTests(unittest.TestCase):

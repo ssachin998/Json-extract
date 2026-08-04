@@ -367,6 +367,23 @@ on disk for review; only strong deterministic evidence (watermark object id,
 already excluded at extraction) may permanently classify decorative.
 
 --------------------------------------------------------------------------------
+## 9. Run-10 audit — option-level image ownership (2026-08-04)
+
+### A10-1 — Option-associated images collapsed into question-level **[PROVEN]**
+`build_final_question` shipped `options[].images = []` (hardcoded) even
+though the schema and the `_OPT_{L}_NN.webp` filename convention already
+existed; run-9's block claimer put every image inside Q5's question block
+into `Q5.question_images = [A,B,C,D]`. Option ownership was lost at
+build time.
+**Fix:** `option_anchors_in_block` (question-block-restricted label anchors
+via the pypdf visitor) + `_assign_option` (closest label row above; x-geometry
+for horizontal/2x2 rows, unambiguous only) wired into `claim_block_images`;
+`image_files_by_q[qn]["option"]` bucket + `_rename_for_slot` kind="option";
+`build_final_question` populates `options[].images`; `final_q_to_record`
+round-trips. Ambiguous figures stay question-level (never guessed, never
+dropped); solution blocks are never option-scanned.
+
+--------------------------------------------------------------------------------
 ## 5. Run-5 audit — solutions-page figure mapping (2026-08-02)
 
 ### A5-1 — Whole solutions page dumped onto ONE decoded header (user report:
