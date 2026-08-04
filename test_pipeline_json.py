@@ -8,7 +8,7 @@ import qbank_pipeline as qp
 from qbank_pipeline import _dedupe_tables, _normalize_solution_payload, looks_truncated_solution, parse_gemini_json_array
 
 
-def _write_test_pdf(path, texts, images):
+def _write_test_pdf(path, texts, images, img_size=(20, 10)):
     """Build a tiny single-page PDF (612x792) with Helvetica text at
     (x, y) -- y in PDF user space, origin bottom-left -- and one red image
     XObject per (obj_num, name, x, y). Pure-python; no poppler needed."""
@@ -16,7 +16,7 @@ def _write_test_pdf(path, texts, images):
     stream_parts = []
     for i, (t, x, y, sz) in enumerate(texts):
         stream_parts.append(f"BT /F1 {sz} Tf {x} {y} Td ({t}) Tj ET".encode("latin-1"))
-    w, h = 20, 10
+    w, h = img_size
     img_data = zlib.compress(b"\xff\x00\x00" * (w * h))
     xobjs = {}
     for obj_num, name, x, y in images:
@@ -801,6 +801,170 @@ class ContinuationOwnershipTests(unittest.TestCase):
         self.assertEqual(recs[2]["question_text"], "The real stem stays intact")
         self.assertIn("full correct explanation", recs[2]["solution_text"])
         self.assertEqual(recs[2]["solution_text"].count("because:"), 1)
+
+
+class GeometryFirstImageTests(unittest.TestCase):
+    """Run-9: image ownership is DETERMINISTIC-FIRST -- every image belongs
+    to the closest question/solution heading ABOVE it (real PDF y positions),
+    or the carried active block for cross-page continuations. Gemini never
+    overrides a deterministic assignment, and a single 'decorative' verdict
+    never discards an image (it goes to unresolved_images.jsonl)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets = qp.ASSETS_DIR
+        qp.ASSETS_DIR = self.tmp / "assets"
+        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
+        self.subj_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR = self._old_assets
+
+    def _rels(self, oids, page=1):
+        rels = []
+        for oid in oids:
+            fname = f"PSY-p{page}-{oid}.webp"
+            (self.subj_dir / fname).write_bytes(b"x" * 3000)
+            rels.append(f"PSY/{fname}")
+        return rels
+
+    def _claim(self, pdf, oids, recs, page=1, active_block=None):
+        owned = {}
+        leftover = qp.claim_page_images(self._rels(oids, page), pdf, page,
+                                        "PSY", 1, recs, owned,
+                                        active_block=active_block)
+        return leftover, owned
+
+    # -- 1. image inside Q1 question block -> Q1 question image ------------
+    def test_image_inside_question_block_maps_to_that_question(self):
+        pdf = self.tmp / "q1_block.pdf"
+        _write_test_pdf(pdf, [
+            ("1. Which defence mechanism is being used?", 72, 700, 12),
+            ("Option A: text", 72, 660, 10),
+        ], [(6, "Im6", 300, 600)])
+        leftover, owned = self._claim(pdf, [6], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+
+    # -- 2. image inside Q6 solution block -> Q6 solution image ------------
+    def test_image_inside_solution_block_maps_to_that_solution(self):
+        pdf = self.tmp / "q6_sol.pdf"
+        _write_test_pdf(pdf, [
+            ("Solution to Question 6:", 72, 700, 12),
+            ("The answer is B because:", 72, 660, 10),
+        ], [(6, "Im6", 300, 600)])
+        leftover, owned = self._claim(pdf, [6], {6: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[6]["solution"], ["PSY/PSY-001-006_SOL_01.webp"])
+
+    # -- 3. image after Q1 heading but before Q2 heading -> Q1 -------------
+    def test_image_between_two_question_headings_belongs_to_first(self):
+        pdf = self.tmp / "q1_q2.pdf"
+        _write_test_pdf(pdf, [
+            ("1. First question stem", 72, 700, 12),
+            ("2. Second question stem", 72, 400, 12),
+        ], [(6, "Im6", 300, 550)])
+        leftover, owned = self._claim(pdf, [6], {1: {}, 2: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertNotIn(2, owned)
+
+    # -- 4. multiple figures inside same block -> all stay with that owner --
+    def test_multiple_figures_in_one_block_stay_with_owner(self):
+        pdf = self.tmp / "multi_fig.pdf"
+        _write_test_pdf(pdf, [
+            ("1. First question stem", 72, 700, 12),
+        ], [(6, "Im6", 300, 600), (7, "Im7", 300, 500)])
+        leftover, owned = self._claim(pdf, [6, 7], {1: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(len(owned[1]["question"]), 2)
+
+    # -- 5. multiple questions/images on same page -> each by position ------
+    def test_multiple_questions_each_image_maps_by_position(self):
+        pdf = self.tmp / "two_q_two_img.pdf"
+        _write_test_pdf(pdf, [
+            ("1. First question stem", 72, 700, 12),
+            ("2. Second question stem", 72, 400, 12),
+        ], [(6, "Im6", 300, 600), (7, "Im7", 300, 300)])
+        leftover, owned = self._claim(pdf, [6, 7], {1: {}, 2: {}})
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertEqual(owned[2]["question"], ["PSY/PSY-001-002_Q_01.webp"])
+
+    # -- 6. cross-page continuation image -> carried owner -----------------
+    def test_cross_page_continuation_image_uses_carried_owner(self):
+        # the new page's image has NO heading above it (block started on the
+        # previous page) -> active_block (q6 solution) owns it
+        pdf = self.tmp / "carry.pdf"
+        _write_test_pdf(pdf, [
+            ("text continues from previous page", 72, 600, 10),
+        ], [(6, "Im6", 300, 700)])
+        leftover, owned = self._claim(pdf, [6], {6: {}}, page=1,
+                                      active_block=("solution", 6))
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[6]["solution"], ["PSY/PSY-001-006_SOL_01.webp"])
+
+    def test_cross_page_without_carry_stays_unclaimed(self):
+        pdf = self.tmp / "nocarry.pdf"
+        _write_test_pdf(pdf, [
+            ("text continues from previous page", 72, 600, 10),
+        ], [(6, "Im6", 300, 700)])
+        leftover, _ = self._claim(pdf, [6], {6: {}}, page=1, active_block=None)
+        self.assertEqual(leftover, ["PSY/PSY-p1-6.webp"])
+
+    # -- 7. genuine watermark -> excluded at extraction (deterministic) -----
+    def test_watermark_object_excluded_at_extraction(self):
+        pdf = self.tmp / "wm.pdf"
+        # images must be > 5000 px or extract_real_images drops them as noise
+        _write_test_pdf(pdf, [
+            ("1. Question stem", 72, 700, 12),
+        ], [(6, "Im6", 300, 600), (7, "Im7", 300, 300)], img_size=(90, 90))
+        # watermark_id = obj 6 -> only obj 7 survives extraction
+        saved = qp.extract_real_images(pdf, 1, 6, "PSY", self.subj_dir)
+        self.assertEqual(saved, ["PSY/PSY-p1-7.webp"])
+
+    # -- 8. ambiguous image -> unresolved, NOT decorative -------------------
+    def test_ambiguous_image_recorded_as_unresolved_not_decorative(self):
+        tmp = Path(tempfile.mkdtemp())
+        old_data = qp.DATA_DIR
+        qp.DATA_DIR = tmp / "data"
+        try:
+            qp._record_unresolved_image("PSY", "PSY-001", 4, "PSY/PSY-p4-7.webp",
+                                        "model-declared decorative",
+                                        model_verdict={"decorative": True})
+            unresolved = qp.DATA_DIR / "unresolved_images.jsonl"
+            decorative = qp.DATA_DIR / "decorative_images.jsonl"
+            self.assertTrue(unresolved.exists())
+            entry = json.loads(unresolved.read_text().splitlines()[0])
+            self.assertEqual(entry["file"], "PSY/PSY-p4-7.webp")
+            self.assertEqual(entry["model_verdict"], {"decorative": True})
+            self.assertFalse(decorative.exists())   # NOT permanently discarded
+        finally:
+            qp.DATA_DIR = old_data
+
+    # -- 9. Gemini disagreement must NOT override deterministic ownership ---
+    def test_gemini_figure_map_cannot_override_geometry(self):
+        # image is inside Q1's block (geometry claims it first); a Gemini
+        # figure-map that would say Q2 runs on the LEFTOVERS only and cannot
+        # move it
+        pdf = self.tmp / "override.pdf"
+        _write_test_pdf(pdf, [
+            ("1. First question stem", 72, 700, 12),
+        ], [(6, "Im6", 300, 600)])
+        rels = self._rels([6])
+        owned = {}
+        # geometry-first: image claimed by Q1's block
+        leftover = qp.claim_page_images(rels, pdf, 1, "PSY", 1, {1: {}, 2: {}},
+                                        owned, active_block=None)
+        self.assertEqual(leftover, [])
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        # the figure-map runs on the (empty) leftovers: even a contradictory
+        # map cannot re-claim the already-owned image
+        remaining = qp.claim_figure_map_images(
+            [{"q_no": 2, "slot": "question"}], [(1, [])], "PSY", 1,
+            {1: {}, 2: {}}, owned)
+        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
+        self.assertNotIn(2, owned)
 
 
 class ValidatorContaminationTests(unittest.TestCase):

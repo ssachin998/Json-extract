@@ -1779,6 +1779,69 @@ def build_section_windows(page_files, pdf_path):
     return windows
 
 
+def question_headers_on_page(pdf_path, file_page, chapter_records):
+    """Locate every printed question-stem heading ("1.", "1)", "Q1." etc.) on
+    a page WITH its vertical position. Returns [(q_no, y_baseline)] in
+    reading order (top of page first), same bottom-left coordinate space as
+    image_positions_on_page.
+
+    The run-9 fix for the page-4 class: the OLD question-side path
+    (qns_printed_on_page) used the pdftotext CLI, whose body-page text is
+    GARBLED on this book -- so it returned nothing and the figure fell to the
+    unreliable 4th-pass Gemini "decorative" verdict. This uses pypdf's text
+    visitor (the SAME tool the solution-header mapper uses successfully on
+    page 33), so question-side figures get the same deterministic geometry
+    treatment as solution-side ones."""
+    try:
+        page = PdfReader(pdf_path).pages[file_page - 1]
+    except Exception:
+        return []
+    words = []
+
+    def _visitor(text, _cm, tm, _font_dict, _font_size):
+        t = (text or "").strip()
+        if t:
+            words.append((round(float(tm[5]), 1), round(float(tm[4]), 1), t))
+
+    try:
+        page.extract_text(visitor_text=_visitor)
+    except Exception:
+        return []
+    if not words:
+        return []
+    lines = {}
+    for y, x, t in words:
+        lines.setdefault(y, []).append((x, t))
+    headers, seen = [], set()
+    for y in sorted(lines, reverse=True):
+        line = " ".join(t for _, t in sorted(lines[y]))
+        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", line)
+        if not m:
+            continue
+        qn = int(m.group(1))
+        if qn in chapter_records and qn not in seen \
+                and not re.match(r"^\s*Solution\s+to\s+Question", line, re.I):
+            seen.add(qn)
+            headers.append((qn, y))
+    return headers
+
+
+def block_headers_on_page(pdf_path, file_page, chapter_records):
+    """Every block-start heading on a page: [(kind, q_no, y_baseline)] in
+    reading order (top first), kind in {"question", "solution"}. Question
+    headings that sit BELOW the first solution header on the page are
+    dropped: once the solutions section begins, a "1." line is a list item
+    inside solution prose, not a question stem."""
+    qs = [("question", qn, y)
+          for qn, y in question_headers_on_page(pdf_path, file_page, chapter_records)]
+    ss = [("solution", qn, y)
+          for qn, y in solution_headers_on_page(pdf_path, file_page, chapter_records)]
+    if ss:
+        first_sol_y = min(y for _k, _q, y in ss)   # lowest solution header
+        qs = [t for t in qs if t[2] > first_sol_y]
+    return sorted(qs + ss, key=lambda t: -t[2])
+
+
 def solution_headers_on_page(pdf_path, file_page, chapter_records):
     """Locate every printed "Solution to Question N:" header on a page WITH
     its vertical position. Returns [(q_no, y_baseline)] in reading order
@@ -3510,44 +3573,45 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
     return leftover
 
 
-def claim_solution_page_images(imgs, pdf_path, file_page, subject, chapter_no,
-                               chapter_records, image_files_by_q):
-    """Deterministic owner for figures printed inside solution blocks.
+def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
+                       chapter_records, image_files_by_q, active_block=None):
+    """GEOMETRY-FIRST deterministic owner for figures inside question OR
+    solution blocks (run-9, generalized from the solution-only mapper).
 
-    Every image on a solutions page belongs to the block it is DRAWN UNDER:
-    the last "Solution to Question N:" header whose baseline sits above the
-    image's bottom edge. Images and headers are matched by real PDF y
-    positions (same coordinate space), never by count or by a single
-    text-layer hit.
+    Every image belongs to the block it is DRAWN UNDER: the closest
+    "question-stem heading" OR "Solution to Question N:" header whose
+    baseline sits above the image's bottom edge. Images and headers are
+    matched by real PDF y positions (same coordinate space as
+    image_positions_on_page), never by count or a single text-layer hit.
 
-    This replaces the old shortcut that attached EVERY image of a page to the
-    ONE solution header the text layer happened to decode -- the exact bug
-    behind the user report of a 7-figure solutions page collapsing into just
-    2 solutions (the text layer of scanned books decodes headers
-    sporadically, and a single decoded header was treated as "the page's
-    owner").
+    This is the page-4 class fix: the old QUESTION-side path needed the
+    (garbled) pdftotext CLI + Gemini's has_figure flag, so page 4's figure
+    fell to a single Gemini "decorative" verdict and was discarded. Here the
+    SAME deterministic positional system that maps solution figures (page 33
+    -> PSY-002-014) is extended to question-side figures.
 
-    Safety rules (each returns the image unclaimed rather than guessing):
-      * no locatable header on the page -> claim NOTHING;
+    active_block: (q_no, kind) for the block still open from the PREVIOUS
+    window (cross-page carry, run-9 priority C). An image with NO heading
+    above it on this page (the block started on the previous page) is
+    assigned to the carried block instead of being left unclaimed.
+
+    Priority implemented (run-9 #5): A/B. strong same-page block ownership
+    (closest heading above) -> C. cross-page carry (active_block) -> else
+    unclaimed (never guessed). Gemini never overrides this: it runs only on
+    the leftovers via claim_figure_map_images / the 4th pass.
+
+    Safety (each returns the image unclaimed rather than guessing):
+      * no locatable header AND no active_block -> claim NOTHING;
       * image position unparsable -> claim NOTHING;
-      * image with no header ABOVE it (block started on the previous page,
-        figure-above-header layout) -> claim NOTHING;
-      * MAX_SOLUTION_IMAGES per solution (enforced in _rename_for_slot): the
-        first figures under a header are kept, extras flow to the model/
-        manual pass instead of stacking a whole page on one solution.
+      * MAX_QUESTION_IMAGES / MAX_SOLUTION_IMAGES per owner (enforced in
+        _rename_for_slot): extras flow to the model/manual passes.
     Returns the files STILL unclaimed."""
-    headers = solution_headers_on_page(pdf_path, file_page, chapter_records)
-    if not headers:
-        # No locatable header -- a question page, or a scanned solutions page
-        # whose text layer cannot be read. Claim NOTHING by position (a
-        # whole-page dump is exactly the bug being fixed); the leftovers flow
-        # to the one-to-one matcher and the model/manual passes, which is the
-        # same safe path the pipeline used before header binding existed.
-        return list(imgs)
+    headers = block_headers_on_page(pdf_path, file_page, chapter_records)
     pos = image_positions_on_page(pdf_path, file_page)
-    if not pos:
-        print(f"  [IMG] page {file_page}: image positions unparsable -- solution "
-              f"figures left for model/manual attribution (no positional auto-claim)")
+    if (not headers and active_block is None) or not pos:
+        # No block evidence (or unparsable positions) -> claim NOTHING by
+        # geometry; the leftovers flow to the one-to-one matcher and the
+        # model/manual passes (the same safe path as before header binding).
         return list(imgs)
     leftover = []
     for rel in imgs:
@@ -3561,24 +3625,39 @@ def claim_solution_page_images(imgs, pdf_path, file_page, subject, chapter_no,
             leftover.append(rel)
             continue
         y_img, _didx = info[0], info[1]
-        # The owner is the CLOSEST header drawn above the image, i.e. the
-        # last one in reading order whose baseline still sits above the
-        # image's bottom edge. Iterate headers bottom-first and take the
-        # first hit -- taking the topmost header above the image instead
-        # would hand every figure on the page to the first solution block.
-        owner = next((qn for qn, y_hdr in reversed(headers) if y_hdr > y_img), None)
+        # Closest header drawn ABOVE the image: iterate bottom-first, take
+        # the first hit (the topmost header above would hand every figure on
+        # the page to the first block).
+        owner = next(((kind, qn) for kind, qn, y_hdr in reversed(headers)
+                      if y_hdr > y_img), None)
         if owner is None:
-            leftover.append(rel)   # no block starts above this figure
+            if active_block is not None:
+                owner = active_block          # cross-page carry (priority C)
+            else:
+                leftover.append(rel)          # no block starts above -> unclaimed
+                continue
+        kind, qn = owner
+        if qn not in chapter_records:
+            leftover.append(rel)
             continue
-        new_rel = _rename_for_slot(rel, owner, "solution", subject, chapter_no,
+        new_rel = _rename_for_slot(rel, qn, kind, subject, chapter_no,
                                    image_files_by_q)
         if new_rel:
-            image_files_by_q.setdefault(owner, {"question": [], "solution": []})["solution"].append(new_rel)
-            qid = f"{subject}-{chapter_no:03d}-{owner:03d}"
-            print(f"  [IMG] page {file_page}: solution-block position -> {rel} -> {qid} (solution)")
+            image_files_by_q.setdefault(qn, {"question": [], "solution": []})[kind].append(new_rel)
+            qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
+            src = "active-block carry" if (owner is active_block) else "block position"
+            print(f"  [IMG] page {file_page}: {src} -> {rel} -> {qid} ({kind})")
         else:
             leftover.append(rel)
     return leftover
+
+
+def claim_solution_page_images(imgs, pdf_path, file_page, subject, chapter_no,
+                               chapter_records, image_files_by_q):
+    """Compatibility wrapper: solution-block-only geometry claim (the pre-9
+    behavior). New callers should use claim_block_images."""
+    return claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
+                              chapter_records, image_files_by_q, active_block=None)
 
 
 def _order_imgs_by_position(imgs, pos):
@@ -3656,21 +3735,27 @@ def claim_figure_map_images(fig_map, window_rows, subject, chapter_no,
 
 
 def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
-                      chapter_records, image_files_by_q):
-    """Two-stage deterministic claimer for one page's images:
+                      chapter_records, image_files_by_q, active_block=None):
+    """Deterministic claimer for one page's images (run-9 geometry-first):
 
-      1. solution-header mapping -- every image drawn under a printed
-         "Solution to Question N:" header goes to THAT solution (position
-         evidence; see claim_solution_page_images). This fixes the
-         whole-page-dump: a single decoded header no longer swallows every
-         figure of a multi-solution page.
+      1. block-header mapping -- every image drawn under a question-stem
+         heading OR a "Solution to Question N:" header goes to THAT block's
+         owner (closest header above the image; cross-page carry via
+         active_block). This is the SAME deterministic positional system that
+         maps solution figures, now extended to question-side figures (the
+         page-4 class fix).
       2. leftovers fall to the one-to-one matcher (exactly one printed q_no +
          exactly one needy slot, else nothing is claimed).
 
+    Gemini never overrides a deterministic assignment: it runs only on the
+    leftovers (claim_figure_map_images in the window loop, and the 4th pass
+    at chapter end -- which is now conservative, see _record_unresolved_image).
+
     Returns the files STILL unclaimed (they reach the second pass / model
     attribution / manual review)."""
-    leftover = claim_solution_page_images(imgs, pdf_path, file_page, subject,
-                                          chapter_no, chapter_records, image_files_by_q)
+    leftover = claim_block_images(imgs, pdf_path, file_page, subject,
+                                  chapter_no, chapter_records, image_files_by_q,
+                                  active_block=active_block)
     if leftover:
         leftover = claim_page_images_one_to_one(leftover, pdf_path, file_page,
                                                 subject, chapter_no, chapter_records,
@@ -3678,10 +3763,46 @@ def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
     return leftover
 
 
+def _active_block_from_carries(carry_by_pass):
+    """(kind, q_no) of the block still OPEN from the previous window, or None.
+    Kind derives from the pass + cut_part: an S-pass carry (or a Q-pass carry
+    whose cut was "solution"/"unknown") means the active block is a SOLUTION
+    block; a Q-pass "question"/"options" cut means the active block is a
+    QUESTION block. The (kind, q_no) tuple order matches block_headers_on_page
+    header tuples so claim_block_images can treat it identically. Used as the
+    cross-page carry owner (run-9 priority C) -- an image at the top of a new
+    page with no heading above it belongs to the block that started on the
+    previous page."""
+    for p in ("Q", "S"):
+        c = carry_by_pass.get(p) or {}
+        qn = c.get("last_open_question")
+        if qn is None:
+            continue
+        if p == "S" or c.get("cut_part") in ("solution", "unknown"):
+            return ("solution", qn)
+        return ("question", qn)   # Q-pass cut at question/options
+    return None
+
+
 def _append_jsonl(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _record_unresolved_image(subject, chapter_id, page, rel, reason, model_verdict=None):
+    """Run-9 CONSERVATIVE-DECORATIVE rule: an extracted image with no
+    deterministic owner must NOT be permanently discarded on a single Gemini
+    "decorative" verdict (PSY-p4-7 was called decorative in one run yet
+    belongs to Q1). It is RECORDED to data/unresolved_images.jsonl -- kept on
+    disk under its temp name with the model verdict attached -- for human
+    review. Only STRONG deterministic evidence (watermark object id, which is
+    already excluded at extraction) may permanently classify decorative."""
+    entry = {"subject": subject, "chapter_id": chapter_id, "page": page,
+             "file": rel, "reason": reason}
+    if model_verdict is not None:
+        entry["model_verdict"] = model_verdict
+    _append_jsonl(DATA_DIR / "unresolved_images.jsonl", entry)
 
 def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 only_chapter_no=None):
@@ -3838,6 +3959,10 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                         print(f"  [PREFLIGHT_OCR] {pf.name}: header-routed {n} solution(s); Gemini skipped")
 
             fig_map_by_pass = {}   # this window's _figure_map control objects
+            # Capture the carry state BEFORE this window's passes update it:
+            # the active block for the window's NEW pages is the block that
+            # was open at the END of the PREVIOUS window (cross-page carry).
+            carries_at_window_start = dict(carry_by_pass)
             for pass_name, prompt, active in (
                     ("Q", SCHEMA_PROMPT_Q, do_q),
                     ("A", SCHEMA_PROMPT_A, do_a),
@@ -4017,7 +4142,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             # (e.g. page-005.jpg for real page 5) -- read it directly from
             # the filename, don't recompute it relative to ch["file_start"].
             # First collect every page's images (top-to-bottom order) for the
-            # window, THEN claim: figure-map first, positional after.
+            # window, THEN claim -- GEOMETRY-FIRST (run-9): deterministic
+            # block ownership (question + solution headings, closest header
+            # above each image) + cross-page carry (active_block from the
+            # previous window) runs FIRST on every page; the Gemini figure-map
+            # and the 4th-pass model attribution only run on the LEFTOVERS and
+            # can never override a deterministic assignment.
             window_rows = []
             for pf in batch:
                 file_page_num = int(pf.stem.split("-")[-1])
@@ -4031,31 +4161,38 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 ordered = _order_imgs_by_position(imgs, pos)
                 window_rows.append((file_page_num, ordered))
 
-            # FIGURE-MAP pass (run-6 user ask: "bta ye image kis question ki
-            # h") -- Gemini's own _figure_map declares q_no+slot per figure in
-            # reading order. Claim those first (exact-count guard inside: any
-            # mismatch skips safely). This is what stops images from sitting
-            # "unclaimed": the model that READ the page tells us the owner.
+            # GEOMETRY-FIRST (run-9 priority A/B/C): every image goes to the
+            # closest question/solution heading ABOVE it (or the carried
+            # active block for cross-page continuations). This is the SAME
+            # deterministic system that maps solution figures (page 33 ->
+            # PSY-002-014) now extended to question-side figures -- the
+            # page-4 class fix. Gemini never overrides this.
+            active_block = _active_block_from_carries(carries_at_window_start)
+            leftover_by_page = {}
+            for file_page_num, rels in window_rows:
+                leftover = claim_page_images(rels, pdf_path, file_page_num, subject,
+                                             ch["chapter_no"], chapter_records,
+                                             image_files_by_q, active_block=active_block)
+                leftover_by_page[file_page_num] = leftover
+
+            # FIGURE-MAP pass (run-6 user ask, run-9 priority D): Gemini's
+            # own _figure_map declares q_no+slot per figure in reading order.
+            # Now runs ONLY on what geometry left unclaimed (exact-count guard
+            # inside: a mismatch skips safely) -- it is a fallback, never an
+            # override of deterministic block ownership.
             window_fig_map = fig_map_by_pass.get("Q") or fig_map_by_pass.get("S") or None
-            fig_leftover = claim_figure_map_images(
-                window_fig_map, window_rows, subject, ch["chapter_no"],
-                chapter_records, image_files_by_q)
+            if window_fig_map:
+                remaining_rows = [(p, leftover_by_page[p]) for p, _rels in window_rows
+                                  if leftover_by_page.get(p)]
+                if remaining_rows:
+                    fig_leftover = claim_figure_map_images(
+                        window_fig_map, remaining_rows, subject, ch["chapter_no"],
+                        chapter_records, image_files_by_q)
+                    for page_no, rels in fig_leftover.items():
+                        leftover_by_page[page_no] = rels
 
             for file_page_num, _rels in window_rows:
-                leftover = fig_leftover.get(file_page_num) or []
-                if not leftover:
-                    continue
-                # A figure between "Solution to Question N" and the next
-                # header belongs to THAT solution, not to whichever question
-                # happens to be pending in reading order. Match by POSITION
-                # (each image goes to the header drawn above it), never by a
-                # single text-layer hit: when the text layer decodes only ONE
-                # of several headers, the old shortcut dumped every figure of
-                # the page onto that one solution (user report: 7 figures
-                # collapsed into 2 solutions). Images with no locatable header
-                # above them are left for the later passes.
-                leftover = claim_page_images(leftover, pdf_path, file_page_num, subject,
-                                             ch["chapter_no"], chapter_records, image_files_by_q)
+                leftover = leftover_by_page.get(file_page_num) or []
                 if leftover:
                     unmatched_images.append({"page": file_page_num, "files": leftover})
                     print(f"  [INFO] Page {file_page_num}: image(s) {leftover} unclaimed for now "
@@ -4156,12 +4293,21 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     still.append(rel)   # undecided / call failed -> manual review
                     continue
                 if verdict.get("decorative") is True:
-                    print(f"  [IMG] fourth pass: page {um['page']} {rel} is decorative/unrelated "
-                          f"(model-confirmed) -- logged to decorative_images.jsonl")
-                    _append_jsonl(DATA_DIR / "decorative_images.jsonl",
-                                  {"subject": subject, "chapter_id": chapter_id,
-                                   "page": um["page"], "file": rel,
-                                   "reason": "model-confirmed decorative/unrelated"})
+                    # CONSERVATIVE (run-9): a single Gemini "decorative"
+                    # verdict is NOT strong enough to discard a real extracted
+                    # image (PSY-p4-7 was called decorative in one run yet
+                    # belongs to Q1). Record it to unresolved_images.jsonl
+                    # (kept on disk for review) instead of permanently logging
+                    # it as decorative. Only STRONG deterministic evidence --
+                    # the watermark object id, already excluded at extraction
+                    # -- may permanently classify decorative.
+                    print(f"  [IMG] fourth pass: page {um['page']} {rel} model says "
+                          f"decorative -- CONSERVATIVE: recorded to "
+                          f"unresolved_images.jsonl, NOT discarded")
+                    _record_unresolved_image(subject, chapter_id, um["page"], rel,
+                                            "model-declared decorative (single "
+                                            "verdict -- conservative, kept for review)",
+                                            model_verdict={"decorative": True})
                     continue
                 qn_attr = verdict.get("q_no")
                 if isinstance(qn_attr, bool) or not isinstance(qn_attr, int) \

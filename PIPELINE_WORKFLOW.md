@@ -475,6 +475,58 @@ implemented:
 
 ---
 
+### 4.23 Changelog — 2026-08-04 (geometry-first image ownership, run-9)
+
+User evidence: the SAME extracted figure (PSY-p4-7.webp) was mapped to
+PSY-001-001 in one run and then "decorative" in another; a single Gemini
+verdict is not reliable enough to discard a real image.
+
+**Why page 4 failed while page 33 works (investigated, PROVEN):**
+- Page 33 (solution figure): `solution_headers_on_page` locates headings via
+  **pypdf's text visitor** (works on this book) and assigns the closest
+  header above each image by PDF y -- pure geometry, no gates.
+- Page 4 (question figure): the question-side path `qns_printed_on_page`
+  used the **pdftotext CLI** (garbled body text on this book) AND needed
+  Gemini's `has_figure_in_question` flag and exactly-one printed q_no. Both
+  failed → "ambiguous printed owners -" → the 4th-pass model said
+  "decorative" → the image was permanently logged to decorative_images.jsonl.
+- So the deterministic positional system existed ONLY for solution-side
+  figures; question-side figures depended on the broken tool + a flag + a
+  single unreliable model verdict.
+
+**Fix (geometry-first, generalized):**
+1. `question_headers_on_page` -- locates question-stem headings ("1.",
+   "Q1.") via the SAME pypdf text visitor as solutions (positions in the
+   same coordinate space).
+2. `block_headers_on_page` -- merged (kind, q_no, y) for question AND
+   solution headings, top-first. Question headings BELOW the first solution
+   header on a page are dropped (a "1." line there is a list item in
+   solution prose, not a stem).
+3. `claim_block_images` -- every image belongs to the CLOSEST heading above
+   it (question or solution), or to the carried `active_block` (cross-page
+   continuation). Replaces the solution-only mapper; `claim_solution_page_images`
+   kept as a compatibility wrapper.
+4. Window loop is now GEOMETRY-FIRST: deterministic block ownership runs
+   per page BEFORE the Gemini figure-map; the figure-map and 4th pass only
+   see leftovers and can never override a deterministic assignment.
+   `active_block` is captured from the carry state at WINDOW START (the
+   block open at the end of the previous window).
+5. **Conservative decorative** -- a single Gemini "decorative" verdict no
+   longer discards an image: it is recorded to `data/unresolved_images.jsonl`
+   (with the model verdict) and kept on disk for review. Only strong
+   deterministic evidence (the watermark object id, already excluded at
+   extraction) may permanently classify decorative.
+6. Priority implemented (run-9 #5): A/B strong same-page block ownership →
+   C cross-page carry → D Gemini fallback → E unresolved_images.jsonl.
+
+Regression tests: `GeometryFirstImageTests` (9 cases: question-block image,
+solution-block image, between-headings, multiple figures one block, multiple
+questions by position, cross-page carried owner, cross-page without carry
+stays unclaimed, watermark excluded at extraction, ambiguous → unresolved
+not decorative, Gemini figure-map cannot override geometry). 69 total.
+
+---
+
 ### 4.22 Changelog — 2026-08-04 (orphan-fragment root cause, run-8)
 
 User asked to investigate why `q_no=None` / orphan fragments keep appearing

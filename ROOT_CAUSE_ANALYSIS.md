@@ -343,6 +343,30 @@ TRUNCATED (same deterministic signal as the carry fallback). Unowned
 fragments stay unassigned for review instead of being guessed into a record.
 
 --------------------------------------------------------------------------------
+## 8. Run-9 audit — geometry-first image ownership (2026-08-04)
+
+### A9-1 — Question-side figures had NO deterministic positional system **[PROVEN]**
+PSY-p4-7.webp mapped to PSY-001-001 in one run, then "decorative" in another.
+Investigation: the SOLUTION-side mapper (page 33 -> PSY-002-014) locates
+headings via pypdf's text visitor and assigns the closest header above each
+image by PDF y. The QUESTION-side path used the pdftotext CLI (garbled body
+text on this book) + Gemini's has_figure flag + exactly-one-q_no gate; when
+those failed, a single 4th-pass Gemini "decorative" verdict permanently
+discarded the image.
+**Fix:** `question_headers_on_page` (pypdf visitor, "1."/"Q1." stems) +
+`block_headers_on_page` (merged question+solution headings; question
+headings below the first solution header are dropped) + `claim_block_images`
+(closest heading above each image, or the carried active_block for cross-page
+continuations). Window loop is geometry-first; the Gemini figure-map and 4th
+pass only run on leftovers and cannot override deterministic ownership.
+
+### A9-2 — Single Gemini "decorative" verdict discarded real images **[PROVEN]**
+**Fix:** conservative decorative -- a "decorative" verdict now records the
+image to data/unresolved_images.jsonl (with the model verdict) and keeps it
+on disk for review; only strong deterministic evidence (watermark object id,
+already excluded at extraction) may permanently classify decorative.
+
+--------------------------------------------------------------------------------
 ## 5. Run-5 audit — solutions-page figure mapping (2026-08-02)
 
 ### A5-1 — Whole solutions page dumped onto ONE decoded header (user report:
