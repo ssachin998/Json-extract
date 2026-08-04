@@ -313,6 +313,36 @@ for same-run refill; `_stem_reject_reason` = explanation-style opener OR
 >=80% token containment in the record's own solution (>=60 chars).
 
 --------------------------------------------------------------------------------
+## 7. Run-8 audit — recurring q_no=None / orphan fragments (2026-08-04)
+
+### A8-1 — S-pass carry NEVER created when _batch_meta is absent **[PROVEN]**
+Log signature: `overlap: [17] | carry-in: - | last-open: -` while a
+`Solution to Question 10:` heading sits at the bottom of the overlap page.
+`compute_carry`'s no-meta fallback required `rec.get("question_text")` --
+but S-pass records fill `solution_text` ONLY, so the fallback never fired
+for the S-pass. Result: the next window had no continuity context naming the
+open question, the prompt's "NEVER invent a question number" rule won over
+the weak overlap note, and the unnumbered continuation came back q_no=null
+(orphan).
+**Fix:** pass-shape detection (S-shaped = solution_text without
+question_text); for S-pass, a non-empty solution on the window's highest
+q_no that `looks_truncated` proves the page ended mid-solution -> carry that
+q_no ("solution" cut). Q-pass fallback unchanged. Plus: explicit
+OVERLAP/CONTEXT + NEW PAGES + OWNERSHIP RULES in the generated context
+(`build_carry_context`), and the Q/S prompts now say to resolve the owner
+from the overlap pages before falling back to q_no=null. The user's overlap
+hypothesis was partially correct (overlap WAS sent; the carry gap + prompt
+contradiction were the real culprits).
+
+### A8-2 — recover_orphans rule 3 wrong-owner guess **[PROVEN mechanism]**
+The PARTIAL owner append fired on ANY low-overlap fragment even when the
+owner's existing solution was COMPLETE -- a blind guess that could glue a
+neighbour's or a new question's text onto a finished solution.
+**Fix:** the append now requires the owner's existing solution to LOOK
+TRUNCATED (same deterministic signal as the carry fallback). Unowned
+fragments stay unassigned for review instead of being guessed into a record.
+
+--------------------------------------------------------------------------------
 ## 5. Run-5 audit — solutions-page figure mapping (2026-08-02)
 
 ### A5-1 — Whole solutions page dumped onto ONE decoded header (user report:

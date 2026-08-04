@@ -497,8 +497,11 @@ Rules:
 - Preserve every word verbatim. Do NOT summarize or paraphrase.
 - NEVER invent a question number. If text at the top of the FIRST page is a
   continuation from BEFORE these pages (starts mid-sentence, no number
-  visible), return it as one item with "q_no": null and the visible fragment
-  under "question_text"/"options".
+  visible), FIRST use the OVERLAP/CONTEXT pages to determine which question
+  it continues (the preceding overlap page usually shows that question's
+  number) and return it under that q_no; ONLY when ownership cannot be
+  established from the context, return it with "q_no": null and the visible
+  fragment under "question_text"/"options".
 - If a question's options are split across two pages, only include the
   options actually visible on THIS batch -- they merge automatically.
 - If a visible line is clearly an answer-letter line or explanation prose
@@ -554,9 +557,13 @@ Return a JSON array. Each element is one question's solution:
 Rules:
 - Preserve every word verbatim. Do NOT summarize or paraphrase.
 - NEVER invent a question number -- use ONLY numbers explicitly printed with
-  the solution (e.g. "Solution to Question 4:" -> q_no 4). If the top of the
-  FIRST page continues a solution from BEFORE these pages with no number
-  visible, return it as one item with "q_no": null under "solution_text".
+  the solution (e.g. "Solution to Question 4:" -> q_no 4) or PROVEN by the
+  OVERLAP/CONTEXT pages (e.g. the "Solution to Question 4:" header visible
+  at the bottom of the preceding overlap page). If the top of the FIRST
+  page continues a solution from BEFORE these pages with no number visible,
+  FIRST use the OVERLAP/CONTEXT pages to determine which question it
+  continues and return it under that q_no; ONLY when ownership cannot be
+  established, return it with "q_no": null under "solution_text".
 - ONE ENTRY PER QUESTION. The text of EACH question's solution goes ONLY into
   that question's own entry. Text printed after a "Solution to Question N:"
   header belongs to q_no N, never to an earlier entry.
@@ -2213,8 +2220,16 @@ def extract_batch_meta(items):
 def compute_carry(batch_meta, items, chapter_records, ending_page):
     """Decide whether a batch ended mid-question and build the payload carried
     into the NEXT request. Primary signal: Gemini's own _batch_meta (it can
-    see the page bottom). Fallback when no usable meta: the highest q_no from
-    this batch whose record has question text but no solution yet.
+    see the page bottom). Fallback when NO usable meta: detect the pass shape
+    from the items themselves --
+      * S-pass items carry solution_text (never question_text): a non-empty
+        solution on the window's highest q_no that LOOKS TRUNCATED proves the
+        page ended mid-solution -> carry that q_no as a "solution" cut. This
+        was the run-8 root cause: the old fallback required question_text,
+        which S-pass records never have, so carry-in was ALWAYS "-" and the
+        unnumbered continuation on the next page came back q_no=null.
+      * Q-pass items carry question_text: keep the battle-tested fallback
+        (highest q_no with a stem but no solution yet -> carry as "solution").
     Stores: last_open_question, last_question_text, partial_solution,
     partial_options, ending_page."""
     have_meta = bool(batch_meta)
@@ -2237,19 +2252,37 @@ def compute_carry(batch_meta, items, chapter_records, ending_page):
         if have_meta:
             return None              # model says the page ended cleanly
         batch_qns = []
+        s_shaped = False             # items look like S-pass output
         for it in items:
             try:
                 batch_qns.append(int(it.get("q_no")))
             except (TypeError, ValueError):
                 pass
+            if (it.get("solution_text") or "").strip() \
+                    and not (it.get("question_text") or "").strip():
+                s_shaped = True
         if not batch_qns:
             return None
         candidate = max(batch_qns)
         rec = chapter_records.get(candidate, {})
-        if rec.get("question_text") and not rec.get("solution_text"):
-            last_qn, cut_part = candidate, "solution"
+        if s_shaped:
+            # S-pass fallback (run-8): a truncated solution proves the page
+            # ended mid-solution -> carry it so the next window's unnumbered
+            # continuation resolves to this q_no instead of q_no=null.
+            sol = (rec.get("solution_text") or "").strip()
+            if sol and looks_truncated_solution(
+                    sol, has_tables=bool(rec.get("tables"))):
+                last_qn, cut_part = candidate, "solution"
+            else:
+                return None
         else:
-            return None
+            # Q-pass fallback (battle-tested): highest q_no with a stem but
+            # no solution yet -> carry as "solution" (if it spans the next
+            # window, the model continues it under the same q_no).
+            if rec.get("question_text") and not rec.get("solution_text"):
+                last_qn, cut_part = candidate, "solution"
+            else:
+                return None
 
     rec = chapter_records.get(last_qn, {})
     return {"last_open_question": last_qn,
@@ -2259,8 +2292,15 @@ def compute_carry(batch_meta, items, chapter_records, ending_page):
             "ending_page": ending_page,
             "cut_part": cut_part}
 
-def build_carry_context(carry, overlap_pages):
-    """The actual text prepended to the next request."""
+def build_carry_context(carry, overlap_pages, new_pages=None):
+    """The actual text prepended to the next request.
+
+    carry: the previous window's open item (its q_no + partial content).
+    overlap_pages: PDF pages re-sent from the previous window (continuity).
+    new_pages: the genuinely NEW pages of this window (run-8: made explicit
+    so Gemini can resolve an unnumbered continuation's owner from the
+    preceding overlap page instead of defaulting to q_no=null -- the orphan
+    source the audit found)."""
     lines = []
     if carry:
         qn = carry["last_open_question"]
@@ -2278,11 +2318,31 @@ def build_carry_context(carry, overlap_pages):
         ]
     if overlap_pages:
         lines.append(
-            f"The first {len(overlap_pages)} page image(s) (PDF page(s) "
-            f"{', '.join(map(str, overlap_pages))}) are OVERLAP from the previous "
-            "batch, provided as context only. Extract the new pages normally; if "
-            "an item spans an overlap page into the new pages, combine both "
-            "sides into ONE complete item under its printed q_no."
+            "OVERLAP / CONTEXT PAGES (supplied ONLY to establish continuity "
+            "and ownership; do NOT re-output their content as new items): "
+            f"PDF page(s) {', '.join(map(str, overlap_pages))}."
+        )
+        if new_pages:
+            lines.append(
+                "NEW PAGES TO EXTRACT (the pages whose content this pass must "
+                f"return): PDF page(s) {', '.join(map(str, new_pages))}."
+            )
+        lines.append(
+            "OWNERSHIP RULES for unnumbered continuations:\n"
+            "- If a new page begins with an unnumbered continuation and the "
+            "preceding OVERLAP page proves it belongs to Question N (e.g. the "
+            "'Solution to Question N:' header or question stem N is visible "
+            "at the bottom of the overlap page), return that continuation "
+            "with q_no=N.\n"
+            "- Keep assigning it to N until an explicit new question/solution "
+            "heading establishes another owner.\n"
+            "- Do NOT return q_no=null merely because the number is not "
+            "repeated on the new page when ownership is clearly established "
+            "by the overlap page.\n"
+            "- NEVER invent a q_no when ownership is uncertain. If ownership "
+            "genuinely cannot be established, return q_no=null as an explicit "
+            "unassigned fragment for later recovery -- never attach it to a "
+            "different question."
         )
     return "\n".join(lines)
 
@@ -2725,7 +2785,16 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                 if item.get("solution_text") and not existing:
                     owner, reason = last_qn, "solution continuation"
                 elif (item.get("solution_text") and existing and frag
+                      and looks_truncated_solution(existing,
+                                                   has_tables=bool(rec.get("tables")))
                       and not _frag_mostly_present(frag, existing)):
+                    # PARTIAL owner append (run-8 tightening): only append a
+                    # continuation to an owner whose existing solution PROVABLY
+                    # ends mid-flow (truncated). Appending to a complete
+                    # solution would glue a neighbour's or new question's text
+                    # onto it -- a wrong-owner guess. The reliable signal
+                    # matches the compute_carry S-pass fallback, so the two
+                    # paths agree.
                     owner, reason = last_qn, "solution continuation (PARTIAL owner append)"
                 elif item.get("options") and not rec.get("options") \
                         and orph.get("pass") in ("Q", None):
@@ -3784,7 +3853,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 if not pass_batch:
                     continue
                 carry_in = carry_by_pass.get(pass_name) if pass_name in ("Q", "S") else None
-                context_str = build_carry_context(carry_in, overlap_pages)
+                context_str = build_carry_context(carry_in, overlap_pages, new_pages)
                 if carry_in:
                     stats["carry_used"] += 1
                 try:

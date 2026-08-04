@@ -144,7 +144,7 @@ class RetryForeignFragmentGuardTests(unittest.TestCase):
     def setUp(self):
         self.rec = {"q_no": 16, "options": {"A": "alpha", "B": "beta",
                                             "C": "gamma", "D": "delta"},
-                    "solution_text": "q16's own partial explanation"}
+                    "solution_text": "q16's own partial explanation leads to:"}
         self.chapter = {15: {"solution_text": "q15's solution text"},
                         16: self.rec,
                         17: {"solution_text": "q17's completely different "
@@ -186,7 +186,7 @@ class OrphanForeignGuardTests(unittest.TestCase):
         recs = {
             16: {"q_no": 16, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
                  "question_text": "q16 stem", "correct_option": "B",
-                 "solution_text": "q16's own partial explanation", "tables": []},
+                 "solution_text": "q16's own partial explanation leads to:", "tables": []},
             17: {"q_no": 17, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
                  "question_text": "q17 stem", "correct_option": "C",
                  "solution_text": "q17's completely different explanation of q17's "
@@ -218,7 +218,7 @@ class OrphanForeignGuardTests(unittest.TestCase):
         recs = {
             16: {"q_no": 16, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
                  "question_text": "q16 stem", "correct_option": "B",
-                 "solution_text": "q16's own partial explanation", "tables": []},
+                 "solution_text": "q16's own partial explanation leads to:", "tables": []},
         }
         frag = "and here the genuine continuation continues without any overlap"
         orphans = [{"chapter_id": "PSY-016", "batch_start": 0, "pdf_pages": [1],
@@ -635,6 +635,172 @@ class CrossFieldContaminationTests(unittest.TestCase):
         out2 = qp._apply_recovery_scope(dict(item), qp._RECOVERY_SCOPE["A"], "DRAIN_A")
         self.assertEqual(out2["correct_option"], "C")
         self.assertIsNone(out2["solution_text"])
+
+
+class ContinuationOwnershipTests(unittest.TestCase):
+    """Run-8: unnumbered continuations crossing an overlap boundary must be
+    assigned to the question whose heading is on the overlap page -- via the
+    deterministic compute_carry S-pass fallback + carry-forward orphan
+    recovery -- never left q_no=null when ownership is provable, and never
+    guessed when it is not."""
+
+    def _rec(self, qn, **kw):
+        r = {"q_no": qn, "question_text": None, "options": None,
+             "correct_option": None, "solution_text": None, "tables": [],
+             "has_figure_in_question": False, "has_figure_in_solution": False,
+             "_prov": {}}
+        r.update(kw)
+        return r
+
+    def _s_orphan(self, frag, carry_qn, last_qn, page=18):
+        return {"chapter_id": "PSY-016", "batch_start": page, "pdf_pages": [page, 21],
+                "new_pages": [page, 19, 20, 21], "carry_q_no": carry_qn,
+                "cut_part": "solution", "last_qn_in_batch": last_qn, "pass": "S",
+                "item": {"q_no": None, "question_text": None, "solution_text": frag,
+                         "options": None, "correct_option": None, "tables": [],
+                         "has_figure_in_question": False,
+                         "has_figure_in_solution": False}}
+
+    # -- 1. Q2's heading at the bottom of the overlap page; all Q2 content on
+    #      the next page -> continuation must be assigned to Q2 ------------
+    def test_heading_on_overlap_page_assigns_continuation_to_owner(self):
+        # window 1 ends with q2's truncated solution (its "Solution to
+        # Question 2:" heading is at the bottom of the overlap page)
+        trunc = "The correct answer is A because the defence mechanism here is:"
+        items1 = [{"q_no": 2, "question_text": None, "solution_text": trunc,
+                   "options": None, "correct_option": None, "tables": []}]
+        recs = {2: self._rec(2, solution_text=trunc)}
+        carry = qp.compute_carry({}, items1, recs, 17)   # no _batch_meta
+        self.assertEqual(carry["last_open_question"], 2)
+        self.assertEqual(carry["cut_part"], "solution")
+        # window 2 still returns the continuation as q_no=null -> the orphan
+        # carries q2 and rule 2 attaches it
+        frag = "repression, because the impulse is pushed out of awareness into the unconscious mind."
+        orphans = [self._s_orphan(frag, carry_qn=2, last_qn=3)]
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "contaminated_stems_blocked": 0,
+                 "chapter_id": "PSY-016"}
+        recs[3] = self._rec(3, question_text="Stem three",
+                            solution_text="complete solution three")
+        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
+        self.assertEqual(remaining, [])
+        self.assertIn("repression", recs[2]["solution_text"])
+        self.assertEqual(recs[3]["solution_text"], "complete solution three")
+
+    # -- 2. Q2 starts on overlap page, continues, then explicit Q3 heading ->
+    #      initial continuation to Q2, subsequent content to Q3 ------------
+    def test_continuation_then_explicit_next_heading_stays_separate(self):
+        recs = {2: self._rec(2, question_text="Stem two",
+                             solution_text="The answer is A because:"),
+                3: self._rec(3, question_text="Stem three",
+                             solution_text="complete solution three")}
+        # the null fragment is q2's continuation; q3's numbered item exists
+        # separately (already merged) and must NOT absorb the fragment
+        frag = "the patient uses rationalisation to minimise the guilt feeling."
+        orphans = [self._s_orphan(frag, carry_qn=2, last_qn=3)]
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "contaminated_stems_blocked": 0,
+                 "chapter_id": "PSY-016"}
+        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
+        self.assertEqual(remaining, [])
+        self.assertIn("rationalisation", recs[2]["solution_text"])
+        self.assertEqual(recs[3]["solution_text"], "complete solution three")
+
+    # -- 3. unnumbered text, no reliable owner -> stays unassigned, never
+    #      guessed ---------------------------------------------------------
+    def test_unowned_continuation_stays_unassigned(self):
+        # window 1 ended with a COMPLETE solution -> no carry created
+        items1 = [{"q_no": 2, "question_text": None,
+                   "solution_text": "The answer is A. Repression is complete.",
+                   "options": None, "correct_option": None, "tables": []}]
+        recs = {2: self._rec(2, solution_text="The answer is A. Repression is complete."),
+                3: self._rec(3, question_text="Stem three",
+                             solution_text="complete solution three")}
+        self.assertIsNone(qp.compute_carry({}, items1, recs, 17))
+        # an unrelated unnumbered fragment with no carry must NOT be glued
+        # onto q2 (complete solution) or guessed at all
+        frag = "Some unnumbered text that has no provable owner on the overlap page."
+        orphans = [self._s_orphan(frag, carry_qn=None, last_qn=2)]
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "contaminated_stems_blocked": 0,
+                 "chapter_id": "PSY-016"}
+        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
+        self.assertEqual(len(remaining), 1)          # stays for review
+        self.assertNotIn("unnumbered text", recs[2]["solution_text"])
+        self.assertNotIn("unnumbered text", recs[3]["solution_text"])
+
+    # -- 4. overlap content must not be duplicated into the final solution --
+    def test_overlap_reextraction_does_not_duplicate_solution(self):
+        # window 1 returns q2 partial; window 2 (with q2's page as overlap)
+        # returns q2 complete -> the FULL solution replaces the partial one
+        # (last-write-wins), never concatenated
+        full = ("The answer is A. Repression is complete. The impulse is "
+                "pushed out of awareness into the unconscious mind.")
+        recs = {}
+        qp.merge_question_records(recs, [
+            {"q_no": 2, "question_text": None, "_prov": "S_PASS",
+             "solution_text": "The answer is A. Repression is complete.",
+             "options": None, "correct_option": None, "tables": []}],
+            {"chapter_id": "PSY-016"})
+        qp.merge_question_records(recs, [
+            {"q_no": 2, "question_text": None, "_prov": "S_PASS",
+             "solution_text": full,
+             "options": None, "correct_option": None, "tables": []}],
+            {"chapter_id": "PSY-016"})
+        self.assertEqual(recs[2]["solution_text"], full)   # not doubled
+        self.assertEqual(recs[2]["solution_text"].count("Repression is complete."), 1)
+
+    # -- 5. S-pass continuation must never enter question_text -------------
+    def test_s_pass_continuation_never_enters_question_text(self):
+        # the S orphan carries a stray question_text (Gemini filled both) ->
+        # blocked from the stem; the solution still merges under its owner
+        frag_sol = ("the patient uses rationalisation to minimise guilt feelings.")
+        stray_stem = ("Rationalisation is a defence mechanism that involves "
+                      "providing a logical explanation for behaviour.")
+        orphans = [{"chapter_id": "PSY-016", "batch_start": 18, "pdf_pages": [18],
+                    "new_pages": [18], "carry_q_no": 2, "cut_part": "solution",
+                    "last_qn_in_batch": 2, "pass": "S",
+                    "item": {"q_no": None, "question_text": stray_stem,
+                             "solution_text": frag_sol, "options": None,
+                             "correct_option": None, "tables": [],
+                             "has_figure_in_question": False,
+                             "has_figure_in_solution": False}}]
+        recs = {2: self._rec(2, question_text="Stem two",
+                             solution_text="The answer is A because:")}
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "contaminated_stems_blocked": 0,
+                 "chapter_id": "PSY-016"}
+        qp.recover_orphans(orphans, recs, "PSY", 16, stats)
+        self.assertEqual(recs[2]["question_text"], "Stem two")      # untouched
+        self.assertIn("rationalisation", recs[2]["solution_text"])  # merged
+
+    # -- 6. valid existing content survives continuation recovery ----------
+    def test_existing_content_never_overwritten_by_continuation(self):
+        recs = {2: self._rec(2, question_text="The real stem stays intact",
+                             solution_text="The answer is A because:")}
+        # fill_only merge (recovery) must NEVER overwrite existing content,
+        # even when the incoming S patch carries a (wrong) stem and a fuller
+        # solution
+        qp.merge_question_records(recs, [
+            {"q_no": 2, "question_text": "WRONG stem from a stray S fragment",
+             "solution_text": "The answer is A because: the full correct "
+                              "explanation continues here with real content.",
+             "options": None, "correct_option": None, "tables": [],
+             "_prov": "S_RETRY"}],
+            {"chapter_id": "PSY-016"}, fill_only=True)
+        self.assertEqual(recs[2]["question_text"], "The real stem stays intact")
+        self.assertEqual(recs[2]["solution_text"], "The answer is A because:")
+        # the REAL continuation path (recover_orphans, truncated owner +
+        # carry) appends the novel tail ONCE -- existing text preserved
+        frag = "the full correct explanation continues here with real content."
+        orphans = [self._s_orphan(frag, carry_qn=2, last_qn=2)]
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "contaminated_stems_blocked": 0,
+                 "chapter_id": "PSY-016"}
+        qp.recover_orphans(orphans, recs, "PSY", 16, stats)
+        self.assertEqual(recs[2]["question_text"], "The real stem stays intact")
+        self.assertIn("full correct explanation", recs[2]["solution_text"])
+        self.assertEqual(recs[2]["solution_text"].count("because:"), 1)
 
 
 class ValidatorContaminationTests(unittest.TestCase):

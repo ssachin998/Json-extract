@@ -475,6 +475,59 @@ implemented:
 
 ---
 
+### 4.22 Changelog — 2026-08-04 (orphan-fragment root cause, run-8)
+
+User asked to investigate why `q_no=None` / orphan fragments keep appearing
+despite overlap pages being sent. Investigation findings:
+
+- **Overlap WAS being passed** — both as re-sent page images AND as a text
+  note ("OVERLAP from the previous batch... combine both sides into ONE
+  complete item"). The user's hypothesis was PARTIALLY correct: the note was
+  too weak and the prompts CONTRADICTED it.
+- **Prompt contradiction** — Q/S passes said "NEVER invent a question
+  number... return it as one item with q_no: null" for unnumbered
+  continuations, directly contradicting the overlap-combine rule. Gemini
+  defaulted to q_no=null.
+- **Real root cause (PROVEN)** — `compute_carry`'s no-meta fallback required
+  `rec.get("question_text")`, but S-pass records fill `solution_text` only.
+  When Gemini omitted `_batch_meta` (common), the S-pass carry was NEVER
+  created → logs showed `carry-in: -` → the next window had no continuity
+  context naming the open question → the unnumbered continuation came back
+  `q_no=null`.
+
+Fixes:
+
+1. **`compute_carry` S-pass fallback** — detects the pass shape from the
+   items (S-shaped = solution_text present, no question_text). For S-pass,
+   a non-empty solution on the window's highest q_no that `looks_truncated`
+   proves the page ended mid-solution → carry that q_no as a "solution" cut.
+   Q-pass fallback unchanged. This restores `carry-in` for solutions
+   crossing page boundaries.
+2. **Explicit overlap semantics in the generated context** —
+   `build_carry_context(carry, overlap_pages, new_pages)` now emits
+   `OVERLAP / CONTEXT PAGES:` and `NEW PAGES TO EXTRACT:` sections plus
+   OWNERSHIP RULES (continuation belongs to the question whose heading is on
+   the overlap page; keep assigning until a new heading; only q_no=null when
+   ownership genuinely cannot be established). One master prompt, generated
+   per batch — no hand-made prompts.
+3. **Prompt contradiction removed** — Q and S passes now say: first use the
+   OVERLAP/CONTEXT pages to determine the owner; only return q_no=null when
+   ownership cannot be established.
+4. **`recover_orphans` rule 3 tightened** — the PARTIAL owner append now
+   requires the owner's existing solution to LOOK TRUNCATED (same signal as
+   the carry fallback). Appending a low-overlap fragment to a COMPLETE
+   solution was a wrong-owner guess; such fragments stay unassigned for
+   review instead.
+5. **Field separation preserved** — the run-7 provenance/scope hardening
+   still guarantees an S-pass/OCR continuation never populates question_text.
+
+Regression tests: `ContinuationOwnershipTests` (6 cases: heading-on-overlap
+assigns owner; continuation-then-next-heading stays separate; unowned stays
+unassigned; overlap re-extraction doesn't duplicate; S continuation never
+enters question_text; existing content never overwritten). 59 tests total.
+
+---
+
 ## 11. What feedback is wanted from the reviewer
 
 - Correctness bugs / race conditions / data-loss paths in `qbank_pipeline.py` (merge, resume, quota exits).
