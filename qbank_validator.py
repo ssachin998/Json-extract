@@ -528,6 +528,19 @@ def validate_deterministic(output_root=OUTPUT_ROOT, explicit_source_gap=()):
                 flag(cid, "image_unclaimed",
                      f"page {um.get('page')} figure not owned by any question: {um.get('files')}",
                      pages=[um.get("page")] if um.get("page") else []))
+    # run-13: unresolved_images.jsonl entries are gate-relevant unless
+    # deterministically junk (broken crop < MIN_IMAGE_BYTES). A single model
+    # "decorative" verdict must NOT clear this (page-4 class: a real Q1
+    # figure was called decorative and the chapter still printed CLEAN).
+    for ui in load_jsonl(data_dir / "unresolved_images.jsonl"):
+        cid = ui.get("chapter_id")
+        if not cid or ui.get("deterministic_junk"):
+            continue
+        flags_by.setdefault(cid, []).append(
+            flag(cid, "image_unresolved",
+                 f"page {ui.get('page')} figure unresolved after all ownership "
+                 f"levels: {ui.get('file')} (method={ui.get('method') or '?'})",
+                 pages=[ui.get("page")] if ui.get("page") else []))
 
     summary = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

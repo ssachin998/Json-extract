@@ -523,6 +523,66 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
+### 4.27 Changelog — 2026-08-06 (unified image-ownership architecture, page-4 class)
+
+Fresh production run: page 4's figure (`PSY/PSY-p4-7.webp`, source-verified
+Q1 question image) still printed `ambiguous printed owners -`, stayed
+unclaimed, and the 4th pass called it "decorative" -> `unresolved_images.jsonl`
+while `[GATE] chapter 1: export gate CLEAN`. The run-9 geometry-first fix was
+supposed to solve this class; it did not on the REAL page. Architecture-level
+investigation (full report: `ROOT_CAUSE_ANALYSIS.md` section 13):
+
+**Root cause — the entire deterministic system depends on the PDF TEXT LAYER.**
+`question_headers_on_page` reads block headings from pypdf's text visitor;
+`qns_printed_on_page`/`one_to_one` read them from pdftotext. On this book's
+QUESTION pages the body-font text layer is garbled/absent (broken ToUnicode),
+so BOTH text tools return nothing for question headings: L1 geometry finds no
+header above the figure, the one-to-one matcher sees no printed q_no
+("ambiguous printed owners -"), and the figure falls to a Gemini call that is
+shown ONLY the isolated crop (no page layout, no printed anchors) — it
+guessed "decorative" for a real figure. The synthetic tests passed because
+they build PDFs with clean Helvetica text; none modelled (a) an unreadable
+text layer, (b) Form-wrapped figures, or (c) an isolated-crop 4th pass.
+
+**New unified ownership ladder (each level sees only the previous level's
+leftovers; every assignment records provenance to
+`data/image_ownership.jsonl`):**
+- **L1 deterministic text-layer geometry** (run-9, unchanged) — closest
+  question/solution heading above the image + cross-page carry. `image_positions_on_page`
+  now also recurses into **Form XObjects** (masked/clipped figures were
+  invisible to the old flat content-stream walk) and returns the drawn
+  **w/h** (needed for the L3 bbox overlay).
+- **L2 deterministic OCR-anchored geometry (NEW)** — same closest-heading-above
+  rule, but headings come from **tesseract on the RENDERED page** (poppler
+  `pdftoppm` or PyMuPDF), so it is immune to text-layer garble. Zero Gemini
+  calls. Runs in the window loop before the model figure-map.
+- **L3 full-page vision (NEW)** — for leftovers, the page is rendered at
+  150 dpi, every leftover's drawn bbox is highlighted + labeled (IMG-1...),
+  and Gemini answers ONE question per call (all page leftovers batched):
+  which printed anchor (question number / option letter / solution header)
+  owns the highlighted figure. Layout-only — the prompt forbids inferring
+  from medical content. Adjacent pages are attached when a figure touches a
+  page edge. Replaces the isolated-crop 4th pass as the primary fallback.
+- **L4 unresolved_images.jsonl** — conservative, never discarded; the export
+  gate now flags every entry (unless deterministic_junk: broken crop below
+  MIN_IMAGE_BYTES). A single model "decorative" verdict no longer clears a
+  chapter.
+
+**Validator:** `_export_gate_violations` gained `unresolved_image` violations
+(the old gate only inspected CLAIMED assets, so CLEAN could print while a real
+Q1 figure sat unresolved); `qbank_validator.py` gained the `image_unresolved`
+flag on the audit side.
+
+**Tests (UnifiedImageOwnershipTests, +8):** Form-XObject position parsing with
+drawn size; page-4 class end-to-end (garbled text layer -> vision claims Q1,
+provenance written, model receives the rendered page); vision cannot override
+deterministic geometry; OCR-anchor geometry with dead text layer; OCR line
+matching + coordinate conversion without the tesseract binary; gate flags
+unresolved images; broken crops excluded; opt-in real-PDF fixture test
+(`fixtures/PSY.pdf` — dumps pypdf words/coords + bboxes for real page 4 and
+asserts `PSY-p4-7` has a parsed position). Suite: 112 tests green (1 skipped
+until the real PDF is dropped into `fixtures/`).
+
 ### 4.26 Changelog — 2026-08-05 (run-12: contaminated-stem dead-end + recovery targeting)
 
 Second full-book run ended `89 flag(s) across 23/33 chapters`. Log forensics
