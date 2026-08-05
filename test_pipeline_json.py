@@ -1466,6 +1466,116 @@ class Run12StemContaminationTests(unittest.TestCase):
                             qp.PASS_STATUS_UNRESOLVED)
 
 
+class ZAIVerificationTests(unittest.TestCase):
+    """Production-shaped regression tests from the independent review's
+    scenarios. They LOCK IN the safe behavior (verified against the current
+    code) so the adversarial layouts can never be broken by a naive
+    'nearest-question' or overwrite change."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets = qp.ASSETS_DIR
+        qp.ASSETS_DIR = self.tmp / "assets"
+        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
+        self.subj_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR = self._old_assets
+
+    # -- Z-Test 1: solution restates the stem ("Regarding [exact stem]...") --
+    def test_solution_restating_stem_with_regarding_is_kept(self):
+        stem = ("Regarding the management of a patient with opioid use "
+                "disorder, which medication is most appropriate?")
+        sol = ("Regarding the management of a patient with opioid use "
+               "disorder, the most appropriate medication is buprenorphine, "
+               "which reduces cravings and withdrawal symptoms and can be "
+               "prescribed in office-based treatment.")
+        rec = {"question_text": stem, "solution_text": sol}
+        # high token overlap with the solution, but question-shaped + short
+        # -> a GOOD stem, never stripped as contamination
+        self.assertIsNone(qp._stem_reject_reason(stem, rec))
+
+    # -- Z-Test 2a: q_no=None OPTIONS fragment is buffered, not dropped and
+    #               never attached to the 'nearest' question ----------------
+    def test_qno_none_options_buffered_not_attached_not_dropped(self):
+        # Layout 1 (adversarial): a page boundary between a stem and its
+        # options; another question started at the bottom of the previous
+        # page. The q_no=None options must NOT be glued onto the wrong
+        # question.
+        recs = {45: {"q_no": 45, "question_text": "A patient presents with...",
+                     "options": {"A": "old-a", "B": "old-b", "C": "old-c",
+                                 "D": "old-d"},
+                     "correct_option": None, "solution_text": None,
+                     "tables": [], "has_figure_in_question": False,
+                     "has_figure_in_solution": False, "_prov": {}}}
+        frag = {"q_no": None, "question_text": None,
+                "options": {"A": "new-a", "B": "new-b", "C": "new-c",
+                            "D": "new-d"},
+                "correct_option": None, "solution_text": None, "tables": [],
+                "has_figure_in_question": False, "has_figure_in_solution": False,
+                "_prov": "Q_PASS"}
+        merged, skipped = qp.merge_question_records(recs, [frag],
+                                                    {"chapter_id": "PSY-999"})
+        # not attached (no ownership proof), not dropped (buffered as orphan)
+        self.assertEqual(skipped, [frag])
+        self.assertEqual(merged[45]["options"]["A"], "old-a")   # untouched
+
+    # -- Z-Test 2b: q_no=None ANSWER-KEY TABLE is consumed as a key, not
+    #               attached to a question ---------------------------------
+    def test_qno_none_answer_key_table_consumed_not_attached(self):
+        # Layout 2 (adversarial): a q_no=None table containing the answer
+        # key must fill answers deterministically, never corrupt a question.
+        frag = {"q_no": None, "question_text": None, "options": None,
+                "correct_option": None, "solution_text": None,
+                "tables": [{"type": "answer key",
+                            "markdown": "| Question No. | Correct Option |\n"
+                                        "|---|---|\n| 1 | A |\n| 2 | C |"}],
+                "has_figure_in_question": False, "has_figure_in_solution": False,
+                "_prov": "A_PASS"}
+        recs = {1: {"q_no": 1, "question_text": "stem1", "options": None,
+                    "correct_option": None, "solution_text": None, "tables": [],
+                    "has_figure_in_question": False,
+                    "has_figure_in_solution": False, "_prov": {}},
+                2: {"q_no": 2, "question_text": "stem2", "options": None,
+                    "correct_option": None, "solution_text": None, "tables": [],
+                    "has_figure_in_question": False,
+                    "has_figure_in_solution": False, "_prov": {}}}
+        orphans = [{"chapter_id": "PSY-999", "batch_start": 0, "pdf_pages": [5],
+                    "new_pages": [5], "carry_q_no": None, "cut_part": None,
+                    "last_qn_in_batch": 2, "pass": "A", "item": frag}]
+        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                 "carry_merges": 0, "contaminated_stems_blocked": 0,
+                 "chapter_id": "PSY-999"}
+        remaining = qp.recover_orphans(orphans, recs, "PSY", 999, stats)
+        self.assertEqual(remaining, [])                    # key consumed
+        self.assertEqual(recs[1]["correct_option"], "A")   # answers filled
+        self.assertEqual(recs[2]["correct_option"], "C")
+        self.assertEqual(recs[1]["question_text"], "stem1")  # stem untouched
+
+    # -- Z-Test 3: DRAIN crop-ladder items are NOT overwritten by OCR -------
+    def test_drain_ocr_merge_never_overwrites_crop_items(self):
+        # ch17 p218 case: crop ladder produced items, OCR fallback produced a
+        # different item. The merge is fill-only -> the earlier crop content
+        # must survive.
+        recs = {7: {"q_no": 7, "question_text": "stem7",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": None, "solution_text": "crop-ladder sol",
+                    "tables": [], "has_figure_in_question": False,
+                    "has_figure_in_solution": False, "_prov": {}}}
+        # an OCR item that would REPLACE the solution if merge overwrote
+        ocr_item = {"q_no": 7, "question_text": "stem7",
+                    "solution_text": "OCR DIFFERENT solution", "tables": [],
+                    "options": None, "correct_option": None,
+                    "has_figure_in_question": False,
+                    "has_figure_in_solution": False, "_prov": "OCR_S"}
+        # fill_only merge (the drain path) must keep the crop-ladder content
+        qp.merge_question_records(recs, [ocr_item],
+                                  {"chapter_id": "PSY-017", "duplicates_merged": 0},
+                                  fill_only=True)
+        self.assertEqual(recs[7]["solution_text"], "crop-ladder sol")
+        self.assertNotIn("OCR DIFFERENT", recs[7]["solution_text"])
+
+
 class ValidatorContaminationTests(unittest.TestCase):
     """qbank_validator must flag cross-field contamination and OCR noise in
     the FINAL rows (run-7 hardening #3/#6)."""

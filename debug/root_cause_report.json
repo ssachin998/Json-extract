@@ -1,97 +1,71 @@
 {
-  "run": "2026-08-05 full-book PSY run (run-12, after run-11 fixes)",
-  "log_source": "deployment log (18 chunks parsed; two-day run 2026-08-04 19:05 -> 2026-08-05, quota-stop at 500 RPD then resume)",
-  "final_validation": "89 flag(s) across 23/33 chapters",
-  "generated_by": "qbank_pipeline run-12 forensic pass",
-  "evidence_limits": {
-    "volume_artifacts_available": false,
-    "note": "validation_report.json / questions.jsonl / orphans.jsonl / state.json / assets / source PDF live on the Railway volume and were not available in the sandbox. This matrix is built from the deployment log + source-code inspection. export_gate.jsonl and page_ledger.jsonl are now emitted by the pipeline so the next run is fully auditable."
-  },
-  "root_causes": [
-    {
-      "id": "RC-12A",
-      "stage": "merge + contamination guard",
-      "title": "Contaminated-stem dead-end: GOOD question-shaped stems destroyed by the token-containment guard, then retry/rescue loop forever returning the same blocked text",
-      "evidence": [
-        "[SWEEP] q3/q4/q10: stripped contaminated stem (stem text substantially contained in this record's own solution)",
-        "[RETRY] blocked contaminated stem for q3/q4/q10 ... still stem-missing (round 1 AND round 2)",
-        "[RESCUE] page 14: q4 -> 0 field(s) filled; page 16: q10 -> 0 field(s) filled",
-        "[GATE] chapter 1: missing_stem 4, missing_stem 10",
-        "SAME pattern in ch2 q25, ch6 q5, ch7 q1/q23-26, ch10 q5, ch11 q1/q17, ch13 q2/q11, ch16 q2/q10",
-        "carry-forward used only 1 time in the WHOLE run"
-      ],
-      "mechanism": "Two compounding bugs: (1) _stem_reject_reason flagged ANY text whose tokens are >=80% contained in the record's own solution -- but medical solutions RESTATE the stem ('The correct answer is B. The patient presents with...'), so short QUESTION-SHAPED stems legitimately passed the threshold and were stripped as 'contaminated' (false positive). (2) When a real contamination re-read arrived, the stem-conflict coherence resolver preferred it (solution-prose coheres perfectly with the solution payload), replacing the GOOD stem -- and the generic merge loop overwrote stems with contaminated text. Result: stem lost -> retry re-asks the same solution pages -> guard blocks the same text every round -> rescue 0 fields -> export-gate missing_stem.",
-      "first_wrong_stage": "merge (stem-conflict resolver + generic overwrite) and contamination-guard false positive",
-      "fix": "1) _stem_reject_reason now only flags token-containment for DECLARATIVE or >250-char text (a question-shaped short stem restated by its solution is kept); 2) merge never lets a contaminated incoming stem replace a valid one (stem-conflict + generic write guards); 3) targeted_retry switches to a STEM-REGION-ONLY prompt after one contamination block; 4) Q-pass no longer runs on pure-solution windows (upstream contamination source), with 1-page cross-section overlap at the Q/S boundary preserving boundary-spanning question tails.",
-      "regression_test": "Run12StemContaminationTests (8 cases) + SectionWindowTests boundary-overlap updates"
+  "run": "2026-08-05 full-book PSY run (Z AI secondary-review log)",
+  "commit_that_generated_the_log": "a6b12d7 (run-11 build)",
+  "commit_evidence": [
+    "Log shows OLD retry message '[RETRY] blocked contaminated stem for qN (stem text substantially contained in this record's own solution) -- kept for review, still stem-missing' WITHOUT the run-12 '; next round will ask for the stem region ONLY' suffix (0fcd8c5 changed this).",
+    "Log hit the hard 500 RPD quota ('limit: 500, model: gemini-3.1-flash-lite') and stopped mid-run -- MAX_CALLS_PER_DAY was still 1400 in a6b12d7; 0fcd8c5 set it to 480.",
+    "Log does NOT contain '_should_run_q_pass' behavior (Q-pass still ran on pure-solution windows, e.g. '[GEMINI:Q] pages 13-17 | items: 1 | orphans buffered: 1' where the Q-pass read solution pages)."
+  ],
+  "current_code_commit": "0fcd8c5 + this investigation's test additions (104 tests)",
+  "pattern_verdicts": {
+    "A_contaminated_stem_loop": {
+      "verdict": "CONFIRMED as OLD-RUN bug; ALREADY FIXED in current code (0fcd8c5)",
+      "code_path": "_stem_reject_reason (token-containment) -> chapter_integrity_sweep step 5 -> targeted_retry stem fill -> merge stem write",
+      "log_evidence": "[SWEEP] q3: stripped contaminated stem ... [RETRY] blocked contaminated stem for q3 ... still stem-missing (round 1 AND 2) ... [RESCUE] page 14: q4 -> 0 field(s) filled ... [GATE] missing_stem q4/q10",
+      "root_cause": "solutions RESTATE question-shaped stems; the >=80% token-containment rule flagged good short stems as contaminated; the merge/stem-conflict resolver then let contaminated solution-prose replace a valid stem; retry re-asked the same pages and the guard blocked the same text every round -> dead-end.",
+      "current_fix": "_stem_reject_reason narrowed (declarative/>250-char only); merge never lets a contaminated stem replace a valid one; targeted_retry switches to a STEM-REGION-ONLY prompt after one block; Q-pass skipped on pure-solution windows (upstream source) with 1-page cross-section overlap at the Q/S boundary.",
+      "final_output_impact": "VERIFIED from log: ch1 q4/q10, ch2 q25, ch7 q1/q23-26, ch11 q1/q17, ch16 q2/q10, ch21 q1, ch23 q10 exported stem-less (export-gate missing_stem). These were final-output damage in the OLD run.",
+      "tests_reproduce": "Run12StemContaminationTests (8) + ZAIVerificationTests.test_solution_restating_stem_with_regarding_is_kept"
     },
-    {
-      "id": "RC-12B",
-      "stage": "answer reconciliation / rescue targeting",
-      "title": "Answer-missing records' rescue targets the wrong page (question page, not the key page) and key pages without the 'Answer Key' header are missed",
-      "evidence": [
-        "ch15 q15 missing answer; [RESCUE] page 194: q15 -> 0 field(s) filled (194 is a question page; the key row is elsewhere)",
-        "ch7 4 missing answers; rescue pages 100/105 -> 0 filled",
-        "ch2 q25 missing answer + bad options + missing stem (the q_no=None option-definition fragments were never reconciled)"
-      ],
-      "mechanism": "locate_missing_record_pages only matched answer rows on pages carrying the KEY_TABLE_PROBE header, and only in '| qn |' pipe format; a key page with '13. B' rows and no header was never located, so the answer-only rescue asked the wrong page and the record shipped answer=null.",
-      "first_wrong_stage": "rescue page targeting (locate_missing_record_pages)",
-      "fix": "answer-row matchers now run on EVERY page in pipe ('| 13 | B |'), list ('13. B') and dash ('13 - B') formats, header optional; header pages still get a stronger vote. The answer-only rescue prompt targets the located key page.",
-      "regression_test": "test_locate_answer_rows_without_probe_header"
+    "B_qno_none_fragments": {
+      "verdict": "PARTIALLY CONFIRMED (data preserved in orphans.jsonl, not lost from disk); NOT a current-code bug to fix by attaching",
+      "code_path": "merge_question_records (q_no=None -> skipped -> orphans buffer) -> recover_orphans (rules 0-4)",
+      "log_evidence": "[WARN] Gemini returned an item with no q_no ... options {'A': 'Cannabis-induced psychosis'...} (ch7, pages 104-107) ... [ORPHAN] Could not determine owner ... kept in orphans.jsonl",
+      "root_cause": "fragments with real options/tables but no q_no have NO provable owner in the current data model (no page coordinates, no preceding/following printed anchors retained). recover_orphans rule 3 needs last_qn_in_batch (None when the whole window is q_no=None); rule 0 handles answer-key TABLES deterministically; option-only fragments stay unresolved.",
+      "final_output_impact": "ch7 q23-26 exported with empty options/answer (gate-flagged bad_options + missing_answer) -- the fragment's options were NOT in the final record. But they ARE preserved in orphans.jsonl (not deleted).",
+      "why_not_attached": "Z AI's 'nearest active question' would corrupt Layout 1 (page boundary between stem and options) and Layout 2 (answer-key table). Current code never guesses; ownership without proof stays unresolved (per the task rule).",
+      "current_state": "safe; a full fix requires per-fragment page-coordinate + anchor provenance (documented remaining uncertainty).",
+      "tests_reproduce": "ZAIVerificationTests.test_qno_none_options_buffered_not_attached_not_dropped + test_qno_none_answer_key_table_consumed_not_attached"
     },
-    {
-      "id": "RC-12C",
-      "stage": "quota accounting",
-      "title": "MAX_CALLS_PER_DAY=1400 never fired; the run hit the model's REAL 500 RPD cap mid-chapter and wasted 2 calls on the 429 backoff before exiting",
-      "evidence": [
-        "status=429 ... limit: 500, model: gemini-3.1-flash-lite ... [QUOTA] still limited after backoff -- saving, exiting",
-        "run stopped 2026-08-04 19:37, resumed 2026-08-05 07:16"
-      ],
-      "mechanism": "the self-brake was set for a 1500/day plan, but the free tier for this model is 500/day; the pipeline only stopped when the API rejected, burning 2 quota calls on the 65s backoff.",
-      "first_wrong_stage": "config (MAX_CALLS_PER_DAY)",
-      "fix": "MAX_CALLS_PER_DAY=480 (graceful daily stop with ~20-call headroom; resume via state.json).",
-      "regression_test": "n/a (config)"
+    "C_export_gate_semantics": {
+      "verdict": "CONFIRMED as intentional audit-only soft warning; NOT a bug",
+      "code_path": "_export_gate_violations -> chapter-end [GATE] log + data/export_gate.jsonl; make_zip() in app.py includes the audit artifacts; ZIP is NOT hard-blocked",
+      "log_evidence": "[GATE] chapter 1: 2 export-gate violation(s) -- NOT a clean export: ... followed by '[PSY] chapter 1 ... done -> 26 questions'",
+      "rationale": "rows must be written for resumability (chapters_done -> state.json -> next run skips); the gate surfaces every violation loudly in the log AND in data/export_gate.jsonl, which is included in the ZIP so reviewers see exactly what is incomplete. Hard-blocking the ZIP would prevent downloading partial results for review -- contrary to the free-tier resume workflow.",
+      "final_output_impact": "the ZIP contains chapters with missing_stem/bad_options AND the export_gate.jsonl audit trail; intentional.",
+      "tests_reproduce": "Run11ForensicHardeningTests export-gate tests"
     },
-    {
-      "id": "RC-12D",
-      "stage": "page ledger",
-      "title": "Malformed-JSON A-pass falsely marked UNRESOLVED even when the same-batch re-ask fully recovered",
-      "evidence": [
-        "[WARN] malformed JSON on A-pass pages [175..179] -- one same-batch re-ask",
-        "[GEMINI:A] pages 175-179 items: 14 (recovered)",
-        "[GATE] chapter 13: unresolved_page_A [175,176,177,178,179]: UNRESOLVED  <- FALSE",
-        "also malformed JSON A-pass 79-88 (10-page salvage recovered) and 503 on ch11 135-139 (single-page retry recovered)"
-      ],
-      "mechanism": "pass_recovered was only set in the salvage-fail branch; a SUCCESSFUL same-batch re-ask left it False, so _classify_pass_status(had_error=True, recovered=False) -> UNRESOLVED even though the data came back.",
-      "first_wrong_stage": "ledger classification after malformed-JSON recovery",
-      "fix": "pass_recovered = True after a successful same-batch re-ask; recovered passes are RETRYABLE_FAILURE, not UNRESOLVED.",
-      "regression_test": "test_recovered_after_error_is_retryable_not_unresolved"
+    "D_drain_crop_ocr_merge": {
+      "verdict": "FALSE (no overwrite; Z AI's suspicion refuted from code)",
+      "code_path": "drain_failed_pages: every crop-ladder merge AND OCR-fallback merge uses merge_question_records(..., fill_only=True); the OCR splice uses _novel_solution_tail (append-only, never replaces)",
+      "log_evidence": "ch17 p218: '[DRAIN] page-218.jpg TOP half: 2 item(s)' ... '[OCR_FALLBACK] page-218.jpg: normalized 1 OCR item(s)' ... 'chapter 17 done -> 14 questions (0 missing answer, 0 missing solution)' + '[GATE] chapter 17: export gate CLEAN'",
+      "root_cause": "none (no overwrite path exists); the 2 crop items and the 1 OCR item merged fill-only; the final chapter was complete and gate-clean.",
+      "final_output_impact": "none (verified from log: ch17 gate CLEAN).",
+      "tests_reproduce": "ZAIVerificationTests.test_drain_ocr_merge_never_overwrites_crop_items"
+    },
+    "E_image_figure_map_count_mismatch": {
+      "verdict": "CONFIRMED as by-design safe-skip; NOT data loss",
+      "code_path": "claim_figure_map_images exact-count guard -> skip map -> leftovers flow to claim_page_images (positional) + 4th-pass model attribution + unresolved_images.jsonl",
+      "log_evidence": "[IMG] figure-map count mismatch (2 declared vs 4 extracted) -- skipping model figure-map claim; left for positional/model passes (ch3 p38) ... the 4th pass then attributed p38-80 -> PSY-003-013, p39-85 -> PSY-003-014; tiny crops (414B/1306B) refused by the broken-crop guard and kept unresolved",
+      "root_cause": "Gemini's declared figure count can differ from extract_real_images' count because the model sees tiny/watermark-ish objects the extractor drops (<5000px or watermark) -- the exact-count guard intentionally skips the WHOLE map rather than mis-aligning entries.",
+      "final_output_impact": "none (images resolved via positional + 4th pass, or kept in unresolved_images.jsonl / unmatched with model verdicts -- never discarded since run-11 conservative-decorative).",
+      "tests_reproduce": "FigureMapTests.test_count_mismatch_skips_entirely"
     }
-  ],
-  "validation_flag_groups": {
-    "estimated_from_log": [
-      {"group": "missing_stem", "source": "RC-12A (dominant)", "chapters": "ch1 q4/q10, ch2 q25, ch7 q1/q23-26, ch10 q5, ch11 q1/q17, ch13 q2/q11, ch16 q2/q10, ch33 qN (user-reported)"},
-      {"group": "bad_options", "source": "RC-12A (q_no=None option fragments never reconciled) + RC-12B (options on boundary pages)", "chapters": "ch2 q25, ch7 q23-26, ch8 q7, ch19 q11/q12"},
-      {"group": "missing_answer", "source": "RC-12B (answer reconciliation/rescue targeting)", "chapters": "ch2 q25, ch7 q23-26, ch15 q15, ch18, ch19, ch24 (user-reported)"},
-      {"group": "unresolved_orphans", "source": "q_no=None fragments with real content (options/tables) that recover_orphans cannot anchor", "note": "pages 72-76, 104-107, 130-134, 133-134 in this run; requires per-fragment page-coordinate provenance for full reconciliation"},
-      {"group": "unresolved_image (conservative)", "source": "ambiguous figures kept unresolved per run-9/11 policy", "note": "correct behavior: never discarded, never guessed"}
-    ],
-    "note": "exact per-flag accounting requires validation_report.json from the volume; the pipeline now writes export_gate.jsonl + page_ledger.jsonl per chapter."
   },
-  "fixes_applied": [
-    {"id": "F1", "file": "qbank_pipeline.py", "function": "_stem_reject_reason", "change": "question-shaped short stems restated by their own solution are no longer flagged as contamination (only declarative/>250-char text is)"},
-    {"id": "F2", "file": "qbank_pipeline.py", "function": "merge_question_records", "change": "contaminated incoming stem never replaces a valid stem; never fills an empty stem with contaminated text (stem-conflict resolver + generic write guards)"},
-    {"id": "F3", "file": "qbank_pipeline.py", "function": "targeted_retry + build_targeted_retry_prompt", "change": "after a contamination block, next round asks for the STEM REGION ONLY (no options/solution echoed)"},
-    {"id": "F4", "file": "qbank_pipeline.py", "function": "_should_run_q_pass + window loop", "change": "Q-pass skipped on pure-solution windows (upstream contamination source); runs only with question-section overlap or a live Q carry"},
-    {"id": "F5", "file": "qbank_pipeline.py", "function": "build_section_windows", "change": "1-page cross-section overlap at the Q/S boundary so a boundary-spanning question's tail is seen by the Q-pass"},
-    {"id": "F6", "file": "qbank_pipeline.py", "function": "malformed-JSON recovery branch", "change": "pass_recovered=True on a successful same-batch re-ask (fixes false UNRESOLVED ledger)"},
-    {"id": "F7", "file": "qbank_pipeline.py", "function": "locate_missing_record_pages", "change": "answer rows matched on every page in pipe/list/dash formats, header optional (fixes rescue targeting the wrong page)"},
-    {"id": "F8", "file": "qbank_pipeline.py", "function": "MAX_CALLS_PER_DAY", "change": "1400 -> 480 (real free-tier limit is 500 RPD for this model; graceful daily stop)"}
+  "fixes_implemented_this_pass": [],
+  "note": "No new code fixes were needed this pass: the log is from a6b12d7 (run-11 build), and the two genuine bug classes it exhibits (contaminated-stem dead-end; 500-RPD quota crash) were already fixed in 0fcd8c5. This pass added the Z-AI production-shaped regression tests (4) locking in the safe behavior, bringing the suite to 104.",
+  "tests_added_this_pass": [
+    "ZAIVerificationTests.test_solution_restating_stem_with_regarding_is_kept",
+    "ZAIVerificationTests.test_qno_none_options_buffered_not_attached_not_dropped",
+    "ZAIVerificationTests.test_qno_none_answer_key_table_consumed_not_attached",
+    "ZAIVerificationTests.test_drain_ocr_merge_never_overwrites_crop_items"
   ],
-  "remaining_uncertainty": [
-    "data/validation_report.json (89 flags) not available; exact per-flag lineage requires the volume artifacts.",
-    "Source PDF not available in the sandbox; per-question page-render verification (e.g. whether ch7's answer table truly has 14 rows, whether ch1 q4/q10 stems are printed on pages 3-12) was not possible.",
-    "RC-2 (q_no=None reconciliation of option/tables fragments) remains only partially solved: full reconciliation needs per-fragment page coordinates + preceding/following printed anchors, which extraction does not yet retain.",
-    "A full clean re-run cannot be executed from this sandbox (no PDF, no GEMINI_API_KEY, no volume). Redeploy the fixed build, reset, re-run, and the export-gate criteria can be certified from export_gate.jsonl + page_ledger.jsonl + validation_report.json."
+  "test_result": "104/104 green",
+  "commit": "see git log for the test-addition commit hash",
+  "still_requires_new_railway_run": [
+    "Redeploy the current commit (0fcd8c5 + tests) and re-run the SAME PSY PDF from a fresh reset to certify the export gates (the old-run missing_stem chapters ch1/2/7/11/16/21/23 should now resolve via the stem-region-only retry + Q-pass skip + merge protection).",
+    "Verify MAX_CALLS_PER_DAY=480 stops the day gracefully (no hard 429) across a multi-day run.",
+    "Confirm ch13's malformed-JSON A-pass no longer reports unresolved_page_A (pass_recovered fix).",
+    "RC-2 (q_no=None option-fragment reconciliation via page-coordinate provenance) remains the open design item; it needs a data-model change, not a heuristic."
   ]
 }
