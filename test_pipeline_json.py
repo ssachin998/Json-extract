@@ -359,11 +359,12 @@ class SectionWindowTests(unittest.TestCase):
         self.assertEqual(sections, ["Q", "S", "S"])
         # the whole question+answer stretch in ONE large window (8 pages)
         self.assertEqual(wins[0][0], list(range(3, 11)))
-        # solutions chunked with 1-page intra-section overlap
-        self.assertEqual(wins[1][0], [11, 12, 13, 14, 15])
+        # RUN-12 cross-section overlap: the first S window includes the last
+        # question page (10) so a boundary-spanning question's tail is seen
+        self.assertEqual(wins[1][0], [10, 11, 12, 13, 14])
         self.assertEqual(wins[2][0], [15, 16])
-        # no cross-section overlap
-        self.assertEqual(set(wins[0][0]) & set(wins[1][0]), set())
+        # page 10 is shared across the Q/S boundary (tail continuity)
+        self.assertEqual(set(wins[0][0]) & set(wins[1][0]), {10})
 
     def test_big_question_section_chunked_too(self):
         # 12 question pages -> 2 Q windows with 1-page overlap, then solutions
@@ -396,7 +397,8 @@ class SectionWindowTests(unittest.TestCase):
         self.assertEqual(qp.build_section_windows(self.files, "pdf"), [])
 
     def test_solutions_chunked_with_intra_section_overlap(self):
-        # 8 solution pages (pp.6-13) -> 2 S windows, 1 overlap page
+        # solutions pp.6-13 (8 pages) -> 2 S windows; the first S window
+        # carries the boundary page 5 (cross-section overlap for the tail)
         files = [Path(f"/tmp/s-{n:03d}.jpg") for n in range(3, 14)]
         text = {p: "1. Q\n" for p in (3, 4)}
         text[5] = "ANSWER KEY\n| Q No | Answer |"
@@ -404,11 +406,15 @@ class SectionWindowTests(unittest.TestCase):
                         for p in range(6, 14)})
         self._fake_text(text)
         wins = qp.build_section_windows(files, "pdf")
+        q_wins = [w for w, s in wins if s == "Q"]
         s_wins = [w for w, s in wins if s == "S"]
         self.assertEqual(len(s_wins), 2)
         self.assertEqual(len(s_wins[0]), qp.SOLUTIONS_CHUNK_PAGES)
-        # 1-page overlap between the two S windows (page 10 = 6+5-1)
-        self.assertEqual(s_wins[0][-1], s_wins[1][0])
+        # first S window starts with the boundary page (5) shared with the Q
+        # window -> a question spanning 5->6 keeps its tail in the Q pass
+        self.assertEqual(s_wins[0][0], 5)
+        self.assertEqual(q_wins[0][-1], 5)
+        self.assertEqual(s_wins[1][0], 10)   # remaining solutions chunk
 
 
 class FigureMapTests(unittest.TestCase):
@@ -1277,6 +1283,24 @@ class Run11ForensicHardeningTests(unittest.TestCase):
         self.assertNotIn("solution_text", prompt)
         self.assertIn("Question 7", prompt)
 
+    def test_locate_answer_rows_without_probe_header(self):
+        # answer rows in "13. B" / "13 - B" format on a page with NO "Answer
+        # Key" header must still locate q13's answer page (run-12: ch15 q15's
+        # rescue went to the question page because the key page lacked the
+        # probe header)
+        fake = {1: "1. Question one\n",
+                2: "13. B\n14. C\n15. A\n"}
+        orig = qp.pdftotext_page
+        qp.pdftotext_page = lambda pdf, page: fake.get(page, "")
+        try:
+            page_files = [Path(f"/tmp/x/page-{n:03d}.jpg") for n in (1, 2)]
+            loc = qp.locate_missing_record_pages("pdf", page_files,
+                                                 {13: ["answer"], 15: ["answer"]}, {})
+        finally:
+            qp.pdftotext_page = orig
+        self.assertIn(2, loc[13])
+        self.assertIn(2, loc[15])
+
     # -- Export gate ------------------------------------------------------
     def test_export_gate_catches_missing_stems_and_answers(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
@@ -1310,6 +1334,136 @@ class Run11ForensicHardeningTests(unittest.TestCase):
         self.assertIn("more prose", clean)
         self.assertNotIn("Page 5 of 200", clean)
         self.assertNotIn("www.x.com", clean)
+
+
+class Run12StemContaminationTests(unittest.TestCase):
+    """Run-12: the contaminated-stem guard must not destroy GOOD question-
+    shaped stems that its own solution restates, and the merge must never let
+    a contaminated re-read replace a valid stem."""
+
+    def _rec(self, qn, stem, sol, **kw):
+        r = {"q_no": qn, "question_text": stem, "options": None,
+             "correct_option": None, "solution_text": sol, "tables": [],
+             "has_figure_in_question": False, "has_figure_in_solution": False,
+             "_prov": {}}
+        r.update(kw)
+        return r
+
+    # -- 1. a short QUESTION-SHAPED stem restated by its own solution is NOT
+    #        contamination (the run-12 false-positive class) ---------------
+    def test_question_shaped_stem_restated_by_solution_is_kept(self):
+        stem = ("Which of the following drugs is most likely to improve the "
+                "negative symptoms of schizophrenia?")
+        sol = ("The correct answer is clozapine. The drug that improves the "
+               "negative symptoms of schizophrenia is clozapine, which is "
+               "reserved for treatment-resistant cases.")
+        rec = self._rec(1, stem, sol)
+        # high token overlap with the solution, but question-shaped + short ->
+        # a GOOD stem, not contamination
+        self.assertIsNone(qp._stem_reject_reason(stem, rec))
+
+    def test_declarative_solution_prose_is_still_rejected(self):
+        # long declarative explanation-as-stem (the real contamination class)
+        sol = ("The correct answer is A. In Korsakoff syndrome the amnesia "
+               "is characterised by anterograde and retrograde memory loss "
+               "with confabulation, and the pathology lies in the mammillary "
+               "bodies and the dorsomedial nucleus of the thalamus with "
+               "severe vitamin B1 deficiency being the underlying cause.")
+        rec = self._rec(5, sol, sol)
+        self.assertIsNotNone(qp._stem_reject_reason(sol, rec))
+
+    def test_explanation_opener_is_still_rejected(self):
+        # "Option A:" opener -> contamination regardless of length
+        stem = "Option A: CAGE questionnaire is used for addiction cases"
+        rec = self._rec(1, stem, "Option A: CAGE questionnaire is used for "
+                                "addiction and substance abuse cases")
+        self.assertIsNotNone(qp._stem_reject_reason(stem, rec))
+
+    # -- 2. merge: a contaminated incoming stem must never replace a valid one
+    def test_merge_keeps_valid_stem_over_contaminated(self):
+        good = ("Which of the following drugs is most likely to improve the "
+                "negative symptoms of schizophrenia?")
+        sol = ("The correct answer is clozapine. The drug that improves the "
+               "negative symptoms of schizophrenia is clozapine, which is "
+               "reserved for treatment-resistant cases.")
+        recs = {1: self._rec(1, good, sol)}
+        contaminated = ("The correct answer is clozapine. The drug that "
+                        "improves the negative symptoms of schizophrenia is "
+                        "clozapine, which is reserved for treatment-resistant "
+                        "cases and should be tried before the others fail.")
+        qp.merge_question_records(recs, [
+            {"q_no": 1, "question_text": contaminated,
+             "solution_text": sol, "options": None, "correct_option": None,
+             "tables": [], "_prov": "Q_PASS"}], {"chapter_id": "PSY-001"})
+        self.assertEqual(recs[1]["question_text"], good)   # valid stem survived
+
+    def test_merge_does_not_fill_empty_stem_with_contaminated(self):
+        sol = ("The correct answer is B. Body dysmorphic disorder involves "
+               "a preoccupation with an imagined defect in appearance that "
+               "causes clinically significant distress and impaired "
+               "functioning with repetitive checking behaviours.")
+        recs = {9: self._rec(9, None, sol)}
+        qp.merge_question_records(recs, [
+            {"q_no": 9, "question_text": sol, "solution_text": sol,
+             "options": None, "correct_option": None, "tables": [],
+             "_prov": "Q_PASS"}], {"chapter_id": "PSY-009"})
+        self.assertIsNone(recs[9]["question_text"])       # stayed empty for retry
+
+    def test_stem_conflict_resolver_never_picks_contaminated(self):
+        # stem conflict: old clean vs new contaminated -> must keep old even
+        # though the contaminated variant coheres with the solution perfectly
+        good = ("Which of the following is the most common defence mechanism "
+                "used by patients with conversion disorder?")
+        sol = ("The correct answer is repression. The defence mechanism used "
+               "by patients with conversion disorder is repression, in which "
+               "the anxiety is pushed into the unconscious and converted into "
+               "a physical symptom.")
+        recs = {1: self._rec(1, good, sol)}
+        contaminated = ("The defence mechanism used by patients with "
+                        "conversion disorder is repression, in which the "
+                        "anxiety is pushed into the unconscious and converted "
+                        "into a physical symptom, and this is the most common "
+                        "mechanism seen in this population.")
+        qp.merge_question_records(recs, [
+            {"q_no": 1, "question_text": contaminated,
+             "solution_text": sol, "options": None, "correct_option": "B",
+             "tables": [], "_prov": "Q_PASS"}], {"chapter_id": "PSY-001"})
+        self.assertEqual(recs[1]["question_text"], good)
+
+    # -- 3. retry strategy switch: after a contamination block, the prompt is
+    #        stem-region-only for that q ------------------------------------
+    def test_stem_only_prompt_after_contamination_block(self):
+        rec = self._rec(3, None, "some solution text")
+        prompt = qp.build_targeted_retry_prompt([(3, ["question"])], {3: rec},
+                                                stem_only_qns={3})
+        self.assertIn("QUESTION STEM", prompt)
+        self.assertIn("option labels", prompt)
+        self.assertIn("Do NOT include any option text", prompt)
+        # the plain (non-stem-only) prompt asks for stem + options together
+        plain = qp.build_targeted_retry_prompt([(3, ["question"])], {3: rec})
+        self.assertIn("all four options", plain)
+        self.assertNotIn("option labels", plain)
+
+    # -- 4. Q-pass activation on solution windows ---------------------------
+    def test_q_pass_skipped_on_pure_solution_window(self):
+        self.assertFalse(qp._should_run_q_pass("S", False, None, False))
+        self.assertFalse(qp._should_run_q_pass("S", False, None, True))
+        # but runs when the window carries the boundary tail or a Q carry
+        self.assertTrue(qp._should_run_q_pass("S", True, None, False))
+        self.assertTrue(qp._should_run_q_pass("S", False, {"last_open_question": 5},
+                                              False))
+        # and always on Q windows / before the extraction boundary
+        self.assertTrue(qp._should_run_q_pass("Q", False, None, False))
+        self.assertFalse(qp._should_run_q_pass("Q", False, None, True))
+
+    # -- 5. malformed-JSON recovery status ----------------------------------
+    def test_recovered_after_error_is_retryable_not_unresolved(self):
+        # a successful same-batch re-ask after malformed JSON is a RECOVERED
+        # pass (run-12 ledger fix: ch13 was falsely flagged UNRESOLVED)
+        self.assertEqual(qp._classify_pass_status("A", "A", 14, True, True),
+                         qp.PASS_STATUS_RETRYABLE_FAILURE)
+        self.assertNotEqual(qp._classify_pass_status("A", "A", 14, True, True),
+                            qp.PASS_STATUS_UNRESOLVED)
 
 
 class ValidatorContaminationTests(unittest.TestCase):

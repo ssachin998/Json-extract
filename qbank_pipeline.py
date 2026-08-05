@@ -66,11 +66,16 @@ DATA_DIR = OUTPUT_ROOT / "data"
 ASSETS_DIR = OUTPUT_ROOT / "assets"
 STATE_FILE = OUTPUT_ROOT / "state.json"
 
-MAX_CALLS_PER_DAY = 1400        # self-imposed brake with ~7% buffer under the
-                                 # free tier's 1500 requests/day (per project;
-                                 # buffer covers shared-key use by other bots,
-                                 # page-by-page retries, and quota-window vs
-                                 # server-date misalignment). NOT Google's limit.
+MAX_CALLS_PER_DAY = 480         # RUN-12: the free tier's actual limit for
+                                 # gemini-3.1-flash-lite is 500 RPD (the
+                                 # run-12 log: "limit: 500, model:
+                                 # gemini-3.1-flash-lite"). The old 1400 brake
+                                 # never fired, so the pipeline ran into the
+                                 # hard 500 cap mid-run and wasted 2 calls on
+                                 # the 429 backoff before exiting. 480 stops
+                                 # the day GRACEFULLY with ~20 calls of
+                                 # headroom for transient retries; state.json
+                                 # resumes the next day.
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
@@ -840,17 +845,26 @@ def _clean_ocr_text(text):
 
 def _stem_reject_reason(qtext, rec=None):
     """Cross-field contamination proof for a would-be question stem
-    (run-7 hardening #3/#6). Returns a short reason string, or None when the
-    text plausibly IS a stem. A stem is rejected when it:
+    (run-7 hardening #3/#6, refined run-12). Returns a short reason string,
+    or None when the text plausibly IS a stem. A stem is rejected when it:
       1. opens with explanation-style language ("Option A:", "Ans. is B",
-         "The correct answer is", "Solution to Question N:" ...);
+         "The correct answer is", "Solution to Question N:" ...) -- this is
+         the reliable contamination signal (ch7 q1's "Option A: CAGE
+         questionnaire..." case) and is unchanged;
       2. is substantially contained in the record's OWN solution text
-         (>=CONTAMINATION_TOKEN_SHARE of its tokens appear there) -- a real
-         stem shares clinical vocabulary but never ~80% of its tokens with
-         its own explanation.
-    Conservative by design: short/ambiguous text is never rejected here (the
-    validator + find_incomplete treat 'missing' as retry-eligible, so a false
-    rejection only costs a re-ask, while a false ACCEPT ships corruption)."""
+         (>=CONTAMINATION_TOKEN_SHARE of its tokens) AND is NOT a plausible
+         real stem. Run-12 correction: solutions RESTATE question-shaped
+         stems ("The correct answer is B. The patient presents with...").
+         A short, question-shaped text that shares tokens with its own
+         solution is a GOOD stem, not contamination -- flagging it stripped
+         real stems (ch1 q3/q4/q10, ch2 q25, ch7 q1/q23-26, ch11 q1/q17)
+         and dead-ended retry ("blocked contaminated stem ... still
+         stem-missing" for every round, rescue 0 fields). Only DECLARATIVE
+         text (> _MAX_REAL_STEM_LEN or not question-shaped) is flagged by
+         the token-containment rule.
+    A false rejection costs a stem (shipped empty + gated); a false accept
+    ships corruption -- so the explanation-opener rule stays strict and only
+    the token-containment rule is narrowed to declarative/long text."""
     t = (qtext or "").strip()
     if not t:
         return None
@@ -859,7 +873,8 @@ def _stem_reject_reason(qtext, rec=None):
     if rec and len(t) >= 60:
         sol = (rec.get("solution_text") or "").strip()
         if sol and _frag_mostly_present(t, sol, CONTAMINATION_TOKEN_SHARE):
-            return "stem text substantially contained in this record's own solution"
+            if len(t) > _MAX_REAL_STEM_LEN or not _QUESTION_SHAPED_RE.search(t):
+                return "stem text substantially contained in this record's own solution"
     return None
 
 
@@ -1308,8 +1323,16 @@ def find_incomplete_records(chapter_records, force_solution_qns=(), printed_solu
     return incomplete
 
 
-def build_targeted_retry_prompt(incomplete_items, chapter_records):
-    """Focused retry schema.  Tables must never be returned inside prose."""
+def build_targeted_retry_prompt(incomplete_items, chapter_records,
+                                stem_only_qns=None):
+    """Focused retry schema.  Tables must never be returned inside prose.
+    stem_only_qns (run-12): q_nos whose stem was contamination-blocked in a
+    previous round -- for these, ask for the STEM REGION ONLY (the text
+    between the printed question number and the first option label), never
+    the options/solution, and do NOT echo the (possibly contaminated)
+    existing text. This breaks the run-12 dead-end where retry kept returning
+    the same solution prose and the guard kept blocking it."""
+    stem_only = set(stem_only_qns or ())
     lines = [
         "You already extracted most of this chapter from these SAME pages. Find ONLY the requested missing pieces.",
         "Return ONLY a valid JSON array, beginning with [ and ending with ]. No prose or markdown fences.",
@@ -1324,7 +1347,19 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records):
         qtext = (rec.get("question_text") or "")[:120]
         lines.append(f"Question {qn} (stem begins: {qtext!r}):")
         if "question" in missing:
-            lines.append(f"- Return full verbatim question stem and all four options A-D for q{qn}.")
+            if qn in stem_only:
+                # RUN-12: stem-region-only ask. The earlier broad ask kept
+                # returning the solution text; a tight region instruction
+                # cannot be satisfied by explanation prose.
+                lines.append(
+                    f"- Return ONLY q{qn}'s QUESTION STEM: the exact sentence(s) "
+                    f"printed directly under the question number and ABOVE the "
+                    f"option labels (A./B./C./D.). The stem is the question the "
+                    f"options answer. Do NOT include any option text, answer "
+                    f"letter, explanation, or 'Solution to Question' text. If "
+                    f"the page shows no stem region for q{qn}, return null.")
+            else:
+                lines.append(f"- Return full verbatim question stem and all four options A-D for q{qn}.")
         if "answer" in missing:
             lines.append(f"- Return the correct option letter for q{qn} from the printed answer key.")
         if "options" in missing:
@@ -1371,6 +1406,7 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
     total_fixed = 0
     first_check = True
     forced = set(force_solution_qns or ())
+    stem_blocked = set()   # run-12: q_nos whose stem retry was contamination-blocked
     for round_no in range(1, max_rounds + 1):
         incomplete = find_incomplete_records(chapter_records, force_solution_qns=forced,
                                              printed_solution_qns=printed_solution_qns)
@@ -1400,7 +1436,8 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
         print(f"  [RETRY] round {round_no}: {len(incomplete)} question(s) still "
               f"incomplete ({preview}) -- sending targeted re-ask")
 
-        prompt = build_targeted_retry_prompt(incomplete, chapter_records)
+        prompt = build_targeted_retry_prompt(incomplete, chapter_records,
+                                          stem_only_qns=stem_blocked)
         # Resilient execution (run-4 lesson, ch9/ch16): never ONE heavy
         # whole-chapter call that fails as a unit -- back off on transient
         # 5xx, split halves->singles on any failure. A recitation-prone
@@ -1443,8 +1480,10 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                 if stem_reason:
                     stats.setdefault("contaminated_stems_blocked", 0)
                     stats["contaminated_stems_blocked"] += 1
+                    stem_blocked.add(qn)   # switch to stem-region-only ask next round
                     print(f"  [RETRY] blocked contaminated stem for q{qn} "
-                          f"({stem_reason}) -- kept for review, still stem-missing")
+                          f"({stem_reason}) -- kept for review, still stem-missing; "
+                          f"next round will ask for the stem region ONLY")
                     _log_blocked_retry_fragment(chapter_id, qn, f"contaminated stem: {stem_reason}",
                                                 incoming_q)
                 else:
@@ -1782,7 +1821,21 @@ def build_section_windows(page_files, pdf_path):
             windows.append((w, "Q"))
     s_pages = [p for p in ordered if p >= solutions_start]
     if s_pages:
-        for w in chunks(s_pages, SOLUTIONS_CHUNK_PAGES, SECTION_OVERLAP_PAGES):
+        # RUN-12 CROSS-SECTION OVERLAP: include the LAST question-section
+        # page (solutions_start - 1) as the first page of the FIRST S window.
+        # A question that spans the boundary (stem on the question side,
+        # options/solution tail on the first solution page) is then seen by
+        # the Q-pass as an OVERLAP page of that S window -- without this, the
+        # boundary split silently dropped the tail (a class of the run-12
+        # missing-options / missing-stem records at every Q/S boundary).
+        first_s = [p for p in s_pages[:SOLUTIONS_CHUNK_PAGES]]
+        if q_pages and first_s and (solutions_start - 1) in q_pages \
+                and (solutions_start - 1) not in first_s:
+            first_s = [solutions_start - 1] + first_s[:SOLUTIONS_CHUNK_PAGES - 1]
+        windows.append((first_s, "S"))
+        covered = set(first_s) & set(s_pages)
+        rest = [p for p in s_pages if p not in covered]
+        for w in chunks(rest, SOLUTIONS_CHUNK_PAGES, SECTION_OVERLAP_PAGES):
             windows.append((w, "S"))
     return windows
 
@@ -1869,6 +1922,22 @@ def block_headers_on_page(pdf_path, file_page, chapter_records):
 OPTION_LABEL_RE = re.compile(r"^\s*([A-D])\s*[.)]\s*(.*)$", re.IGNORECASE)
 _OPTION_ROW_TOL = 3.0      # labels on the same visual line share a baseline
 _OPTION_X_MARGIN = 20.0    # x-distance tie margin (ambiguous if too close)
+
+# --- run-12 stem-contamination discriminator -------------------------------
+# Medical solutions routinely RESTATE the question stem ("The correct answer
+# is B. The patient presents with ... as described above"), so a short,
+# QUESTION-SHAPED stem can legitimately share >=80% of its tokens with its own
+# solution. Flagging that as contamination destroyed GOOD stems (ch1 q3/q4/q10,
+# ch2 q25, ch7 q1/q23-26, ch11 q1/q17, ch16 q2/q10 in run-12) and sent the
+# retry into a dead-end ("blocked contaminated stem ... still stem-missing"
+# for every round). A genuinely contaminated stem is DECLARATIVE explanation
+# prose or implausibly long; a real stem is question-shaped and short.
+_QUESTION_SHAPED_RE = re.compile(
+    r"\?\s*$|which\b|what\b|who\b|whom\b|how\b|why\b|identify\b|choose\b|"
+    r"select\b|best\b|most likely\b|correct\b|diagnos|drug\b|treatment\b|"
+    r"following\b|regarding\b|according\b|is the\b|are the\b|of the\b",
+    re.IGNORECASE)
+_MAX_REAL_STEM_LEN = 250   # a printed MCQ stem is never longer than this
 
 
 def option_anchors_in_block(pdf_path, file_page, y_head, y_bottom):
@@ -2058,7 +2127,16 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
         return {}
     header_re = re.compile(r"Solution\s+to\s+Question\s+(\d{1,3})", re.IGNORECASE)
     stem_re_cache = {}
-    key_row_re = re.compile(r"(?m)^\s*\|\s*(\d{1,3})\s*\|")   # table row "| 13 |"
+    # RUN-12 ANSWER-KEY ROW MATCHERS: an answer-missing record's rescue must
+    # target the page where its answer is printed. The key table can appear in
+    # several formats -- a markdown pipe row ("| 13 | B |"), a column list
+    # ("13. B"), or a compact "13-B" line -- and its page may not carry the
+    # KEY_TABLE_PROBE header ("Answer Key"), so we match rows on EVERY page
+    # and only use the header to give key-looking pages a stronger vote.
+    key_row_re = re.compile(
+        r"(?m)^\s*\|\s*(\d{1,3})\s*\|\s*([A-Da-d])\s*\|"          # | 13 | B |
+        r"|^\s*(\d{1,3})\s*[.)]\s*([A-Da-d])\s*$"                # 13. B / 13) B
+        r"|^\s*(\d{1,3})\s*[-–]\s*([A-Da-d])\s*$")               # 13 - B
     for pf in page_files:
         try:
             page_no = int(pf.stem.split("-")[-1])
@@ -2078,9 +2156,15 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
             qn = int(m.group(1))
             if qn in pages:
                 pages[qn].add(page_no)
+        # answer rows (match on any page; header strengthens but is not
+        # required -- ch15 q15's key page did not carry the probe header)
+        for m in key_row_re.finditer(text):
+            qn = int(m.group(1) or m.group(3) or m.group(5))
+            if qn in pages:
+                pages[qn].add(page_no)
         if is_key_page:
-            # answer-table rows -> each row's q_no locates its answer here
-            for m in key_row_re.finditer(text):
+            # even a headerless table still puts every row's q on this page
+            for m in re.finditer(r"(?m)^\s*\|\s*(\d{1,3})\s*\|", text):
                 qn = int(m.group(1))
                 if qn in pages:
                     pages[qn].add(page_no)
@@ -3325,11 +3409,27 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                         "similarity": round(sim, 3), "verdict": "fill-only kept-existing",
                         "old_stem": old_q[:600], "new_stem": new_q[:600]})
                 else:
-                    co, cn = _stem_payload_coherence(old_q, rec), _stem_payload_coherence(new_q, rec)
-                    if abs(co - cn) >= STEM_COHERENCE_MARGIN and max(co, cn) > 0:
-                        keep, verdict = (old_q, "kept-old") if co > cn else (new_q, "kept-new")
+                    # RUN-12 STEM-CONTAMINATION PROTECTION: the coherence
+                    # resolver must NEVER let solution-prose win. A
+                    # contaminated "stem" IS the record's own solution text,
+                    # so its payload coherence is artificially HIGH -- the
+                    # resolver would pick "kept-new" and replace a GOOD stem
+                    # with the solution, after which the sweep strips it and
+                    # retry dead-ends (the run-12 recurring class). Check
+                    # both variants for contamination FIRST; a contaminated
+                    # variant can never be chosen over a clean one.
+                    new_contam = _stem_reject_reason(new_q, rec)
+                    old_contam = _stem_reject_reason(old_q, rec)
+                    if new_contam and not old_contam:
+                        keep, verdict = old_q, "kept-old (new variant contaminated)"
+                    elif old_contam and not new_contam:
+                        keep, verdict = new_q, "kept-new (old variant contaminated)"
                     else:
-                        keep, verdict = old_q, "kept-old (undecidable -- review logged)"
+                        co, cn = _stem_payload_coherence(old_q, rec), _stem_payload_coherence(new_q, rec)
+                        if abs(co - cn) >= STEM_COHERENCE_MARGIN and max(co, cn) > 0:
+                            keep, verdict = (old_q, "kept-old") if co > cn else (new_q, "kept-new")
+                        else:
+                            keep, verdict = old_q, "kept-old (undecidable -- review logged)"
                     stats["stem_conflicts"] = stats.get("stem_conflicts", 0) + 1
                     _append_jsonl(DATA_DIR / "stem_conflicts.jsonl", {
                         "q_no": qn, "chapter_id": stats.get("chapter_id"),
@@ -3342,7 +3442,26 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                     rec["question_text"] = keep
                 item = {**item, "question_text": None}  # block the generic loop below
         for k in ["question_text", "solution_text"]:
-            if item.get(k):
+            if not item.get(k):
+                continue
+            if k == "question_text":
+                # RUN-12: never fill or overwrite a stem with contaminated
+                # solution prose (the run-12 dead-end source). A contaminated
+                # incoming stem is dropped regardless of fill_only; an
+                # existing valid stem is never replaced by one.
+                if _stem_reject_reason(item[k], rec):
+                    stats.setdefault("contaminated_stems_blocked", 0)
+                    stats["contaminated_stems_blocked"] += 1
+                    print(f"  [WARN] q{qn}: dropped contaminated stem at merge "
+                          f"({_stem_reject_reason(item[k], rec)}) -- existing "
+                          f"stem kept; field stays retry-eligible")
+                    item = {**item, "question_text": None}
+                    continue
+                if fill_only and rec.get(k):
+                    continue  # recovery: never overwrite existing content
+                rec[k] = item[k]
+                rec["_prov"][k] = prov   # provenance of every patched field
+            else:
                 if fill_only and rec.get(k):
                     continue  # recovery: never overwrite existing content
                 rec[k] = item[k]
@@ -4011,6 +4130,19 @@ PASS_STATUS_UNRESOLVED = "UNRESOLVED"
 _PASS_SECTION_OK = {"Q": "Q", "A": "A", "S": "S"}
 
 
+def _should_run_q_pass(section, has_question_overlap, q_carry, solutions_section_seen):
+    """RUN-12: whether the Q-pass should run on this window. On a window the
+    section planner labeled "S" (all pages >= solutions_start), Q-pass runs
+    ONLY when the window carries question-section overlap pages (the boundary
+    tail) or a live Q carry (a question genuinely continuing into the
+    solutions). Running Q-pass over the whole solution section was the
+    upstream source of the run-12 contaminated stems (Q read solution prose
+    as question_text) and the resulting retry dead-end."""
+    if section == "S" and not has_question_overlap and not q_carry:
+        return False
+    return not solutions_section_seen
+
+
 def _classify_pass_status(pass_name, section, n_items, had_error, recovered_all):
     """Structured extraction status (run-11 point B): a zero-item pass is
     EXPECTED_EMPTY when the window's section is NOT the pass's section;
@@ -4241,7 +4373,17 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             probe = probe_batch_pages(pdf_path, window_pages)
             do_s = solutions_section_seen or probe["solutions"]
             do_a = probe["key_table"]
-            do_q = not solutions_section_seen
+            # RUN-12 Q-PASS ACTIVATION FIX: on a window the section planner
+            # labeled "S" (all pages >= solutions_start), the Q-pass must NOT
+            # run over the whole solution section -- that is the upstream
+            # source of the contaminated stems (Q read solution prose as
+            # question_text on pages 13-17, 17-21, 122-126, ... and the
+            # merge/guard then dead-ended). Q-pass on an S window runs ONLY
+            # when the window carries question-section overlap pages (the
+            # boundary tail) or a live Q carry (a question genuinely
+            # continuing into the solutions).
+            do_q = _should_run_q_pass(section, bool(overlap_pages),
+                                       carry_by_pass.get("Q"), solutions_section_seen)
             if not (do_q or do_s or do_a):
                 do_q = True  # eerily silent page (figures only?) -- default to Q-pass
 
@@ -4346,6 +4488,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                             raw_items = call_gemini_on_pages(genai_model, pass_batch,
                                                              context=context_str,
                                                              prompt=prompt)
+                            # RUN-12 LEDGER FIX: a SUCCESSFUL same-batch re-ask
+                            # is a full recovery -- without this flag the pass
+                            # was classified UNRESOLVED (ch13 gate flagged
+                            # unresolved_page_A [175-179] even though the
+                            # re-ask returned 14 items).
+                            pass_recovered = True
                             state["calls_today"] += 1
                             save_state(state)
                         except Exception as e2:

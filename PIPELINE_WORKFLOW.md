@@ -523,6 +523,53 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
+### 4.26 Changelog — 2026-08-05 (run-12: contaminated-stem dead-end + recovery targeting)
+
+Second full-book run ended `89 flag(s) across 23/33 chapters`. Log forensics
+(18 chunks) + code inspection. Full matrix: `debug/root_cause_report.json`.
+
+**RC-12A — Contaminated-stem dead-end (dominant, ~all missing stems).**
+Two compounding bugs:
+1. `_stem_reject_reason` flagged ANY text whose tokens are ≥80% contained in
+   the record's own solution. Medical solutions RESTATE the stem ("The
+   correct answer is B. The patient presents with..."), so short
+   QUESTION-SHAPED stems legitimately passed the threshold and were stripped
+   as "contaminated" (false positive) — ch1 q3/q4/q10, ch2 q25, ch7
+   q1/q23-26, ch11 q1/q17, ch16 q2/q10.
+2. When a real contaminated re-read arrived, the stem-conflict coherence
+   resolver preferred it (solution-prose coheres perfectly with the
+   solution payload) and the generic merge loop overwrote — so a GOOD stem
+   was replaced, the sweep stripped it, and retry/rescue then looped the
+   same blocked text ("blocked contaminated stem ... still stem-missing",
+   rescue 0 fields, export-gate missing_stem).
+**Fix:** the token-containment rule now only fires for DECLARATIVE or
+>250-char text (question-shaped short stems are kept); merge never lets a
+contaminated stem replace a valid one (stem-conflict + generic write
+guards); after one contamination block, retry switches to a STEM-REGION-ONLY
+prompt; and the Q-pass no longer runs over pure-solution windows (the
+upstream contamination source) — with 1-page cross-section overlap at the
+Q/S boundary so boundary-spanning question tails are preserved.
+
+**RC-12B — Answer rescue targeting.** `locate_missing_record_pages` only
+matched pipe-format key rows on pages with the "Answer Key" header, so
+answer-missing records' rescue asked the question page (ch15 q15 -> page 194
+-> 0 fields). Answer rows are now matched on every page in pipe / list
+("13. B") / dash ("13 - B") formats, header optional.
+
+**RC-12C — Quota brake.** The real free-tier limit for this model is 500 RPD
+(log: "limit: 500, model: gemini-3.1-flash-lite"); `MAX_CALLS_PER_DAY`
+1400->480 so the daily stop is graceful instead of a hard 429 mid-run.
+
+**RC-12D — Ledger false UNRESOLVED.** A successful same-batch re-ask after
+malformed JSON left `pass_recovered=False` -> the pass was marked UNRESOLVED
+(ch13 flagged `unresolved_page_A [175-179]` even though 14 items came back).
+Now `pass_recovered=True` on the re-ask.
+
+Tests: `Run12StemContaminationTests` (8) + `test_locate_answer_rows_without_probe_header`
++ SectionWindowTests boundary-overlap updates. 100 total, all green.
+
+---
+
 ### 4.24 Changelog — 2026-08-04 (option-level image ownership, run-10)
 
 Investigation (user asked: "do images that belong to MCQ options A/B/C/D get

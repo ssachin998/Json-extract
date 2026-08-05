@@ -1,137 +1,97 @@
 {
-  "run": "2026-08-04 full-book PSY run (33 chapters)",
-  "log_source": "deployment a4eb90ab / replica 2d7c8999 (Railway), 10:39-11:32 UTC",
-  "final_validation": "96 flag(s) across 27/33 chapters",
-  "generated_by": "qbank_pipeline run-11 forensic pass",
+  "run": "2026-08-05 full-book PSY run (run-12, after run-11 fixes)",
+  "log_source": "deployment log (18 chunks parsed; two-day run 2026-08-04 19:05 -> 2026-08-05, quota-stop at 500 RPD then resume)",
+  "final_validation": "89 flag(s) across 23/33 chapters",
+  "generated_by": "qbank_pipeline run-12 forensic pass",
   "evidence_limits": {
     "volume_artifacts_available": false,
-    "note": "data/validation_report.json, questions.jsonl, orphans.jsonl, unmatched_images.jsonl, state.json, assets and the source PDF live on the Railway volume and were NOT available in the sandbox. This matrix is built from the deployment log (54 chunks parsed) + source-code inspection. Source-page-level proof for each flag requires the volume artifacts; see remaining_uncertainty."
+    "note": "validation_report.json / questions.jsonl / orphans.jsonl / state.json / assets / source PDF live on the Railway volume and were not available in the sandbox. This matrix is built from the deployment log + source-code inspection. export_gate.jsonl and page_ledger.jsonl are now emitted by the pipeline so the next run is fully auditable."
   },
   "root_causes": [
     {
-      "id": "RC-1",
-      "stage": "image_finalization",
-      "title": "Stale-path image lifecycle: figure-map claims rename temp files but the caller keeps the stale temp names -> 4th-pass FileNotFoundError -> false 'unmatched image'",
+      "id": "RC-12A",
+      "stage": "merge + contamination guard",
+      "title": "Contaminated-stem dead-end: GOOD question-shaped stems destroyed by the token-containment guard, then retry/rescue loop forever returning the same blocked text",
       "evidence": [
-        "[IMG] figure-map: PSY/PSY-p67-150.webp -> PSY-005-003 (question side, model-declared)",
-        "[INFO] Page 67: image(s) ['PSY/PSY-p67-150.webp', 'PSY/PSY-p67-151.webp'] unclaimed for now",
-        "[IMG] attribution call failed for PSY/PSY-p67-150.webp: [Errno 2] No such file or directory: '/data/qbank_output_v2/assets/questions/PSY/PSY-p67-150.webp'",
-        "same triple for p83-186, p104-229, p119-260, p120-263"
+        "[SWEEP] q3/q4/q10: stripped contaminated stem (stem text substantially contained in this record's own solution)",
+        "[RETRY] blocked contaminated stem for q3/q4/q10 ... still stem-missing (round 1 AND round 2)",
+        "[RESCUE] page 14: q4 -> 0 field(s) filled; page 16: q10 -> 0 field(s) filled",
+        "[GATE] chapter 1: missing_stem 4, missing_stem 10",
+        "SAME pattern in ch2 q25, ch6 q5, ch7 q1/q23-26, ch10 q5, ch11 q1/q17, ch13 q2/q11, ch16 q2/q10",
+        "carry-forward used only 1 time in the WHOLE run"
       ],
-      "mechanism": "claim_figure_map_images renames (moves) each claimed temp file to its final slot name. The run-9 window loop only updated leftover_by_page[page] for pages present in fig_leftover; a page whose images were ALL claimed is absent from fig_leftover, so its STALE TEMP NAMES stayed in the leftover list -> appended to unmatched_images -> the 4th pass tried to open a moved file -> FileNotFoundError -> logged as unmatched even though the image WAS owned.",
-      "affected": "ch3 unmatched:1, ch5 unmatched:1, ch6 unmatched:1, ch7 unmatched:1, ch9 unmatched:2 (and any chapter where the figure-map claimed images)",
-      "fix": "window loop now clears leftover_by_page[page] = [] for every page fed to the figure-map that is absent from fig_leftover; attribute_orphan_image returns {'decorative':'already_claimed'} for missing files (no Gemini call); the 4th pass drops already-claimed refs instead of recording unmatched.",
-      "regression_test": "test_stale_path_returns_already_claimed_not_unmatched, test_figure_map_fully_claimed_page_returns_empty_leftover"
+      "mechanism": "Two compounding bugs: (1) _stem_reject_reason flagged ANY text whose tokens are >=80% contained in the record's own solution -- but medical solutions RESTATE the stem ('The correct answer is B. The patient presents with...'), so short QUESTION-SHAPED stems legitimately passed the threshold and were stripped as 'contaminated' (false positive). (2) When a real contamination re-read arrived, the stem-conflict coherence resolver preferred it (solution-prose coheres perfectly with the solution payload), replacing the GOOD stem -- and the generic merge loop overwrote stems with contaminated text. Result: stem lost -> retry re-asks the same solution pages -> guard blocks the same text every round -> rescue 0 fields -> export-gate missing_stem.",
+      "first_wrong_stage": "merge (stem-conflict resolver + generic overwrite) and contamination-guard false positive",
+      "fix": "1) _stem_reject_reason now only flags token-containment for DECLARATIVE or >250-char text (a question-shaped short stem restated by its solution is kept); 2) merge never lets a contaminated incoming stem replace a valid one (stem-conflict + generic write guards); 3) targeted_retry switches to a STEM-REGION-ONLY prompt after one contamination block; 4) Q-pass no longer runs on pure-solution windows (upstream contamination source), with 1-page cross-section overlap at the Q/S boundary preserving boundary-spanning question tails.",
+      "regression_test": "Run12StemContaminationTests (8 cases) + SectionWindowTests boundary-overlap updates"
     },
     {
-      "id": "RC-2",
-      "stage": "anchor_detection",
-      "title": "q_no=None items with REAL content (options, stems, solutions) silently orphaned; never reconciled to the stem-less records they belong to",
+      "id": "RC-12B",
+      "stage": "answer reconciliation / rescue targeting",
+      "title": "Answer-missing records' rescue targets the wrong page (question page, not the key page) and key pages without the 'Answer Key' header are missed",
       "evidence": [
-        "[WARN] Gemini returned an item with no q_no, skipping: {'q_no': None, 'question_text': None, 'options': {'A': 'Kleine-Levin syndrome...', ...}} (x5, ch2 pages 30-33)",
-        "[GEMINI:Q] pages 30-33 | items: 5 | orphans buffered: 5",
-        "chapter 2 done -> 16 questions (2 missing answer, ...) | orphans: 5 unresolved"
+        "ch15 q15 missing answer; [RESCUE] page 194: q15 -> 0 field(s) filled (194 is a question page; the key row is elsewhere)",
+        "ch7 4 missing answers; rescue pages 100/105 -> 0 filled",
+        "ch2 q25 missing answer + bad options + missing stem (the q_no=None option-definition fragments were never reconciled)"
       ],
-      "mechanism": "merge_question_records skips q_no=None items into the orphan buffer; recover_orphans rule 3 needs last_qn_in_batch, which is None when the whole window's items are q_no=None fragments; the fragments carry options for stem-less records (q25/q26) that are NEVER reconciled.",
-      "affected": "ch2 q25/q26 stem-less + 5 unresolved orphans; ch7 q1/q23-26; ch10; ch31; ch33 orphans",
-      "fix": "not fully solvable without page coordinates; improved answer-key targeting + export gate make the gap EXPLICIT instead of silent; q_no=None items with options and no stem are now reportable via the export gate. Full fix requires per-fragment page coords (see remaining_uncertainty).",
-      "regression_test": "export-gate missing_stem/answer tests"
+      "mechanism": "locate_missing_record_pages only matched answer rows on pages carrying the KEY_TABLE_PROBE header, and only in '| qn |' pipe format; a key page with '13. B' rows and no header was never located, so the answer-only rescue asked the wrong page and the record shipped answer=null.",
+      "first_wrong_stage": "rescue page targeting (locate_missing_record_pages)",
+      "fix": "answer-row matchers now run on EVERY page in pipe ('| 13 | B |'), list ('13. B') and dash ('13 - B') formats, header optional; header pages still get a stronger vote. The answer-only rescue prompt targets the located key page.",
+      "regression_test": "test_locate_answer_rows_without_probe_header"
     },
     {
-      "id": "RC-3",
-      "stage": "merge / contamination filter",
-      "title": "Contaminated-stem catch-22: sweep strips a stem whose text overlaps the record's solution; retry/rescue return the same class of text and are blocked again -> the record ships STEM-LESS while '0 missing answer / 0 missing solution' hides it",
+      "id": "RC-12C",
+      "stage": "quota accounting",
+      "title": "MAX_CALLS_PER_DAY=1400 never fired; the run hit the model's REAL 500 RPD cap mid-chapter and wasted 2 calls on the 429 backoff before exiting",
       "evidence": [
-        "[SWEEP] q3/q4/q10: stripped contaminated stem ... targeted retry will refill it",
-        "[RETRY] blocked contaminated stem for q3 ... still stem-missing",
-        "[RESCUE] page 14: q4 -> 0 field(s) filled",
-        "chapter 1 done -> 26 questions (0 missing answer, 0 missing solution)"
+        "status=429 ... limit: 500, model: gemini-3.1-flash-lite ... [QUOTA] still limited after backoff -- saving, exiting",
+        "run stopped 2026-08-04 19:37, resumed 2026-08-05 07:16"
       ],
-      "mechanism": "the stem-text-in-own-solution check is correct for the Option-A/B-prose class (ch7 q1 'Option A: CAGE questionnaire...'), but when the real stem was never captured the retry keeps offering solution-like text; the guard blocks it (correctly) and nothing refills the stem. The chapter summary counted ONLY answers/solutions, so stem-less records were invisible.",
-      "affected": "ch1 q3/q4/q10, ch2 q25/q26, ch6 q5, ch7 q1/q23-26, ch9 q5, ch10 q5, ch32 q5 (typical)",
-      "fix": "summary now reports missing stem + bad options; export gate flags missing_stem; rescue uses field-specific prompts so a stem re-ask asks ONLY for the stem region.",
-      "regression_test": "test_export_gate_catches_missing_stems_and_answers"
+      "mechanism": "the self-brake was set for a 1500/day plan, but the free tier for this model is 500/day; the pipeline only stopped when the API rejected, burning 2 quota calls on the 65s backoff.",
+      "first_wrong_stage": "config (MAX_CALLS_PER_DAY)",
+      "fix": "MAX_CALLS_PER_DAY=480 (graceful daily stop with ~20-call headroom; resume via state.json).",
+      "regression_test": "n/a (config)"
     },
     {
-      "id": "RC-4",
-      "stage": "answer_reconciliation",
-      "title": "Missing answers despite an answer key in source: A-pass returns fewer key rows than the chapter has questions, and nothing cross-checks",
+      "id": "RC-12D",
+      "stage": "page ledger",
+      "title": "Malformed-JSON A-pass falsely marked UNRESOLVED even when the same-batch re-ask fully recovered",
       "evidence": [
-        "ch7: A-pass pages 108-111 items: 9 -> chapter 7 done -> 14 questions (4 missing answer)",
-        "ch2: 2 missing answer; ch18: 1; ch19: 2; ch24: 2 (user report)"
+        "[WARN] malformed JSON on A-pass pages [175..179] -- one same-batch re-ask",
+        "[GEMINI:A] pages 175-179 items: 14 (recovered)",
+        "[GATE] chapter 13: unresolved_page_A [175,176,177,178,179]: UNRESOLVED  <- FALSE",
+        "also malformed JSON A-pass 79-88 (10-page salvage recovered) and 503 on ch11 135-139 (single-page retry recovered)"
       ],
-      "mechanism": "the A-pass only fires when KEY_TABLE_PROBE_RE matches the window's text; a key table spanning pages outside the probed window, or a partial table read, silently leaves answers missing. No stage verifies 'answer table visibly contains qN -> answer must be filled'.",
-      "affected": "ch7 (4), ch2 (2), ch18 (1), ch19 (2), ch24 (2) — user-reported",
-      "fix": "locate_missing_record_pages now also finds ANSWER-KEY pages for answer-missing records; rescue uses an answer-only prompt (answer_rescue_prompt); export gate flags missing_answer so it can no longer hide.",
-      "regression_test": "test_locate_missing_record_pages_finds_answer_key_pages, test_answer_rescue_prompt_is_answer_only"
-    },
-    {
-      "id": "RC-5",
-      "stage": "rescue",
-      "title": "Rescue returns 0 fields: broad prompt + wrong target page + contamination/scope filters",
-      "evidence": [
-        "[RESCUE] page 14: q4 -> 0 field(s) filled",
-        "[RESCUE] page 22: q25,26 -> 0 field(s) filled",
-        "[RESCUE] page 100: q23,24,25,26 -> 0 field(s) filled",
-        "ch7 rescue: 0 filled / 2 calls; ch2 rescue: 0/1"
-      ],
-      "mechanism": "rescue re-asked the whole record with the broad targeted-retry prompt; for answer gaps it targeted the QUESTION page (not the answer-table page) and the returned text was often filtered by scope/contamination rules -> 0 fields.",
-      "fix": "field-specific prompts (answer-only ask for answer gaps) + answer-key page targeting; a rescue that fills 0 fields is now visible via the ledger (PARTIAL/UNRESOLVED status) instead of being counted as a completed recovery.",
-      "regression_test": "test_pass_status_classification"
-    },
-    {
-      "id": "RC-6",
-      "stage": "api_resilience",
-      "title": "503 / finish_reason=4 handling works (single-page retry + drain recovered pages) but recovery completeness is not asserted",
-      "evidence": [
-        "[GEMINI_ERROR] page-336.jpg: status=503 ... queued for second-chance drain",
-        "[DRAIN] page-336.jpg recovered on second chance",
-        "[GEMINI_ERROR] page-352..356: status=503 ... single-page retry: 5/5 pages recovered",
-        "ch31 S-pass batch 340 503 -> single-page retry: 2/2 recovered"
-      ],
-      "mechanism": "retries recovered the observed pages; but nothing tracks whether the recovery satisfied the page's extraction OBLIGATION (a page may come back 'recovered' with 0 items).",
-      "fix": "page/pass ledger with structured status (SUCCESS/EXPECTED_EMPTY/PARTIAL/RETRYABLE_FAILURE/UNRESOLVED) persisted to data/page_ledger.jsonl; chapter-end gate surfaces UNRESOLVED passes.",
-      "regression_test": "test_pass_status_classification"
-    },
-    {
-      "id": "RC-8",
-      "stage": "section_state_machine",
-      "title": "Section-boundary announcement fires repeatedly (every S window) because the text-layer S label never set the seen flag",
-      "evidence": [
-        "[SECTION] solutions section begins at page 13 ... (ch1)",
-        "[SECTION] solutions section begins at page 17 ... (ch1)",
-        "[SECTION] solutions section begins at page 22 / page 26 / page 30 ... (ch2)"
-      ],
-      "mechanism": "run-8 deliberately kept solutions_section_seen managed by the EXTRACTION boundary (so Q-pass stays active for questions tailing into solutions); the S-window branch re-logged + re-reset on EVERY S window because it never set any flag.",
-      "fix": "solutions_section_announced flag: the boundary is announced and carry reset once per chapter; Q-pass activation logic unchanged.",
-      "regression_test": "(covered by existing section tests; behavior verified in code)"
+      "mechanism": "pass_recovered was only set in the salvage-fail branch; a SUCCESSFUL same-batch re-ask left it False, so _classify_pass_status(had_error=True, recovered=False) -> UNRESOLVED even though the data came back.",
+      "first_wrong_stage": "ledger classification after malformed-JSON recovery",
+      "fix": "pass_recovered = True after a successful same-batch re-ask; recovered passes are RETRYABLE_FAILURE, not UNRESOLVED.",
+      "regression_test": "test_recovered_after_error_is_retryable_not_unresolved"
     }
   ],
   "validation_flag_groups": {
     "estimated_from_log": [
-      {"group": "missing_answer", "source": "RC-4", "count_source": "chapter summaries + user report (ch2 2, ch7 4, ch18 1, ch19 2, ch24 2)"},
-      {"group": "missing_stem (contaminated_question/empty_question)", "source": "RC-3", "note": "stems stripped and never refilled are the dominant hidden class"},
-      {"group": "unresolved_orphans", "source": "RC-2", "note": "ch1 1, ch2 5, ch7 1, ch8 1, ch10 1, ch31 1, ch33 1 (from summaries)"},
-      {"group": "unmatched_images", "source": "RC-1 (false positives) + genuine broken-crop refusals", "note": "ch3 1, ch5 1, ch6 1, ch7 1, ch9 2 — most are RC-1 stale-path false positives"},
-      {"group": "unresolved_image_assets", "source": "RC-1 FileNotFoundError paths"},
-      {"group": "contaminated_question", "source": "RC-3", "note": "correct detection; the gap is upstream stem capture"}
+      {"group": "missing_stem", "source": "RC-12A (dominant)", "chapters": "ch1 q4/q10, ch2 q25, ch7 q1/q23-26, ch10 q5, ch11 q1/q17, ch13 q2/q11, ch16 q2/q10, ch33 qN (user-reported)"},
+      {"group": "bad_options", "source": "RC-12A (q_no=None option fragments never reconciled) + RC-12B (options on boundary pages)", "chapters": "ch2 q25, ch7 q23-26, ch8 q7, ch19 q11/q12"},
+      {"group": "missing_answer", "source": "RC-12B (answer reconciliation/rescue targeting)", "chapters": "ch2 q25, ch7 q23-26, ch15 q15, ch18, ch19, ch24 (user-reported)"},
+      {"group": "unresolved_orphans", "source": "q_no=None fragments with real content (options/tables) that recover_orphans cannot anchor", "note": "pages 72-76, 104-107, 130-134, 133-134 in this run; requires per-fragment page-coordinate provenance for full reconciliation"},
+      {"group": "unresolved_image (conservative)", "source": "ambiguous figures kept unresolved per run-9/11 policy", "note": "correct behavior: never discarded, never guessed"}
     ],
-    "note": "exact per-flag accounting requires data/validation_report.json from the volume; the pipeline now writes data/export_gate.jsonl and data/page_ledger.jsonl so the next run is fully auditable."
+    "note": "exact per-flag accounting requires validation_report.json from the volume; the pipeline now writes export_gate.jsonl + page_ledger.jsonl per chapter."
   },
   "fixes_applied": [
-    {"id": "F1", "file": "qbank_pipeline.py", "function": "process_pdf window loop", "change": "clear leftover_by_page for figure-map-fully-claimed pages (stale-path fix)"},
-    {"id": "F2", "file": "qbank_pipeline.py", "function": "attribute_orphan_image / 4th pass", "change": "already_claimed guard for relocated files; drop stale refs from unmatched"},
-    {"id": "F3", "file": "qbank_pipeline.py", "function": "process_pdf S-boundary", "change": "solutions_section_announced announce-once flag"},
-    {"id": "F4", "file": "qbank_pipeline.py", "function": "locate_missing_record_pages", "change": "also locate ANSWER-KEY pages for answer-missing records"},
-    {"id": "F5", "file": "qbank_pipeline.py", "function": "answer_rescue_prompt + rescue call site", "change": "answer-only focused prompt for answer gaps"},
-    {"id": "F6", "file": "qbank_pipeline.py", "function": "chapter summary", "change": "report missing stem + bad options (visibility)"},
-    {"id": "F7", "file": "qbank_pipeline.py", "function": "page ledger", "change": "per-window-pass structured status -> data/page_ledger.jsonl"},
-    {"id": "F8", "file": "qbank_pipeline.py", "function": "_export_gate_violations + chapter-end gate", "change": "deterministic pre-export gate -> data/export_gate.jsonl"}
+    {"id": "F1", "file": "qbank_pipeline.py", "function": "_stem_reject_reason", "change": "question-shaped short stems restated by their own solution are no longer flagged as contamination (only declarative/>250-char text is)"},
+    {"id": "F2", "file": "qbank_pipeline.py", "function": "merge_question_records", "change": "contaminated incoming stem never replaces a valid stem; never fills an empty stem with contaminated text (stem-conflict resolver + generic write guards)"},
+    {"id": "F3", "file": "qbank_pipeline.py", "function": "targeted_retry + build_targeted_retry_prompt", "change": "after a contamination block, next round asks for the STEM REGION ONLY (no options/solution echoed)"},
+    {"id": "F4", "file": "qbank_pipeline.py", "function": "_should_run_q_pass + window loop", "change": "Q-pass skipped on pure-solution windows (upstream contamination source); runs only with question-section overlap or a live Q carry"},
+    {"id": "F5", "file": "qbank_pipeline.py", "function": "build_section_windows", "change": "1-page cross-section overlap at the Q/S boundary so a boundary-spanning question's tail is seen by the Q-pass"},
+    {"id": "F6", "file": "qbank_pipeline.py", "function": "malformed-JSON recovery branch", "change": "pass_recovered=True on a successful same-batch re-ask (fixes false UNRESOLVED ledger)"},
+    {"id": "F7", "file": "qbank_pipeline.py", "function": "locate_missing_record_pages", "change": "answer rows matched on every page in pipe/list/dash formats, header optional (fixes rescue targeting the wrong page)"},
+    {"id": "F8", "file": "qbank_pipeline.py", "function": "MAX_CALLS_PER_DAY", "change": "1400 -> 480 (real free-tier limit is 500 RPD for this model; graceful daily stop)"}
   ],
   "remaining_uncertainty": [
-    "data/validation_report.json (96 flags) was not available; the exact per-flag breakdown and source-page lineage for each of the 96 flags still requires the volume artifacts.",
-    "The source PDF was not available in the sandbox, so page-render verification of specific questions (e.g. whether ch7's answer table truly has 14 rows) was not possible.",
-    "RC-2 (q_no=None reconciliation) is only partially fixed: full reconciliation needs per-fragment page coordinates + preceding/following printed anchors, which the current extraction does not retain. This remains the highest open risk.",
-    "A full clean re-run (archive -> reset -> re-extract the same PDF) cannot be executed from this sandbox: no PDF, no GEMINI_API_KEY, no Railway volume. The pipeline now emits export_gate.jsonl + page_ledger.jsonl so the next deployment run is auditable end-to-end."
+    "data/validation_report.json (89 flags) not available; exact per-flag lineage requires the volume artifacts.",
+    "Source PDF not available in the sandbox; per-question page-render verification (e.g. whether ch7's answer table truly has 14 rows, whether ch1 q4/q10 stems are printed on pages 3-12) was not possible.",
+    "RC-2 (q_no=None reconciliation of option/tables fragments) remains only partially solved: full reconciliation needs per-fragment page coordinates + preceding/following printed anchors, which extraction does not yet retain.",
+    "A full clean re-run cannot be executed from this sandbox (no PDF, no GEMINI_API_KEY, no volume). Redeploy the fixed build, reset, re-run, and the export-gate criteria can be certified from export_gate.jsonl + page_ledger.jsonl + validation_report.json."
   ]
 }

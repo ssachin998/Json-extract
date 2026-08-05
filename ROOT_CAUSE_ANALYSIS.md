@@ -443,3 +443,38 @@ solutions_section_announced (announce/reset once; Q-pass activation unchanged).
 ### A11-6 — Export gate **[NEW]**
 Deterministic pre-export check (missing stems/options/answers/solutions,
 broken asset refs, unresolved passes) → data/export_gate.jsonl + loud log.
+
+--------------------------------------------------------------------------------
+## 11. Run-12 audit — contaminated-stem dead-end + recovery targeting (2026-08-05)
+
+Second full-book run ended 89 flags / 23 chapters. Log forensics (18 chunks)
++ code. Full matrix: debug/root_cause_report.json.
+
+### A12-1 — Contaminated-stem dead-end **[PROVEN mechanism + false positive]**
+Good question-shaped stems stripped: solutions RESTATE the stem, so short
+question-shaped stems pass the >=80% token-containment check and were
+destroyed. Additionally, when a genuinely contaminated re-read arrived, the
+stem-conflict coherence resolver preferred it (solution-prose coheres with
+the solution payload) and the generic merge overwrote the good stem. Retry
+then re-asked the same solution pages, the guard blocked the same text every
+round, rescue returned 0 fields, and export-gate flagged missing_stem.
+Fix: guard narrowed to declarative/>250-char text; merge never lets a
+contaminated stem replace a valid one; retry switches to a stem-region-only
+prompt after one block; Q-pass no longer runs on pure-solution windows
+(upstream contamination source) with 1-page cross-overlap at the Q/S
+boundary preserving boundary-spanning tails.
+
+### A12-2 — Answer rescue targeted the wrong page **[PROVEN mechanism]**
+Answer rows only matched pipe format on pages with the "Answer Key" header;
+a key page with "13. B" rows and no header was missed, so answer rescue
+asked the question page (ch15 q15 -> page 194 -> 0 fields). Fix: answer-row
+matchers run on every page in pipe/list/dash formats, header optional.
+
+### A12-3 — Quota brake never fired (500 RPD real limit) **[PROVEN]**
+MAX_CALLS_PER_DAY=1400 vs the model's actual 500 RPD -> hard 429 mid-run +
+2 wasted backoff calls. Fix: 480 (graceful daily stop, resume via state).
+
+### A12-4 — Malformed-JSON recovery falsely UNRESOLVED **[PROVEN]**
+pass_recovered only set in the salvage-fail branch; a successful same-batch
+re-ask left it False -> ch13 gate flagged unresolved_page_A [175-179] even
+though 14 items came back. Fix: pass_recovered=True on the re-ask.
