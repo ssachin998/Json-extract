@@ -132,6 +132,17 @@ SECTION_OVERLAP_PAGES = 1      # tiny intra-section overlap (a question split
                                # overlap drops from 2/6 (33%) to 1/10 (10%) --
                                # the token waste the old fixed windows had
 
+def _batch_after_routing(pass_name, batch, routed_pages):
+    """run-17: routed_pages are recitation-sensitive SOLUTION pages whose
+    solutions were already OCR-recovered (PREFLIGHT_OCR). They are skipped
+    ONLY by the S-pass -- Q and A still receive them, so QUESTIONS printed on
+    a mixed sensitive page are never silently lost (the old code excluded
+    them from every pass, and no drain ran because the page never "failed")."""
+    if pass_name == "S":
+        return [pf for pf in batch if pf not in routed_pages]
+    return list(batch)
+
+
 def _pace_gemini_call():
     """Sleep just enough that consecutive Gemini requests stay
     MIN_SECONDS_BETWEEN_CALLS apart. Called at the two choke points EVERY
@@ -2205,29 +2216,6 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
     return {qn: sorted(ps) for qn, ps in pages.items() if ps}
 
 
-def answer_key_rows_seen(chapter_records, stats=None):
-    """Deterministic ANSWER RECONCILIATION (run-11 RC-4): every answer-key
-    row observed during the run (A-pass items + orphan answer-key tables)
-    vs the canonical records. Returns (found, missing_qns, conflicts):
-      found      -- q_no -> letter for every key row matched to a record
-      missing_qns-- q_nos that HAVE a key row but whose record lacks an answer
-      conflicts  -- q_nos whose key letter disagrees with the record's answer
-    A q_no with a visible key row but answer=None is PROOF the answer exists
-    in source -- the pipeline must not finish with answer=null for it."""
-    found, conflicts = {}, []
-    # re-read the run's answer-key ledgers
-    key_rows = {}   # q_no -> letter
-    for path in (DATA_DIR / "integrity_flags.jsonl",):
-        pass
-    # primary source: chapter_records already merged the A-pass key rows via
-    # correct_option; the disagreement detection below is the reconciliation.
-    for qn, rec in chapter_records.items():
-        ans = rec.get("correct_option")
-        if ans:
-            found[qn] = str(ans).strip().upper()
-    return found, [], []
-
-
 def answer_rescue_prompt(qn, rec, chapter_records):
     """ANSWER-ONLY focused prompt (run-11 RC-5): for a record whose answer is
     missing, ask for ONLY the answer letter of qN -- no stems, no options, no
@@ -2363,20 +2351,23 @@ def _page_crops(pf, parts, overlap_frac=0.12):
     re-extraction is merge-safe because every consumer is fill-only/deduped).
     Returns [(label, crop_path)]; crops live next to the source page."""
     im = Image.open(pf)
-    w, h = im.size
-    labels_map = {2: ("TOP half", "BOTTOM half"),
-                  4: ("quarter 1 (top)", "quarter 2", "quarter 3", "quarter 4 (bottom)")}
-    labels = labels_map.get(parts) or [f"band {i + 1}/{parts}" for i in range(parts)]
-    step = h / parts
-    ov = step * overlap_frac
-    crops = []
-    for i in range(parts):
-        top = max(0, int(i * step - ov))
-        bot = min(h, int((i + 1) * step + ov))
-        out = Path(str(pf).rsplit(".", 1)[0] + f"_crop{parts}x{i + 1}.jpg")
-        im.crop((0, top, w, bot)).save(out, "JPEG", quality=90)
-        crops.append((labels[i], out))
-    return crops
+    try:
+        w, h = im.size
+        labels_map = {2: ("TOP half", "BOTTOM half"),
+                      4: ("quarter 1 (top)", "quarter 2", "quarter 3", "quarter 4 (bottom)")}
+        labels = labels_map.get(parts) or [f"band {i + 1}/{parts}" for i in range(parts)]
+        step = h / parts
+        ov = step * overlap_frac
+        crops = []
+        for i in range(parts):
+            top = max(0, int(i * step - ov))
+            bot = min(h, int((i + 1) * step + ov))
+            out = Path(str(pf).rsplit(".", 1)[0] + f"_crop{parts}x{i + 1}.jpg")
+            im.crop((0, top, w, bot)).save(out, "JPEG", quality=90)
+            crops.append((labels[i], out))
+        return crops
+    finally:
+        im.close()   # run-17: close the PIL handle (GC alone is not immediate)
 
 
 def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, pdf_path=None):
@@ -2699,11 +2690,6 @@ SOLUTION_DUMP_HDR_RE = re.compile(r"Solution to Question\s+(\d{1,3})\s*:")
 # and cross-merge question prose with solution prose).
 CARRY_EXPIRY_BATCHES = 3      # unresolved carry dies after this many batches
 
-SOLUTION_STYLE_STEM_RE = re.compile(
-    r"^\s*(?:option\s+[a-d]\s*[:.)\-]|ans(?:wer)?\s*[:.)\-]|correct\s+answer\s+is\b|"
-    r"the\s+(?:correct\s+)?answer\s+is\b|solution\s*[:.)\-]|explanation\s*[:.)\-]|"
-    r"answer\s*[:.)\-]|solution\s+to\s+question\s+\d+)", re.IGNORECASE)
-
 SECTION_HEADING_RE = re.compile(
     r"^\s*(?:chapter\s+\d{1,3}\s*[:.\-–]?\s*)?"
     r"(detailed\s+explanations?|answer\s*keys?|answers?\s+(?:and|&)\s+explanations?|"
@@ -2909,13 +2895,6 @@ def _solution_fragment_foreign(frag, qn, rec, chapter_records):
             if first_line in (other.get("solution_text") or ""):
                 return f"first line exists verbatim in q{other_qn}'s solution"
     return None
-
-
-def looks_like_solution_style_stem(text):
-    """True when a would-be question_text is really solution prose
-    ("Option A: ...", "Ans. is B", "Solution to Question 4: ...").
-    Anchored at the start so real stems mentioning options mid-text are safe."""
-    return bool(text and SOLUTION_STYLE_STEM_RE.search(str(text)))
 
 
 def detect_section_boundary(items):
@@ -3722,25 +3701,6 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         "stem_suspect": rec.get("_stem_suspect_reason"),
     }
 
-def repair_option_labels(question):
-    """Correct only high-confidence mislabeled Option X explanation lines."""
-    text = ((question.get("solution") or {}).get("text") or "")
-    options = {str(o.get("id")).upper(): str(o.get("text") or "")
-               for o in question.get("options") or []}
-    def repl(match):
-        label, desc = match.group(1).upper(), match.group(2)
-        words = {w.lower() for w in re.findall(r"\w+", desc) if len(w) > 2}
-        scores = {oid: len(words & set(re.findall(r"\w+", val.lower()))) / max(1, len(set(re.findall(r"\w+", val.lower()))))
-                  for oid, val in options.items() if val}
-        if not scores:
-            return match.group(0)
-        best = max(scores, key=scores.get)
-        if best != label and scores[best] >= 2 * max(scores.get(label, 0.0), 0.01):
-            print(f"  [LABEL_CORRECTED] {question.get('id')}: Option {label} -> Option {best}")
-            return f"Option {best}: {desc}"
-        return match.group(0)
-    question["solution"]["text"] = re.sub(r"(?m)Option\s+([A-D])\s*:\s*([^\n]+)", repl, text)
-    return question
 
 # ============================================================
 # MAIN DRIVER
@@ -3972,16 +3932,7 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
         return leftover
     # N images, M>=2 slots: position-ordered one-to-one
     pos = image_positions_on_page(pdf_path, file_page)
-
-    def order_key(rel):
-        try:
-            oid = int(Path(rel).stem.rsplit("-", 1)[-1])
-        except (ValueError, IndexError):
-            oid = None
-        y, _x, didx, _w, _h = pos.get(oid, (None, None, 10**6, 0, 0))
-        return (-(y if y is not None else float("-inf")), didx)
-
-    ordered_imgs = sorted(imgs, key=order_key)
+    ordered_imgs = _order_imgs_by_position(imgs, pos)
     leftover = []
     for i, rel in enumerate(ordered_imgs):
         if i >= len(slots):
@@ -4093,14 +4044,6 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
         else:
             leftover.append(rel)
     return leftover
-
-
-def claim_solution_page_images(imgs, pdf_path, file_page, subject, chapter_no,
-                               chapter_records, image_files_by_q):
-    """Compatibility wrapper: solution-block-only geometry claim (the pre-9
-    behavior). New callers should use claim_block_images."""
-    return claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
-                              chapter_records, image_files_by_q, active_block=None)
 
 
 def _order_imgs_by_position(imgs, pos):
@@ -4236,7 +4179,7 @@ def _ocr_anchors_from_data(data, scale, img_h):
             continue
         try:
             left = int(data["left"][i]); top = int(data["top"][i])
-            wdt = int(data["width"][i]); hgt = int(data["height"][i])
+            hgt = int(data["height"][i])
             conf = float(data["conf"][i])
         except (KeyError, ValueError, TypeError, IndexError):
             continue
@@ -4912,12 +4855,6 @@ def drop_phantom_solution_only_records(chapter_records, chapter_id, stats,
     return dropped
 
 
-def _record_chapter_ledger(chapter_id, ledger_rows):
-    """Append the chapter's ledger rows (window-pass attempts) atomically."""
-    for r in ledger_rows:
-        _append_jsonl(DATA_DIR / "page_ledger.jsonl", r)
-
-
 def _record_unresolved_image(subject, chapter_id, page, rel, reason,
                              model_verdict=None, method="unresolved",
                              confidence=None):
@@ -5177,7 +5114,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     print("Daily Gemini call limit reached. Saving progress, exiting.")
                     save_state(state)
                     sys.exit(0)
-                pass_batch = [pf for pf in batch if pf not in routed_pages]
+                pass_batch = _batch_after_routing(pass_name, batch, routed_pages)
                 if not pass_batch:
                     continue
                 if pass_name == "Q":
@@ -5822,7 +5759,6 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 subject, chapter_id, ch["chapter_no"], qn, rec,
                 image_files_by_q.get(qn, {"question": [], "solution": []})
             )
-            final_q = repair_option_labels(final_q)
             chapter_rows.append(final_q)
         # run-16 CRASH-SAFE COMMIT: the master questions.jsonl is rewritten
         # atomically per chapter (never appended) -- a worker SIGKILL at ANY

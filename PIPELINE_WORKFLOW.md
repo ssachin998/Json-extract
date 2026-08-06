@@ -523,6 +523,42 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
+### 4.31 Changelog — 2026-08-06 (full-code audit: bug fixes + dead/duplicate code removal)
+
+Full audit of all pipeline code (qbank_pipeline 6324→6260 lines; validator,
+app, healer, tests reviewed). Fixes:
+
+**Real bugs:**
+- **routed_pages skipped EVERY pass** (`PREFLIGHT_OCR` recitation routing):
+  a mixed sensitive page (questions + sensitive solutions) silently lost its
+  QUESTIONS -- the page was excluded from Q/A/S and never "failed", so the
+  drain never ran either. Now only the S-pass skips routed pages (their
+  solutions were already OCR-recovered); Q and A always receive them.
+- **Validator false positives on GOOD stems**: `qbank_validator`'s
+  `_stem_contamination_reason` still used the pre-run-12 naive token
+  containment rule, so it flagged real question-shaped stems that the
+  pipeline now accepts (ch26 q1 class "...is called ___") as
+  `contaminated_question` on every re-run. Synced to
+  `_stem_reject_reason` semantics: question-shape narrowing + reverse
+  containment (stem == own solution verbatim is always contamination).
+
+**Dead code removed (zero references anywhere):** `answer_key_rows_seen`
+(empty stub), `looks_like_solution_style_stem` (+ its only use of
+`SOLUTION_STYLE_STEM_RE`), `claim_solution_page_images` (pre-run-9 compat
+wrapper), `_record_chapter_ledger` (unused since ledger rows append inline).
+
+**Duplicates removed:** the second copy of the image `order_key` (now reuses
+`_order_imgs_by_position`); the separate `repair_option_labels` (the label
+correction already runs inline inside `build_final_question`, the only
+builder both the main path and `--recover` use).
+
+**Cleanups:** `_page_crops` closes its PIL handle; unused `wdt` variable
+removed. pyflakes-clean on all production files.
+
+Tests: `Run17CodeAuditTests` (+2: routed-pages skip S-only) and
+`ValidatorContaminationTests` (+2: real restated stem NOT flagged, verbatim
+stem flagged). Suite: **141 tests OK**.
+
 ### 4.30 Changelog — 2026-08-06 (SIGKILL/OOM investigation + bounded-memory architecture)
 
 **Symptom:** the fresh Railway run terminated around Chapter 11 with

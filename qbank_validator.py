@@ -83,6 +83,17 @@ EXPLANATION_START_RE = re.compile(
     r"solution\s*[:.)\-]|explanation\s*[:.)\-]|answer\s*[:.)\-]|"
     r"solution\s+to\s+question\s+\d+|explanation\s+of\s+question\s+\d+)",
     re.IGNORECASE)
+# run-17: mirror qbank_pipeline._stem_reject_reason semantics EXACTLY --
+# the validator used the OLD naive token-containment rule, so it flagged
+# GOOD stems that the pipeline now accepts (run-12/15 narrowing: a short
+# question-shaped stem whose solution restates it, e.g. ch26 q1 "...is
+# called ___") as contaminated_question -> false positives on every re-run.
+_MAX_REAL_STEM_LEN = 250
+_QUESTION_SHAPED_RE = re.compile(
+    r"\?\s*$|which\b|what\b|who\b|whom\b|how\b|why\b|identify\b|choose\b|"
+    r"select\b|best\b|most likely\b|correct\b|diagnos|drug\b|treatment\b|"
+    r"following\b|regarding\b|according\b|is the\b|are the\b|of the\b",
+    re.IGNORECASE)
 _OCR_NOISE_LINE_RES = [
     re.compile(r"^\s*[-–—.·]?\s*\d{1,4}\s*[-–—.·]?\s*$"),          # 12 / -12- / 12.
     re.compile(r"^\s*page\s*\d{1,4}\s*(of\s*\d{1,4})?\s*$", re.I),  # Page 12 of 300
@@ -93,7 +104,12 @@ _OCR_NOISE_LINE_RES = [
 
 def _stem_contamination_reason(qtext, stext):
     """Cross-field contamination proof for a final row's question_text.
-    Returns a reason string, or None when the text plausibly IS a stem."""
+    Returns a reason string, or None when the text plausibly IS a stem.
+    run-17: mirrors qbank_pipeline._stem_reject_reason -- explanation-opener
+    is always contamination; token-containment only fires for DECLARATIVE/
+    implausibly-long text (run-12 narrowing: solutions RESTATE question-shaped
+    stems); a stem that IS its own solution verbatim (reverse containment) is
+    contamination no matter how question-shaped it looks (run-15 ch7 q23/25)."""
     t = (qtext or "").strip()
     if not t:
         return None
@@ -101,8 +117,13 @@ def _stem_contamination_reason(qtext, stext):
         return "opens with explanation-style language"
     s = (stext or "").strip()
     if s and len(t) >= 60 and token_overlap(t, s) >= CONTAMINATION_TOKEN_SHARE:
-        return (f"{token_overlap(t, s):.0%} of its tokens appear in the "
-                f"row's own solution (>= {CONTAMINATION_TOKEN_SHARE:.0%})")
+        # reverse containment: the whole solution fits inside the would-be
+        # stem -> the two fields are the SAME text -> always contamination
+        if token_overlap(s, t) >= CONTAMINATION_TOKEN_SHARE:
+            return "question_text is the row's own solution verbatim"
+        if len(t) > _MAX_REAL_STEM_LEN or not _QUESTION_SHAPED_RE.search(t):
+            return (f"{token_overlap(t, s):.0%} of its tokens appear in the "
+                    f"row's own solution (>= {CONTAMINATION_TOKEN_SHARE:.0%})")
     return None
 
 

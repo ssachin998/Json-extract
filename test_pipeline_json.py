@@ -1608,6 +1608,30 @@ class ValidatorContaminationTests(unittest.TestCase):
         kinds = {f["kind"] for f in flags}
         self.assertIn("contaminated_question", kinds)
 
+    # run-17: validator must agree with pipeline._stem_reject_reason -- a
+    # REAL short question-shaped stem that its solution restates (ch26 q1
+    # class) is NOT contamination; a stem == solution verbatim (ch7 q23/25)
+    # IS.
+    def test_real_restated_stem_not_flagged(self):
+        import qbank_validator as qv
+        stem = ("The acts that a person says or does to disclose himself "
+                "as having the status of boy or man is called _______?")
+        sol = (stem + " Gender role is the public manifestation of gender "
+               "identity. It includes behavior, dress, and mannerisms "
+               "culturally associated with masculinity or femininity.")
+        reason = qv._stem_contamination_reason(stem, sol)
+        self.assertIsNone(reason)                       # no false positive
+
+    def test_verbatim_stem_solution_flagged(self):
+        import qbank_validator as qv
+        text = ("The patient has developed acute muscular dystonia (spasm of "
+                "muscles of tongue, face, neck, and back) which is an "
+                "extrapyramidal side effect of haloperidol. This occurs "
+                "within 1-5 days of drug intake.")
+        reason = qv._stem_contamination_reason(text, text)
+        self.assertIsNotNone(reason)                    # verbatim -> flagged
+        self.assertIn("verbatim", reason)
+
     def test_ocr_noise_solution_flagged(self):
         import qbank_validator as qv
         flags = qv.check_row(self._row("Real stem question text here?",
@@ -2524,6 +2548,38 @@ class Run16MemoryAndResumeTests(unittest.TestCase):
             qp.render_page_png(pdf, p, dpi=36)
         after = set(Path("/tmp").glob("qbank_render_*")) if Path("/tmp").exists() else set()
         self.assertEqual(after, before)   # no leaked temp render dirs
+
+
+class Run17CodeAuditTests(unittest.TestCase):
+    """run-17 full-code audit: real bug fixes + dead/duplicate code removal.
+
+    BUG FIX under test: routed_pages (recitation-sensitive solution pages
+    whose solutions were already OCR-recovered via PREFLIGHT_OCR) used to be
+    excluded from EVERY Gemini pass -- a mixed page with QUESTIONS + sensitive
+    solutions silently lost its questions (no drain either: the page never
+    "failed"). Now only the S-pass skips them; Q and A still run."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        qp._RENDER_CACHE.clear()
+
+    def test_routed_pages_skipped_only_by_s_pass(self):
+        batch = [Path("page-100.jpg"), Path("page-101.jpg")]
+        routed = {Path("page-100.jpg")}
+        # S-pass excludes the routed page (solutions already OCR-recovered)
+        self.assertEqual(qp._batch_after_routing("S", batch, routed),
+                         [Path("page-101.jpg")])
+        # Q-pass and A-pass keep EVERY page -- questions on a mixed
+        # sensitive page must not be silently lost
+        self.assertEqual(qp._batch_after_routing("Q", batch, routed), batch)
+        self.assertEqual(qp._batch_after_routing("A", batch, routed), batch)
+
+    def test_no_routed_pages_batch_unchanged(self):
+        batch = [Path("page-1.jpg")]
+        self.assertEqual(qp._batch_after_routing("S", batch, set()), batch)
+        self.assertEqual(qp._batch_after_routing("Q", batch, set()), batch)
 
 
 if __name__ == "__main__":

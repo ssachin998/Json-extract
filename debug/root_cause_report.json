@@ -268,5 +268,42 @@
       "Fresh run must NOT SIGKILL; [MEM] lines must show bounded peak RSS (<< 512 MB).",
       "Resume after a kill must produce exactly-once rows per chapter (no duplicates in questions.jsonl)."
     ]
+  },
+  "run_17_code_audit": {
+    "bugs_fixed": [
+      {
+        "id": "B17-1",
+        "title": "routed_pages excluded from ALL Gemini passes -> questions on mixed sensitive pages silently lost (no drain: page never failed)",
+        "fix": "_batch_after_routing: only S-pass skips routed pages (solutions already OCR-recovered); Q/A always run"
+      },
+      {
+        "id": "B17-2",
+        "title": "qbank_validator._stem_contamination_reason used pre-run-12 naive containment -> flagged GOOD question-shaped stems (ch26 q1 class) as contaminated_question on every re-run (false positives)",
+        "fix": "synced to pipeline _stem_reject_reason: question-shape narrowing + reverse-containment verbatim rule"
+      }
+    ],
+    "dead_code_removed": [
+      "answer_key_rows_seen (empty stub)",
+      "looks_like_solution_style_stem (+ SOLUTION_STYLE_STEM_RE)",
+      "claim_solution_page_images (pre-run-9 compat wrapper)",
+      "_record_chapter_ledger (unused)"
+    ],
+    "duplicates_removed": [
+      "second copy of image order_key (reuses _order_imgs_by_position)",
+      "separate repair_option_labels (inline in build_final_question already)"
+    ],
+    "cleanups": [
+      "_page_crops closes PIL handle",
+      "unused wdt variable removed",
+      "pyflakes-clean on production files"
+    ],
+    "lines": "qbank_pipeline 6324 -> 6260 (-64 lines of dead/duplicate code)",
+    "tests_added": [
+      "Run17CodeAuditTests.test_routed_pages_skipped_only_by_s_pass",
+      "Run17CodeAuditTests.test_no_routed_pages_batch_unchanged",
+      "ValidatorContaminationTests.test_real_restated_stem_not_flagged",
+      "ValidatorContaminationTests.test_verbatim_stem_solution_flagged"
+    ],
+    "test_result": "141 tests OK (1 skipped: opt-in real-PDF fixture)"
   }
 }
