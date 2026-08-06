@@ -101,5 +101,99 @@
       "Export gate must list unresolved_image for any figure that still cannot be owned (never CLEAN-with-unresolved).",
       "Confirm data/image_ownership.jsonl rows with method deterministic_ocr_geometry / full_page_vision for question-side figures."
     ]
+  },
+  "run_14_final_audit": {
+    "run": "fresh PAY production run 2026-08-06 (33 chapters)",
+    "validator_summary": "90 flag(s) across 25/33 chapters (log final line)",
+    "export_gate_violations_from_log": {
+      "ch2": [
+        "missing_stem 25",
+        "missing_stem 26",
+        "bad_options 25",
+        "bad_options 26",
+        "missing_answer 25",
+        "missing_answer 26"
+      ],
+      "ch7": [
+        "bad_options 23-26",
+        "missing_answer 23-26",
+        "missing_stem 24,26",
+        "unresolved_image 104"
+      ],
+      "ch16": [
+        "unresolved_image 209"
+      ],
+      "ch18": [
+        "bad_options 13",
+        "missing_answer 13"
+      ],
+      "ch19": [
+        "bad_options 11,12",
+        "missing_answer 11,12"
+      ],
+      "ch24": [
+        "bad_options 12,13",
+        "missing_answer 12,13"
+      ],
+      "ch25": [
+        "unresolved_image 291"
+      ],
+      "ch26": [
+        "missing_stem 1",
+        "bad_options 11 (A,B,C only)"
+      ],
+      "ch28": [
+        "unresolved_image 319",
+        "unresolved_image 316"
+      ]
+    },
+    "root_causes": [
+      {
+        "id": "A14-1",
+        "title": "Q-pass skipped on question pages (section planner labels whole chapter S; _should_run_q_pass False on S windows)",
+        "affected": "ch2/7/11/16/18/19/24/25/28/30/32 mass [question]+[options] retries; tails lost (ch2 q25-26, ch7 q23-26, ch18 q13, ch19 q11-12, ch24 q12-13)",
+        "fix": "window_has_question_content (OCR question anchors on rendered pages) forces do_q=True on S windows; ocr_page_anchors psm 6->4->11 fallback",
+        "confidence": "PROVEN (log: [GEMINI:Q] lines missing on question windows)"
+      },
+      {
+        "id": "A14-2",
+        "title": "Export gate CLEAN while unresolved meaningful orphans exist (ch11/17/33)",
+        "affected": "ch11, ch17, ch33 (1-3 unresolved orphans each)",
+        "fix": "gate flags meaningful unresolved orphans as orphan_unresolved",
+        "confidence": "PROVEN"
+      },
+      {
+        "id": "A14-3",
+        "title": "Sweep stripped stems to None; retry could not refill (ch26 q1, ch7 q24/q26)",
+        "affected": "ch26 q1 missing_stem; ch7 q24/26",
+        "fix": "stem quarantine: keep text + _stem_suspect_reason; fill_only retry replaces; gate/validator flag suspect_stem",
+        "confidence": "PROVEN"
+      },
+      {
+        "id": "A14-4",
+        "title": "L3 full-page vision silently skipped when image positions missing (p104 class)",
+        "affected": "p104, p209-454, p291, p319, p316",
+        "fix": "loud skip logs + method vision_skipped_no_position in unresolved ledger",
+        "confidence": "PROVEN in code; page-level parse gap needs PDF"
+      },
+      {
+        "id": "A14-5",
+        "title": "q_no=None tail options fragment (ch7 q23-26)",
+        "affected": "ch7 q23-26 options=[]",
+        "fix": "SCHEMA_PROMPT_Q within-page continuation clause",
+        "confidence": "PARTIALLY PROVEN (prompt-level mitigation; deterministic orphan alignment is a design item)"
+      }
+    ],
+    "tests_added": [
+      "Run13FinalAuditFixesTests x10 (q-activation, gate orphans, stem quarantine, vision logging, prompt clause, psm fallback)"
+    ],
+    "test_result": "122 tests OK (1 skipped: opt-in real-PDF fixture)",
+    "requires_zip_verification": [
+      "exact validator flag breakdown by kind (validation_report.json)",
+      "numbering_gap analysis (ch7 14 questions vs q23-26 records)",
+      "chapters.json page ranges (chapter-boundary overlap hypothesis)",
+      "stale PAY/PSY artifact check in the ZIP",
+      "ch16/18/19/24 answers vs source (cross-chapter answer contamination check)"
+    ]
   }
 }

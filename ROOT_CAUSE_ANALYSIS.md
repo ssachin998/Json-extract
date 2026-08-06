@@ -590,3 +590,67 @@ L4 unresolved + gate flag. Every automatic assignment writes
 `data/image_ownership.jsonl` (owner, slot, method, evidence, confidence).
 See `PIPELINE_WORKFLOW.md` 4.27. Tests: `UnifiedImageOwnershipTests` (+8,
 112 total green; opt-in real-PDF fixture test in `RealPdfOptInFixtureTests`).
+
+## 14. Run-14 audit — fresh PAY production run (90 flags / 25 chapters) (2026-08-06)
+
+Fresh run on current head (subject code PAY, same 3988 KB book, 33 chapters).
+Validator summary: `90 flag(s) across 25/33 chapters`. The run-13 image
+architecture WORKED (page-4 figure owned via full-page vision
+`PAY-001-001 (question) [high]`; ch1 gate CLEAN; 4 of 5 unresolved images
+now carry explicit gate violations). Remaining damage clusters below.
+
+### A14-1 — Q-pass skipped on real question pages (mass stem/option loss) **[PROVEN mechanism, dominant]**
+
+Chapters where the text-layer solutions detector fired on the chapter's
+FIRST pages (previous chapter's solution tail inside the page range) had the
+whole chapter labeled "S": `build_section_windows` → every window "S" →
+`_should_run_q_pass` False (no overlap/carry) → the Q-pass never ran on the
+question pages. The A/S passes still ran (answer-key rows + leftover
+solutions), so records existed with answers but NO stems/options; only the
+fragile 2-round targeted retry recovered them (ch11 27/27, ch16 17/17, ch25
+12/12, ch30 10/10, ch32 9/9 healed; ch2 q25-26, ch7 q23-26, ch18 q13, ch19
+q11-12, ch24 q12-13 lost). Log proof: every such chapter shows
+`[GEMINI:Q] pages X-Y` MISSING on the question windows, followed by
+`RETRY round 1: N question(s) still incomplete (q1[question] ... )`.
+Fix: `window_has_question_content` (rendered-page OCR question anchors above
+the first solution header) forces `do_q=True` on S windows; `ocr_page_anchors`
+gained psm 6→4→11 fallback + digit confidence floor.
+
+### A14-2 — Export gate CLEAN while orphans unresolved **[PROVEN inconsistency]**
+
+ch11 (1 unresolved), ch17 (3 unresolved), ch33 (1 unresolved) printed
+`orphans: N unresolved` in the chapter summary AND `[GATE] ... CLEAN`.
+`_export_gate_violations` never read orphans.jsonl. Fix: meaningful unclaimed
+fragments (any of question_text/options/correct_option/solution_text/tables)
+now block CLEAN as `orphan_unresolved`.
+
+### A14-3 — Sweep deleted stems retry could not refill **[PROVEN data loss]**
+
+ch26 q1: `[SWEEP] q1: stripped contaminated stem` → retry blocked every
+candidate (`blocked contaminated stem for q1 ... next round ... still
+missing`, rescue 0 fields) → `missing_stem 1`. ch7 q24/q26 same loop. The
+run-12 guard narrowing was not enough for these cases; the strip-to-None was
+irreversible. Fix: quarantine — keep the text + `_stem_suspect_reason`,
+retry may replace it (fill_only conflict path now replaces quarantined
+stems), gate/validator report `suspect_stem`. No stem is ever deleted
+without a replacement again.
+
+### A14-4 — L3 vision silently skipped for some images **[PROVEN in code]**
+
+p104/p209-454/p291/p319/p316 reached the isolated-crop fallback (which
+labeled some "decorative") with no log line from the vision level. Root:
+`image_positions_on_page` returned no drawn bbox for those figures (Form /
+unusual content-stream placement), and `full_page_vision_ownership` returned
+silently when `labels` was empty. Fix: loud skip logs + unresolved method
+`vision_skipped_no_position`. NOTE: the under-lying position-parse gap for
+those pages needs the real PDF to debug (see REMAINING UNCERTAINTY).
+
+### A14-5 — q_no=None tail fragments (ch7 q23-26 options) **[PARTIALLY PROVEN]**
+
+Even with Q-pass running on the tail window (pages 104-107), Gemini returned
+the q23-26 options as ONE q_no-less fragment → orphan → options=[] for
+q23-26 forever. Fix: prompt clause forces within-page continuations to
+repeat the visible q_no. Full deterministic orphan alignment (ordinal
+provenance per page) remains a design item (see REMAINING UNCERTAINTY).
+
+**Tests:** `Run13FinalAuditFixesTests` (+10). Suite 122 OK.

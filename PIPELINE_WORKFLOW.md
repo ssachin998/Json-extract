@@ -523,6 +523,62 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
+### 4.28 Changelog — 2026-08-06 (final audit of the fresh PAY run: 90 flags / 25 of 33 chapters)
+
+Fresh run on current head (`PAY.pdf`, 33 chapters): validator reported
+`90 flag(s) across 25/33 chapters`; export gate listed 33 violations across
+8 chapters (ch2/7/16/18/19/24/25/26/28) + 5 unresolved images. Full log
+(14 chunks) + code tracing. Full matrix: `debug/root_cause_report.json`.
+
+**RC-14A — Q-pass skipped on real question pages (DOMINANT, ~all mass
+stem/option loss).** `build_section_windows` labels every page >= the
+text-layer `solutions_start` as "S"; `_should_run_q_pass` then returns False
+for every S window without overlap/carry, and the sticky
+`solutions_section_seen`/`probe["solutions"]` keeps it off. On chapters whose
+first pages show solution headers (previous chapter's solution tail inside
+the page range, or an interleaved answer-key page), the WHOLE chapter got
+labeled "S" and the Q-pass never ran on the question pages: ch2/7/11/16/18/
+19/24/25/28/30/32 needed 9-27 records each of [question]+[options] targeted
+retry, and the tails (ch2 q25-26, ch7 q23-26, ch18 q13, ch19 q11-12, ch24
+q12-13) were lost after 2 retry rounds. **Fix:** `window_has_question_content`
+-- OCR question-stem headings on the RENDERED pages (immune to the garbled
+body-font text layer, same filter as block_headers_on_page) force `do_q=True`
+on S windows. Also robustified `ocr_page_anchors`: psm 6 → psm 4 → psm 11
+fallback + relaxed confidence floor for digit tokens.
+
+**RC-14B — Export gate printed CLEAN with unresolved orphans (accounting
+inconsistency).** ch11/17/33 printed `orphans: N unresolved` right next to
+`[GATE] ... CLEAN`; `_export_gate_violations` never consulted orphans.jsonl.
+**Fix:** the gate now adds `orphan_unresolved` violations for meaningful
+(any content field) unclaimed fragments; empty junk fragments stay silent.
+
+**RC-14C — Sweep deleted stems the retry could not refill (data loss).** ch26
+q1 / ch7 q24-26: sweep stripped the stem to None ("contaminated"), retry
+blocked every re-ask ("blocked contaminated stem ... still missing"), record
+shipped `missing_stem`. **Fix (stem quarantine):** the sweep now keeps the
+text and sets `_stem_suspect_reason` (flagged, preserved for review); a
+passing retry candidate replaces it even in fill_only recovery; the gate and
+validator report `suspect_stem` instead of silently accepting or deleting.
+
+**RC-14D — L3 full-page vision silently skipped → isolated-crop "decorative".**
+p104/p209-454/p291/p319/p316 images fell to the isolated fallback (no log
+line explaining why). **Fix:** render-unavailable and no-parsed-position paths
+now log loudly, and unresolved entries carry method
+`vision_skipped_no_position` / `all_levels_failed` for the audit trail.
+
+**RC-14E — q_no=None tail fragments.** ch7 q23-26 options arrived as a
+q_no-less fragment (orphan) even when Q-pass ran on the tail window. **Fix:**
+`SCHEMA_PROMPT_Q` now instructs the model to repeat the q_no of a
+within-page continuation (options under a figure / split by a table) instead
+of emitting `q_no: null` for content whose number is visible on the page.
+
+Tests: `Run13FinalAuditFixesTests` (+10): Q-activation on S windows with OCR
+anchors, pure-solution windows stay skipped, no-OCR windows stay skipped,
+gate flags meaningful orphans / ignores empty fragments, sweep quarantine
+keeps data + gate flag, fill-only merge replaces a quarantined stem, vision
+logs when positions are missing, prompt clause present, OCR psm fallback.
+Suite: 122 tests OK.
+
 ### 4.27 Changelog — 2026-08-06 (unified image-ownership architecture, page-4 class)
 
 Fresh production run: page 4's figure (`PSY/PSY-p4-7.webp`, source-verified

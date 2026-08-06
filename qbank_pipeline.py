@@ -509,6 +509,14 @@ Rules:
   number) and return it under that q_no; ONLY when ownership cannot be
   established from the context, return it with "q_no": null and the visible
   fragment under "question_text"/"options".
+- CONTINUATION-WITHIN-PAGE (run-13): a stem/options block that visibly
+  continues a question whose printed number appeared EARLIER ON THE SAME
+  page (e.g. options printed under a figure, a question split by a table,
+  or a tail question block after an image) MUST repeat that q_no on the
+  continuation item. Never emit "q_no": null for content that belongs to a
+  question number visible on these pages -- a null q_no there detaches the
+  fragment permanently (orphans.jsonl) and the question ships without its
+  options/answer.
 - If a question's options are split across two pages, only include the
   options actually visible on THIS batch -- they merge automatically.
 - If a visible line is clearly an answer-letter line or explanation prose
@@ -1228,14 +1236,24 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
         reason = _stem_reject_reason(qt, rec)
         if not reason:
             continue
-        chapter_records[qn]["question_text"] = None
+        # RUN-13 STEM QUARANTINE (replaces strip-to-None): the sweep's
+        # containment heuristic fired on REAL stems that the solution
+        # restates (ch26 q1, ch7 q24/q26 in this run), the retry could not
+        # refill them ("blocked contaminated stem ... next round ... still
+        # missing"), and the record shipped with NO stem -- permanent data
+        # loss (missing_stem gate flag). Quarantine instead: keep the text
+        # (flagged suspect), let the retry REPLACE it with a passing
+        # candidate, and if nothing passes the record ships the suspect with
+        # a suspect_stem gate flag -- preserved for review, never silently
+        # deleted, never silently accepted.
+        rec["_stem_suspect_reason"] = reason
         stats["contaminated_stems_stripped"] = stats.get("contaminated_stems_stripped", 0) + 1
-        iflag("contaminated_stem_stripped", qn,
-              f"question_text was solution prose ({reason}; prov="
-              f"{rec.get('_prov', {}).get('question_text')}) -- stripped, "
-              f"retry refills the real stem")
-        print(f"  [SWEEP] q{qn}: stripped contaminated stem ({reason}) -- "
-              f"targeted retry will refill it")
+        iflag("contaminated_stem_suspect", qn,
+              f"question_text MAY BE solution prose ({reason}; prov="
+              f"{rec.get('_prov', {}).get('question_text')}) -- quarantined "
+              f"(kept for review), retry may replace with a passing candidate")
+        print(f"  [SWEEP] q{qn}: quarantined suspect stem ({reason}) -- kept "
+              f"for review, retry may replace it")
 
     if flags:
         stats["integrity_flags"] = stats.get("integrity_flags", 0) + len(flags)
@@ -3404,12 +3422,24 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                 # fill_only (recovery) mode never overwrites an existing stem:
                 # the existing row keeps its text, only the ledger note is written.
                 if fill_only:
-                    # recovery mode never overwrites an existing stem; log only.
-                    stats["stem_conflicts"] = stats.get("stem_conflicts", 0) + 1
-                    _append_jsonl(DATA_DIR / "stem_conflicts.jsonl", {
-                        "q_no": qn, "chapter_id": stats.get("chapter_id"),
-                        "similarity": round(sim, 3), "verdict": "fill-only kept-existing",
-                        "old_stem": old_q[:600], "new_stem": new_q[:600]})
+                    # RUN-13: recovery mode never overwrites an existing stem
+                    # -- EXCEPT a quarantined suspect stem: a passing retry
+                    # candidate replaces it and clears the quarantine (ch26
+                    # q1 class: sweep-quarantined real stem, retry candidate
+                    # arrived, fill-only kept the suspect -> shipped empty).
+                    if rec.get("_stem_suspect_reason"):
+                        rec["question_text"] = new_q
+                        rec["_stem_suspect_reason"] = None
+                        rec["_prov"]["question_text"] = prov
+                        print(f"  [STEM] q{qn}: quarantined suspect stem "
+                              f"replaced by retry candidate (fill_only)")
+                        item = {**item, "question_text": None}
+                    else:
+                        stats["stem_conflicts"] = stats.get("stem_conflicts", 0) + 1
+                        _append_jsonl(DATA_DIR / "stem_conflicts.jsonl", {
+                            "q_no": qn, "chapter_id": stats.get("chapter_id"),
+                            "similarity": round(sim, 3), "verdict": "fill-only kept-existing",
+                            "old_stem": old_q[:600], "new_stem": new_q[:600]})
                 else:
                     # RUN-12 STEM-CONTAMINATION PROTECTION: the coherence
                     # resolver must NEVER let solution-prose win. A
@@ -3459,9 +3489,14 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                           f"stem kept; field stays retry-eligible")
                     item = {**item, "question_text": None}
                     continue
-                if fill_only and rec.get(k):
+                if fill_only and rec.get(k) and not rec.get("_stem_suspect_reason"):
                     continue  # recovery: never overwrite existing content
+                             # (EXCEPT a quarantined suspect stem -- run-13:
+                             # a passing candidate replaces it and clears the
+                             # quarantine, so a wrongly-swept real stem is
+                             # healed instead of shipping empty)
                 rec[k] = item[k]
+                rec["_stem_suspect_reason"] = None   # a passing stem clears quarantine
                 rec["_prov"][k] = prov   # provenance of every patched field
             else:
                 if fill_only and rec.get(k):
@@ -3635,6 +3670,9 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         "correct_options": [rec["correct_option"]] if rec["correct_option"] else [],
         "solution": {"text": sol_text, "images": sol_images, "tables": tables},
         "tags": [],
+        # run-13: quarantined suspect stem marker -- ships in questions.jsonl
+        # so the post-run validator flags it too (not only the export gate).
+        "stem_suspect": rec.get("_stem_suspect_reason"),
     }
 
 def repair_option_labels(question):
@@ -4104,20 +4142,12 @@ def render_page_png(pdf_path, file_page, dpi=150):
     return _RENDER_CACHE[key]
 
 
-def ocr_page_anchors(png, scale, page_h_pt):
-    """[(kind, q_no, y_pdf_pt)] block headings read by OCR from the RENDERED
-    page pixels (tesseract, --psm 6). kind in {"question","solution"};
-    y_pdf_pt is the line's center converted back to PDF user space (origin
-    bottom-left, LARGER y == HIGHER), the same space claim_block_images uses.
-    Returns [] when the tesseract binary is unavailable or OCR yields nothing
-    usable -- the caller then falls through to the vision level."""
-    if not shutil.which("tesseract"):
-        return []
-    try:
-        data = pytesseract.image_to_data(png, config="--psm 6",
-                                         output_type=pytesseract.Output.DICT)
-    except Exception:
-        return []
+def _ocr_anchors_from_data(data, scale, img_h):
+    """Shared word->line->anchor extraction for one tesseract image_to_data
+    dict. Digits (question numbers) keep a relaxed confidence floor (30 vs
+    40 for words): tesseract scores small standalone numbers lower, and a
+    missed number = a lost block anchor on a page whose text layer is
+    already garbled."""
     words = []
     for i, txt in enumerate(data.get("text", []) or []):
         t = (txt or "").strip()
@@ -4129,7 +4159,8 @@ def ocr_page_anchors(png, scale, page_h_pt):
             conf = float(data["conf"][i])
         except (KeyError, ValueError, TypeError, IndexError):
             continue
-        if conf < 40:
+        floor = 30 if re.fullmatch(r"\d{1,3}", t) else 40
+        if conf < floor:
             continue
         words.append((left, top + hgt / 2.0, t))   # x_px, y_center_px
     if not words:
@@ -4154,12 +4185,71 @@ def ocr_page_anchors(png, scale, page_h_pt):
         m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", line)
         if m:
             anchors.append(("question", int(m.group(1)),
-                            (png.height - _yc) / scale))
+                            (img_h - _yc) / scale))
             continue
         for sm in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", line, re.I):
             anchors.append(("solution", int(sm.group(1)),
-                            (png.height - _yc) / scale))
+                            (img_h - _yc) / scale))
     return sorted(set(anchors), key=lambda a: -a[2])
+
+
+def ocr_page_anchors(png, scale, page_h_pt):
+    """[(kind, q_no, y_pdf_pt)] block headings read by OCR from the RENDERED
+    page pixels (tesseract). kind in {"question","solution"}; y_pdf_pt is the
+    line's center converted back to PDF user space (origin bottom-left,
+    LARGER y == HIGHER), the same space claim_block_images uses.
+    Returns [] when the tesseract binary is unavailable or OCR yields nothing
+    usable -- the caller then falls through to the vision level.
+
+    run-13: tries several tesseract segmentation modes in order (psm 6
+    uniform block -> psm 4 single column -> psm 11 sparse text) because
+    scanned page layouts differ; a mode that yields no anchors is retried
+    with the next. This is what the L2 OCR-geometry claim and the run-13
+    Q-pass activation both rely on."""
+    if not shutil.which("tesseract"):
+        return []
+    for cfg in ("--psm 6", "--psm 4", "--psm 11"):
+        try:
+            data = pytesseract.image_to_data(png, config=cfg,
+                                             output_type=pytesseract.Output.DICT)
+        except Exception:
+            continue
+        anchors = _ocr_anchors_from_data(data, scale, png.height)
+        if anchors:
+            return anchors
+    return []
+
+
+def window_has_question_content(pdf_path, pages, chapter_records, dpi=150):
+    """Deterministic check used by Q-pass ACTIVATION (run-13 root cause: the
+    section planner labels a whole chapter "S" when the text layer shows
+    solution headers on its FIRST pages -- often the previous chapter's
+    solution tail -- and _should_run_q_pass then skips the Q-pass for every
+    S window, so question stems/options on those pages are only ever
+    recovered by the fragile targeted retry, and tail questions ship
+    missing. A window "has question content" when OCR of its RENDERED pages
+    finds a printed question-stem heading (a q_no in chapter_records) ABOVE
+    the page's first solution header (or on a page with no solution header
+    at all) -- the same filter block_headers_on_page applies. Rendered-page
+    OCR is immune to the garbled body-font text layer. Zero Gemini calls.
+    Returns True when ANY of the pages shows question content."""
+    for p in pages:
+        rendered = render_page_png(pdf_path, p, dpi=dpi)
+        if not rendered[0]:
+            continue
+        img, scale, _page_h = rendered
+        anchors = ocr_page_anchors(img, scale, _page_h)
+        if not anchors:
+            continue
+        sol_y = min((y for k, _q, y in anchors if k == "solution"), default=None)
+        for k, qn, y in anchors:
+            if k != "question":
+                continue
+            if qn in chapter_records and (sol_y is None or y > sol_y):
+                return True
+    return False
+
+
 
 
 def _record_image_ownership(subject, chapter_id, page, rel, qid, slot,
@@ -4276,9 +4366,15 @@ def full_page_vision_ownership(model, pdf_path, file_page, rels, positions,
         return claimed, still, verdicts
     render = render_page_png(pdf_path, file_page, dpi=dpi)
     if not render[0]:
+        # run-13: never silently skip -- the isolated fallback that runs next
+        # mislabels real figures "decorative" without page context (the
+        # page-4 class). Log loudly so the audit trail shows WHY.
+        print(f"  [IMG] full-page vision SKIPPED for page {file_page}: page "
+              f"render unavailable ({len(rels)} leftover(s)) -- isolated fallback runs")
         return claimed, list(rels), verdicts
     page_img, scale, page_h_pt = render
     labels = {}
+    missing_pos = []
     for i, rel in enumerate(rels):
         try:
             oid = int(Path(rel).stem.rsplit("-", 1)[-1])
@@ -4286,11 +4382,21 @@ def full_page_vision_ownership(model, pdf_path, file_page, rels, positions,
             oid = None
         info = positions.get(oid) if oid is not None else None
         if info is None:
+            missing_pos.append(rel)
             still.append(rel)
             continue
         labels[f"IMG-{i + 1}"] = (rel, oid, info)
     if not labels:
+        # run-13: no parsed drawn bbox for ANY leftover (Form-wrapped /
+        # unusual content stream, e.g. the p104 class) -- say so explicitly
+        # instead of failing silently into the isolated-crop fallback.
+        print(f"  [IMG] full-page vision SKIPPED for page {file_page}: NO parsed "
+              f"image positions for {len(rels)} leftover(s) ({rels}) -- isolated "
+              f"fallback runs")
         return claimed, still, verdicts
+    if missing_pos:
+        print(f"  [IMG] full-page vision page {file_page}: positions missing for "
+              f"{missing_pos} -- those fall to the isolated pass")
     draw = ImageDraw.Draw(page_img)
     font = None
     try:
@@ -4567,7 +4673,7 @@ def _ledger_pass(chapter_id, subject, chapter_no, pass_name, window_pages,
 
 
 def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger,
-                            chapter_id, unresolved_images=()):
+                            chapter_id, unresolved_images=(), unresolved_orphans=()):
     """run-11 EXPORT GATE: returns a list of (kind, q_no, detail) violations
     that must be ZERO before a chapter export counts as clean. Deterministic
     checks only -- no Gemini. This is what makes 'missing answer = 0 / missing
@@ -4595,6 +4701,13 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
             violations.append(("missing_answer", qn, "no correct_option"))
         if not (rec.get("solution_text") or "").strip():
             violations.append(("missing_solution", qn, "no solution_text"))
+        if rec.get("_stem_suspect_reason"):
+            # run-13: quarantined suspect stem (kept for review, not deleted)
+            # is still a violation -- the chapter must not look clean while a
+            # stem MAY be solution prose.
+            violations.append(("suspect_stem", qn,
+                               f"stem quarantined (kept for review): "
+                               f"{rec['_stem_suspect_reason']}"))
     # every referenced asset file must exist on disk
     for qn, entry in (image_files_by_q or {}).items():
         for kind, paths in ({"question": entry.get("question", []),
@@ -4617,6 +4730,22 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
         violations.append(("unresolved_image", u.get("page"),
                            f"{u.get('file')} (method={u.get('method') or '?'} "
                            f"confidence={u.get('confidence') or '?'})"))
+    # run-13 orphan accounting: a chapter with a MEANINGFUL unclaimed
+    # q_no-less fragment must NOT print GATE CLEAN (ch11/17/33 printed
+    # "orphans: N unresolved" next to "[GATE] ... CLEAN" -- the four systems
+    # orphan summary / export gate / validator / ZIP disagreed). Empty or
+    # junk fragments (everything None) are not data loss and stay silent.
+    for o in unresolved_orphans or ():
+        item = o.get("item") or {}
+        present = [k for k in ("question_text", "options", "correct_option",
+                               "solution_text", "tables")
+                   if item.get(k)]
+        if not present:
+            continue
+        pages = o.get("pdf_pages") or o.get("new_pages") or []
+        violations.append(("orphan_unresolved", None,
+                           f"meaningful q_no-less fragment on pages {pages} "
+                           f"unclaimed (fields: {present})"))
     return violations
 
 
@@ -4812,6 +4941,22 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             # continuing into the solutions).
             do_q = _should_run_q_pass(section, bool(overlap_pages),
                                        carry_by_pass.get("Q"), solutions_section_seen)
+            # RUN-13 Q-PASS ACTIVATION SAFETY NET: _should_run_q_pass returns
+            # False for every S-labeled window (section planner saw solution
+            # headers on the chapter's first pages -- frequently the previous
+            # chapter's solution tail -- and labeled the WHOLE chapter "S").
+            # That silently skipped the Q-pass on real question pages and
+            # produced the run's mass stem/option losses (ch2/7/11/16/18/19/
+            # 24/25/28/30/32: 9-27 records each needing [question]+[options]
+            # targeted retry, tails like ch7 q23-26 / ch2 q25-26 lost). If
+            # the RENDERED pages still print question-stem headings, the
+            # Q-pass MUST run -- deterministic OCR evidence overrides the
+            # text-layer section label.
+            if not do_q and section == "S" and new_pages:
+                if window_has_question_content(pdf_path, new_pages, chapter_records):
+                    print(f"  [ACTIVATE] OCR question anchors on S-window pages "
+                          f"{new_pages} -- Q-pass ON (deterministic question content)")
+                    do_q = True
             if not (do_q or do_s or do_a):
                 do_q = True  # eerily silent page (figures only?) -- default to Q-pass
 
@@ -5209,6 +5354,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 vis_pos = image_positions_on_page(pdf_path, um["page"])
             except Exception:
                 vis_pos = {}
+            um["vision_positions"] = bool(vis_pos)   # audit tag for unresolved
             _vis_claimed, vis_still, vis_verdicts = full_page_vision_ownership(
                 genai_model, pdf_path, um["page"], um["files"], vis_pos,
                 subject, ch["chapter_no"], chapter_records, chapter_id, state,
@@ -5310,6 +5456,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     if um.get("brake_hit"):
                         reason = "left queued by daily-quota brake (resume tomorrow)"
                         method = "quota_brake"
+                    elif not um.get("vision_positions"):
+                        reason = ("no owner after L1 geometry + L2 OCR geometry; "
+                                  "L3 full-page vision SKIPPED (no parsed image "
+                                  "positions on the page) -- isolated fallback "
+                                  "also could not prove ownership")
+                        method = "vision_skipped_no_position"
                     else:
                         reason = ("no owner after L1 geometry + L2 OCR geometry + "
                                   "L3 full-page vision + isolated fallback")
@@ -5432,7 +5584,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         unresolved_ledger = [l for l in ledger_rows if l["status"] == PASS_STATUS_UNRESOLVED]
         violations = _export_gate_violations(chapter_records, image_files_by_q,
                                              unresolved_ledger, chapter_id,
-                                             chapter_unresolved_images)
+                                             chapter_unresolved_images, orphans)
         if violations:
             stats["export_gate_violations"] = stats.get("export_gate_violations", 0) + len(violations)
             for kind, qn, detail in violations:

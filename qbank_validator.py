@@ -202,6 +202,13 @@ def check_row(row, assets_questions):
 
     if not qtext or not qtext.strip():
         flags.append(flag(cid, "empty_question", f"{row.get('id')}: empty question text", qn))
+    # run-13: pipeline-quarantined suspect stem (kept, not deleted) -- the
+    # question ships WITH a stem that MAY be solution prose; flag loudly so
+    # it is never silently accepted as clean content.
+    if row.get("stem_suspect"):
+        flags.append(flag(cid, "suspect_stem",
+                          f"{row.get('id')}: stem quarantined by pipeline "
+                          f"({row['stem_suspect']}) -- review before use", qn, HIGH))
     opt_ids = {str(o.get("id", "")).strip().upper() for o in opts}
     nonempty = sum(1 for o in opts if (o.get("text") or "").strip())
     if len(opts) != 4 or opt_ids != {"A", "B", "C", "D"} or nonempty != 4:

@@ -2026,5 +2026,187 @@ class RealPdfOptInFixtureTests(unittest.TestCase):
                       "parser still cannot see this figure")
 
 
+class Run13FinalAuditFixesTests(unittest.TestCase):
+    """run-13 FINAL AUDIT fixes, driven by the fresh PAY production run
+    (90 validator flags / 25 of 33 chapters):
+
+    1. Q-pass ACTIVATION: the section planner labels a whole chapter "S" when
+       the text layer shows solution headers on its first pages (often the
+       previous chapter's solution tail), and _should_run_q_pass then skips
+       the Q-pass on every S window -> the run's MASS stem/option loss
+       (ch2/7/11/16/18/19/24/25/28/30/32: 9-27 records each needing
+       [question]+[options] targeted retry; tails like ch7 q23-26, ch2
+       q25-26, ch19 q11-12, ch24 q12-13 lost entirely). Fix: if OCR of the
+       RENDERED pages still finds question-stem headings, Q-pass MUST run.
+    2. EXPORT-GATE ORPHAN ACCOUNTING: ch11/17/33 printed
+       "orphans: N unresolved" next to "[GATE] ... CLEAN". A meaningful
+       unclaimed fragment must block CLEAN.
+    3. STEM QUARANTINE: ch26 q1 / ch7 q24-26 shipped missing_stem because
+       the sweep stripped the stem to None and retry could not refill it.
+       Suspect stems are now kept + flagged; a passing candidate replaces
+       them even in fill_only recovery.
+    4. L3 vision never silently skips (p104 class) -- logs + method tags.
+    5. Q-pass prompt forbids q_no:null for within-page continuations."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets, self._old_data, self._old_state = qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE
+        self._old_pace = qp._pace_gemini_call
+        qp.ASSETS_DIR = self.tmp / "assets"
+        qp.DATA_DIR = self.tmp / "data"
+        qp.STATE_FILE = self.tmp / "state.json"
+        qp._pace_gemini_call = lambda: None
+        (qp.ASSETS_DIR / "questions" / "PSY").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE = self._old_assets, self._old_data, self._old_state
+        qp._pace_gemini_call = self._old_pace
+        qp._RENDER_CACHE.clear()
+
+    # -- 1. Q-pass activation via OCR question anchors ---------------------
+    def test_s_window_with_question_anchors_forces_q_pass(self):
+        pdf = str(self.tmp / "x.pdf")
+        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
+        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
+        qp.ocr_page_anchors = lambda *a, **k: [("question", 1, 700.0), ("question", 2, 500.0)]
+        try:
+            self.assertTrue(qp.window_has_question_content(pdf, [204, 205], {1: {}, 2: {}}))
+        finally:
+            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
+
+    def test_s_window_pure_solutions_has_no_question_content(self):
+        pdf = str(self.tmp / "x.pdf")
+        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
+        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
+        # solution headers only, and the lone numbered line sits BELOW them
+        qp.ocr_page_anchors = lambda *a, **k: [
+            ("solution", 1, 600.0), ("question", 1, 300.0)]
+        try:
+            self.assertFalse(qp.window_has_question_content(pdf, [209], {1: {}}))
+        finally:
+            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
+
+    def test_should_run_q_pass_still_skips_when_no_ocr_signal(self):
+        # the OLD behavior stays for windows with NO question-content signal:
+        # a pure-solution S window must not get Q-passed (run-12 protection)
+        pdf = str(self.tmp / "x.pdf")
+        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
+        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
+        qp.ocr_page_anchors = lambda *a, **k: []   # OCR finds nothing
+        try:
+            self.assertFalse(qp.window_has_question_content(pdf, [220], {1: {}}))
+        finally:
+            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
+
+    # -- 2. export-gate orphan accounting ----------------------------------
+    def test_export_gate_flags_meaningful_unresolved_orphan(self):
+        recs = {1: {"q_no": 1, "question_text": "stem",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "B", "solution_text": "sol"}}
+        orphan = {"chapter_id": "PAY-007", "pdf_pages": [105],
+                  "item": {"q_no": None, "question_text": None,
+                           "options": {"A": "Cannabis-induced psychosis",
+                                       "B": "Amphetamine-induced psychosis",
+                                       "C": "Alcohol-induced psychosis",
+                                       "D": "Cocaine-induced psychosis"},
+                           "correct_option": None, "solution_text": None}}
+        vio = qp._export_gate_violations(recs, {}, [], "PAY-007", (),
+                                         unresolved_orphans=[orphan])
+        kinds = {k for k, _q, _d in vio}
+        self.assertIn("orphan_unresolved", kinds)   # the ch7 q23-26 class
+
+    def test_export_gate_ignores_empty_orphan_fragment(self):
+        recs = {1: {"q_no": 1, "question_text": "stem",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "B", "solution_text": "sol"}}
+        orphan = {"chapter_id": "PAY-017", "pdf_pages": [218],
+                  "item": {"q_no": None, "question_text": None, "options": None,
+                           "correct_option": None, "solution_text": None,
+                           "tables": None}}
+        vio = qp._export_gate_violations(recs, {}, [], "PAY-017", (),
+                                         unresolved_orphans=[orphan])
+        self.assertEqual(vio, [])   # empty junk fragment is not data loss
+
+    # -- 3. stem quarantine ------------------------------------------------
+    def test_sweep_quarantines_suspect_stem_instead_of_deleting(self):
+        rec = {"q_no": 1, "question_text": "The correct answer is B because the "
+               "patient presents with psychosis and this is managed by "
+               "antipsychotics as the first line of treatment.",
+               "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+               "correct_option": "B",
+               "solution_text": "The correct answer is B because the patient "
+               "presents with psychosis and this is managed by antipsychotics "
+               "as the first line of treatment.",
+               "_prov": {"question_text": "Q_PASS"}}
+        stats = {}
+        qp.chapter_integrity_sweep({1: rec}, {}, "PSY", 1, stats)
+        # data preserved (never stripped to None) + quarantine flag set
+        self.assertTrue((rec.get("question_text") or "").strip())
+        self.assertTrue(rec.get("_stem_suspect_reason"))
+        # and the export gate reports suspect_stem (never silently clean)
+        vio = qp._export_gate_violations({1: rec}, {}, [], "PSY-001")
+        self.assertIn("suspect_stem", {k for k, _q, _d in vio})
+
+    def test_fill_only_merge_replaces_quarantined_suspect_stem(self):
+        existing = {1: {"q_no": 1, "question_text": "The correct answer is B "
+                       "because the patient presents with psychosis ... suspect",
+                        "options": None, "correct_option": "B",
+                        "solution_text": "The correct answer is B ...",
+                        "tables": [], "_prov": {},
+                        "has_figure_in_question": False,
+                        "has_figure_in_solution": False,
+                        "_stem_suspect_reason": "opens with explanation-style language"}}
+        item = {"q_no": 1, "question_text": "Which antipsychotic is first-line "
+                "for acute psychosis with agitation?", "options": None,
+                "correct_option": "B", "solution_text": None, "tables": [],
+                "_prov": "Q_RETRY"}
+        stats = {"duplicates_merged": 0, "conflicts": 0}
+        qp.merge_question_records(existing, [item], stats, fill_only=True)
+        self.assertIn("Which antipsychotic", existing[1]["question_text"])
+        self.assertIsNone(existing[1].get("_stem_suspect_reason"))  # cleared
+
+    # -- 4. vision never silently skips ------------------------------------
+    def test_full_page_vision_logs_when_positions_missing(self):
+        pdf = self.tmp / "no_pos.pdf"
+        _write_test_pdf(pdf, [("1. Stem", 72, 700, 12)], [(7, "Im7", 300, 600)])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        model = object()   # must never be called (no labels to ask about)
+        with redirect_stdout(buf):
+            claimed, still, _ = qp.full_page_vision_ownership(
+                model, pdf, 1, ["PSY/PSY-p1-7.webp"], {}, "PSY", 1, {1: {}},
+                "PSY-001", {"calls_today": 0}, {}, dpi=72)
+        out = buf.getvalue()
+        self.assertEqual(still, ["PSY/PSY-p1-7.webp"])
+        self.assertIn("NO parsed image positions", out)   # loud, not silent
+
+    # -- 5. prompt forbids within-page q_no:null continuations -------------
+    def test_qpass_prompt_has_continuation_qno_clause(self):
+        self.assertIn("CONTINUATION-WITHIN-PAGE", qp.SCHEMA_PROMPT_Q)
+        self.assertIn("repeat that q_no", qp.SCHEMA_PROMPT_Q)
+
+    # -- 6. OCR anchor fallback across psm modes ---------------------------
+    def test_ocr_anchors_retries_psm_modes(self):
+        calls = []
+        def fake_image_to_data(png, config=None, output_type=None):
+            calls.append(config)
+            if config == "--psm 6":
+                return {"text": ["", ""], "left": [0, 0], "top": [0, 0],
+                        "width": [0, 0], "height": [0, 0], "conf": [0, 0]}
+            return {"text": ["1.", "Stem"], "left": [100, 150], "top": [100, 100],
+                    "width": [30, 70], "height": [20, 20], "conf": [92, 95]}
+        orig_which, orig_td = qp.shutil.which, qp.pytesseract.image_to_data
+        qp.shutil.which = lambda *a, **k: "/usr/bin/tesseract"
+        qp.pytesseract.image_to_data = fake_image_to_data
+        try:
+            anchors = qp.ocr_page_anchors(Image.new("RGB", (1500, 2000)), 150 / 72, 2000)
+            self.assertEqual(calls, ["--psm 6", "--psm 4"])
+            self.assertEqual([(k, qn) for k, qn, _y in anchors if k == "question"],
+                             [("question", 1)])
+        finally:
+            qp.shutil.which, qp.pytesseract.image_to_data = orig_which, orig_td
+
+
 if __name__ == "__main__":
     unittest.main()
