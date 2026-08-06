@@ -67,5 +67,39 @@
     "Verify MAX_CALLS_PER_DAY=480 stops the day gracefully (no hard 429) across a multi-day run.",
     "Confirm ch13's malformed-JSON A-pass no longer reports unresolved_page_A (pass_recovered fix).",
     "RC-2 (q_no=None option-fragment reconciliation via page-coordinate provenance) remains the open design item; it needs a data-model change, not a heuristic."
-  ]
+  ],
+  "run_13_image_ownership": {
+    "title": "Page-4 class: question-side figure never deterministically owned; isolated-crop 4th pass mislabels it decorative; gate prints CLEAN",
+    "root_cause": [
+      "L1 geometry reads question headings from the PDF text layer (pypdf visitor + pdftotext); the book's QUESTION-page body font has a broken ToUnicode map, so both text tools return no question headings (the same garble that broke the pre-run-9 pdftotext path).",
+      "image_positions_on_page ignored Form-XObject-wrapped images (flat walk, Image-subtype-only Do) -> no position -> geometry cannot own the figure even on clean-text pages.",
+      "4th pass (attribute_orphan_image) shows Gemini ONLY the isolated crop + a stem list: no page layout, no printed anchors -> unreliable 'decorative' verdicts.",
+      "Export gate never consulted unresolved_images.jsonl (only claimed assets) -> [GATE] CLEAN with a source-verified Q1 figure unresolved (false negative).",
+      "Synthetic tests passed because _write_test_pdf uses clean Helvetica text, direct Do placement and no isolated-crop 4th pass -> could not reproduce production."
+    ],
+    "fix": [
+      "image_positions_on_page: recursive Form-XObject walk with CTM composition (cycle-guarded) + drawn w/h from cm scale.",
+      "NEW L2 claim_block_images_ocr: closest-heading-above geometry from tesseract on the rendered page (pdftoppm/PyMuPDF) - deterministic, zero API cost, immune to text-layer garble.",
+      "NEW L3 full_page_vision_ownership: rendered page with highlighted+labeled bboxes; layout-only JSON verdicts; one call per page (all leftovers batched); adjacent pages for edge-touching figures; replaces isolated-crop as primary fallback.",
+      "Provenance ledger data/image_ownership.jsonl for every automatic assignment (owner/slot/method/evidence/confidence).",
+      "Export gate + qbank_validator flag unresolved images (unresolved_image / image_unresolved); deterministic_junk (broken crop < MIN_IMAGE_BYTES) excluded; model 'decorative' alone never clears a chapter."
+    ],
+    "tests_added": [
+      "test_form_wrapped_image_position_parsed_with_drawn_size",
+      "test_garbled_text_layer_question_image_claimed_by_full_page_vision",
+      "test_vision_never_overrides_deterministic_geometry",
+      "test_ocr_geometry_claims_when_text_layer_garbled",
+      "test_ocr_anchor_line_matching_converts_coordinates",
+      "test_unresolved_image_blocks_clean_gate",
+      "test_broken_crop_not_gate_violation",
+      "RealPdfOptInFixtureTests.test_page4_pypdf_dump_and_image_position (opt-in, requires fixtures/PSY.pdf)"
+    ],
+    "test_result": "112 tests OK (1 skipped: opt-in real-PDF fixture)",
+    "still_requires_new_railway_run": [
+      "Fresh run must show page 4 'OCR block position -> PSY-p4-7 -> PSY-001-001 (question)' or 'full-page vision: ... -> PSY-001-001' instead of 'ambiguous printed owners'.",
+      "No question-side figure may end in unresolved_images.jsonl as 'model-declared decorative'.",
+      "Export gate must list unresolved_image for any figure that still cannot be owned (never CLEAN-with-unresolved).",
+      "Confirm data/image_ownership.jsonl rows with method deterministic_ocr_geometry / full_page_vision for question-side figures."
+    ]
+  }
 }
