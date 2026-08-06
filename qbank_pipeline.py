@@ -883,6 +883,19 @@ def _stem_reject_reason(qtext, rec=None):
     if rec and len(t) >= 60:
         sol = (rec.get("solution_text") or "").strip()
         if sol and _frag_mostly_present(t, sol, CONTAMINATION_TOKEN_SHARE):
+            # RUN-14: a would-be stem that is (near-)IDENTICAL to the whole
+            # solution (ch7 q23/q25: question_text == solution_text verbatim,
+            # e.g. "The patient has developed acute muscular dystonia ..."
+            # or "Clozapine is the only drug ...") is contamination NO MATTER
+            # how question-shaped it looks ("which", "is the" appear inside
+            # explanation prose, so the run-12 question-shape narrowing lets
+            # them through). A REAL stem is a short question and its solution
+            # is much longer, so the REVERSE containment (solution inside
+            # stem) only fires when the two fields are the SAME text -- which
+            # is always contamination. Real stems whose solution restates
+            # them (ch26 q1) still pass: reverse containment fails.
+            if _frag_mostly_present(sol, t, 0.8):
+                return "question_text is this record's own solution verbatim"
             if len(t) > _MAX_REAL_STEM_LEN or not _QUESTION_SHAPED_RE.search(t):
                 return "stem text substantially contained in this record's own solution"
     return None
@@ -3141,6 +3154,39 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                         if not (r.get("question_text") or "").strip()]
             if len(stemless) == 1:
                 owner, reason = stemless[0], "question+options fallback (chapter's sole stem-less record)"
+        # ---- rule 5 (run-14): VERIFIED DUPLICATE. A q_no-less fragment whose
+        # text is already present in a record (option tail re-sent by a later
+        # batch's carry -- PAY-033 p356 "(d) the person has recently shown..."
+        # duplicating q8's option D; or a DRAIN scrap that repeats an option
+        # block) is a duplicate, NOT new content. Consume it deterministically
+        # with a match to the record's EXISTING text -- no ownership guess, no
+        # merge (the content is already there).
+        if owner is None:
+            frag_text = (item.get("question_text") or "").strip()
+            frag_opts = item.get("options") or {}
+            dup_qn = None
+            for qn, r in chapter_records.items():
+                r_opts = {str(k).strip().upper(): str(v or "").strip()
+                          for k, v in (r.get("options") or {}).items() if v}
+                matched = False
+                if frag_text:
+                    for opt_text in r_opts.values():
+                        if opt_text and _frag_mostly_present(frag_text, opt_text, 0.9):
+                            matched = True
+                            break
+                if not matched and frag_opts:
+                    f_vals = {str(v or "").strip().lower() for v in frag_opts.values() if v}
+                    r_vals = {v.lower() for v in r_opts.values()}
+                    if f_vals and f_vals <= r_vals:
+                        matched = True
+                if matched:
+                    dup_qn = qn
+                    break
+            if dup_qn is not None:
+                stats["orphans_recovered"] = stats.get("orphans_recovered", 0) + 1
+                print(f"  [ORPHAN] Consumed orphan: page={page} fragment already "
+                      f"present on q{dup_qn} (verified duplicate -- not data loss)")
+                continue
         if owner is None:
             print(f"  [ORPHAN] Could not determine owner: page={page} kept in orphans.jsonl")
             remaining.append(orph)
@@ -4220,6 +4266,28 @@ def ocr_page_anchors(png, scale, page_h_pt):
     return []
 
 
+def page_has_question_content(pdf_path, page, chapter_records, dpi=150):
+    """Per-page variant: does THIS rendered page print a question-stem heading
+    (a q_no in chapter_records) above its first solution header (or no
+    solution header at all)? Rendered-page OCR -- immune to the garbled
+    body-font text layer. Returns False when OCR/render is unavailable (the
+    caller decides the safe default)."""
+    rendered = render_page_png(pdf_path, page, dpi=dpi)
+    if not rendered[0]:
+        return False
+    img, scale, _page_h = rendered
+    anchors = ocr_page_anchors(img, scale, _page_h)
+    if not anchors:
+        return False
+    sol_y = min((y for k, _q, y in anchors if k == "solution"), default=None)
+    for k, qn, y in anchors:
+        if k != "question":
+            continue
+        if qn in chapter_records and (sol_y is None or y > sol_y):
+            return True
+    return False
+
+
 def window_has_question_content(pdf_path, pages, chapter_records, dpi=150):
     """Deterministic check used by Q-pass ACTIVATION (run-13 root cause: the
     section planner labels a whole chapter "S" when the text layer shows
@@ -4234,20 +4302,10 @@ def window_has_question_content(pdf_path, pages, chapter_records, dpi=150):
     OCR is immune to the garbled body-font text layer. Zero Gemini calls.
     Returns True when ANY of the pages shows question content."""
     for p in pages:
-        rendered = render_page_png(pdf_path, p, dpi=dpi)
-        if not rendered[0]:
-            continue
-        img, scale, _page_h = rendered
-        anchors = ocr_page_anchors(img, scale, _page_h)
-        if not anchors:
-            continue
-        sol_y = min((y for k, _q, y in anchors if k == "solution"), default=None)
-        for k, qn, y in anchors:
-            if k != "question":
-                continue
-            if qn in chapter_records and (sol_y is None or y > sol_y):
-                return True
+        if page_has_question_content(pdf_path, p, chapter_records, dpi=dpi):
+            return True
     return False
+
 
 
 
@@ -4749,6 +4807,71 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
     return violations
 
 
+def drop_phantom_solution_only_records(chapter_records, chapter_id, stats,
+                                       prior_rows=()):
+    """RUN-14 PHANTOM SOLUTION-ONLY RECORDS (ch2 q25/26 class): a record whose
+    ONLY content is solution_text -- stem/options/answer were never set by ANY
+    pass (proven by per-field provenance) AND whose solution DUPLICATES a
+    record already shipped in an earlier chapter (same q_no, >=50% solution
+    similarity) is a cross-chapter solution spill: the PREVIOUS chapter's
+    "Solution to Question N:" header landed inside this chapter's page range
+    and the S-pass created a phantom question record whose real q_no already
+    shipped in the previous chapter (ch1 q25/26: "Hysteria...", "Big five
+    personality traits..."). Shipping it pollutes the app with an empty
+    question and the gate triple-flags it forever. Returns the list of
+    dropped q_nos; the full record is preserved in
+    data/dropped_phantom_records.jsonl (shipped in the zip), so the solution
+    text is never lost, just not emitted as a question here.
+
+    Conservative by design:
+      * only records whose solution came from S/DRAIN/OCR passes AND whose
+        stem/options/answer have NO provenance are considered;
+      * the cross-chapter duplicate check is REQUIRED -- a solution-only
+        record with no prior duplicate (e.g. a real question whose stem was
+        lost but whose solution was extracted) is KEPT and stays flagged by
+        the gate (missing_stem etc.), never silently dropped."""
+    dropped = []
+    for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
+        prov = rec.get("_prov") or {}
+        has_question = (rec.get("question_text") or "").strip()
+        has_options = bool(rec.get("options"))
+        has_answer = bool(rec.get("correct_option"))
+        has_solution = (rec.get("solution_text") or "").strip()
+        sol_prov = str(prov.get("solution_text") or "")
+        if has_question or has_options or has_answer or not has_solution:
+            continue
+        if not (sol_prov.startswith("S") or sol_prov.startswith("DRAIN")
+                or sol_prov.startswith("OCR")):
+            continue
+        # cross-chapter duplicate proof: same q_no in an ALREADY-WRITTEN
+        # chapter with a highly similar solution
+        dup = False
+        for row in prior_rows:
+            try:
+                rq = int(row.get("q_no"))
+            except (TypeError, ValueError):
+                continue
+            if rq != qn:
+                continue
+            r_sol = (row.get("solution_text") or "").strip()
+            if r_sol and _frag_mostly_present(has_solution, r_sol, 0.5):
+                dup = True
+                break
+        if not dup:
+            continue
+        dropped.append(qn)
+        _append_jsonl(DATA_DIR / "dropped_phantom_records.jsonl",
+                      {"chapter_id": chapter_id, "q_no": qn,
+                       "reason": "solution-only record duplicating an earlier "
+                                 "chapter's q_no (cross-chapter solution spill); "
+                                 "no stem/options/answer ever extracted",
+                       "solution_prov": sol_prov,
+                       "solution_text": str(has_solution)[:1200]})
+    if dropped:
+        stats["phantom_solution_dropped"] = stats.get("phantom_solution_dropped", 0) + len(dropped)
+    return dropped
+
+
 def _record_chapter_ledger(chapter_id, ledger_rows):
     """Append the chapter's ledger rows (window-pass attempts) atomically."""
     for r in ledger_rows:
@@ -4843,6 +4966,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                                                    # EVERY S window because the
                                                    # extraction boundary owns
                                                    # solutions_section_seen)
+        q_covered_pages = set()                    # run-14: pages the Q-pass has
+                                                   # actually run on (per chapter)
         prev_window_last_page = None
 
         # SECTION-AWARE WINDOWS (run-6): detect questions/answers/solutions
@@ -4957,6 +5082,29 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     print(f"  [ACTIVATE] OCR question anchors on S-window pages "
                           f"{new_pages} -- Q-pass ON (deterministic question content)")
                     do_q = True
+            # RUN-14 Q-COVERAGE SAFETY NET: a page the Q-pass NEVER ran on is
+            # a question-loss risk no matter what the section planner guessed
+            # (ch2 q25/26, ch7 q23-26, ch18 q13, ch19 q11/12, ch24 q12/13 --
+            # the whole chapter was labeled "S" from the previous chapter's
+            # solution tail, so Q never saw the question pages and only the
+            # fragile targeted retry recovered part of the loss). Run Q on
+            # any window with never-Q-covered NEW pages UNLESS OCR proves the
+            # pages contain no question content (pure solutions). OCR/render
+            # unavailable -> RUN (safe default: accuracy must never depend on
+            # the text layer -- same philosophy as probe_batch_pages).
+            if not do_q:
+                uncovered = [p for p in new_pages if p not in q_covered_pages]
+                if uncovered:
+                    try:
+                        has_q = window_has_question_content(pdf_path, uncovered,
+                                                            chapter_records)
+                    except Exception:
+                        has_q = True
+                    if has_q:
+                        print(f"  [ACTIVATE] pages {uncovered} never Q-passed "
+                              f"and show question content -- Q-pass ON "
+                              f"(run-14 Q-coverage safety net)")
+                        do_q = True
             if not (do_q or do_s or do_a):
                 do_q = True  # eerily silent page (figures only?) -- default to Q-pass
 
@@ -4992,6 +5140,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 pass_batch = [pf for pf in batch if pf not in routed_pages]
                 if not pass_batch:
                     continue
+                if pass_name == "Q":
+                    # run-14: the Q-pass ATTEMPTED this window's pages -- mark
+                    # them covered so the safety net doesn't re-ask the same
+                    # pages in every later S window (retry/rescue own failures).
+                    q_covered_pages.update(window_pages)
                 carry_in = carry_by_pass.get(pass_name) if pass_name in ("Q", "S") else None
                 context_str = build_carry_context(carry_in, overlap_pages, new_pages)
                 if carry_in:
@@ -5574,6 +5727,28 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                   f"data/dropped_anchorless.jsonl")
             chapter_records = kept_records
             stats["anchorless_dropped"] = stats.get("anchorless_dropped", 0) + len(dropped_anchorless)
+
+        # cross-chapter duplicate proof for the phantom check: read the
+        # already-written questions.jsonl rows (excluding this chapter) so a
+        # solution-only record is only dropped when an EARLIER chapter already
+        # shipped the same q_no + solution (ch2 q25/26 <- ch1 q25/26 spill).
+        try:
+            prior_rows = [json.loads(l) for l in
+                          (DATA_DIR / "questions.jsonl").read_text(
+                              encoding="utf-8").splitlines() if l.strip()]
+            prior_rows = [r for r in prior_rows
+                          if r.get("chapter_id") != chapter_id
+                          and (r.get("solution") or {}).get("text")]
+        except Exception:
+            prior_rows = []
+        dropped_phantom = drop_phantom_solution_only_records(
+            chapter_records, chapter_id, stats, prior_rows=prior_rows)
+        if dropped_phantom:
+            print(f"  [DROP] {len(dropped_phantom)} solution-only phantom record(s) "
+                  f"removed (q{dropped_phantom}) -- preserved in "
+                  f"data/dropped_phantom_records.jsonl")
+            chapter_records = {qn: r for qn, r in chapter_records.items()
+                               if qn not in set(dropped_phantom)}
 
         # EXPORT GATE (run-11): deterministic pre-export check. A chapter may
         # not be exported as "complete" while these violations stand -- each

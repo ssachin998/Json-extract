@@ -654,3 +654,56 @@ repeat the visible q_no. Full deterministic orphan alignment (ordinal
 provenance per page) remains a design item (see REMAINING UNCERTAINTY).
 
 **Tests:** `Run13FinalAuditFixesTests` (+10). Suite 122 OK.
+
+## 15. Run-15 audit — output-data verification of the fresh PAY run (2026-08-06)
+
+The user's Drive `Output` folder was audited directly (chapters.json,
+export_gate.jsonl, image_ownership.jsonl, integrity_flags.jsonl,
+orphans.jsonl, page_ledger.jsonl, PAY-001..033.jsonl).
+
+### A15-1 — Q-pass coverage gap, PROVEN from page_ledger (ch7: 12 questions missing)
+
+PAY-007 has ZERO `pass: "Q"` rows in page_ledger.jsonl. The text-layer
+solutions detector fired on page 100 (ch6's solution tail), the whole chapter
+was labeled "S", and `_should_run_q_pass` returned False for every window. The
+A-pass returned 10 answer rows (q1-10), the S-pass 13 solution fragments. The
+final ch7 file contains records q1-10 + q23-26 = 14 records; **q11-22 never
+existed as records** (A-pass did not cover them, Q never ran, and targeted
+retry only re-asks EXISTING incomplete records). Same ledger signature for
+ch2 (no Q on pages 22-30), ch16/18/19/24/25/28/30/32 (Q absent or overlap-only).
+Fix: run-14/15 Q-coverage safety net (q_covered_pages + rendered-page OCR
+question-anchor check) forces the Q-pass on never-covered question pages.
+
+### A15-2 — Phantom solution-only records (ch2 q25/26) **[PROVEN]**
+
+PAY-002-025/026: question null, options [], answer [], solution present
+("Hysteria develops due to fixation in the phallic stage..." / "Big five
+personality traits..."). These are ch1's q25/26 SOLUTIONS (ch1 output has
+q25/26 complete; topics are ch1's). The S-pass read ch1's solution headers
+inside ch2's page range and created phantom records. Fix: phantom drop with
+cross-chapter duplicate proof + full preservation ledger.
+
+### A15-3 — Stem == solution verbatim slipped the guard (ch7 q23/25) **[PROVEN]**
+
+PAY-007-023 question_text == solution_text ("The patient has developed acute
+muscular dystonia ... within 1-5 days of drug intake."); PAY-007-025 same
+("Clozapine is the only drug ..."). Both contain "which"/"is", so the run-12
+question-shape narrowing let them through the containment rule. Fix:
+reverse-containment — a stem (near-)identical to its own solution is rejected
+verbatim; real stems restated in longer solutions still pass.
+
+### A15-4 — Real stem rejected 3x as contaminated (ch26 q1) **[PROVEN]**
+
+integrity_flags: `contaminated_stem_stripped` q1 (PAY-026), then retry ×2 and
+rescue all rejected "The acts that a person says or does to disclose himself
+as having the status of boy or man is called ___." — a REAL stem whose solution
+restates it. Fixed by run-14 stem quarantine (kept + flagged) + the
+reverse-containment rule (real stem now passes).
+
+### A15-5 — Orphan tails (PAY-033 p356) **[PROVEN]**
+
+orphans.jsonl: "(d) the person has recently shown..." duplicates q8's option D.
+Fix: recover_orphans rule 5 verified-duplicate consumption.
+
+**Packaging:** chapters.json has only PAY chapters (no stale PSY); export gate,
+orphans, ledger all present in the folder. No stale-artifact leak found.

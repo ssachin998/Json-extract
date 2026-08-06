@@ -523,6 +523,61 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
+### 4.29 Changelog — 2026-08-06 (output-data audit of the fresh PAY run: 90 flags / 25 of 33)
+
+The user's Drive `Output` folder (chapters.json, export_gate.jsonl,
+image_ownership.jsonl, integrity_flags.jsonl, orphans.jsonl, page_ledger.jsonl,
+PAY-001..033.jsonl) was audited against the code. Verified:
+
+- **chapters.json clean**: 33 chapters, all PAY, no stale PSY artifacts.
+- **image_ownership.jsonl**: 17 records, all high confidence with full
+  provenance (page-4 → PAY-001-001 question via full_page_vision; p213 →
+  deterministic_ocr_geometry). Run-13 image architecture confirmed working.
+- **export_gate.jsonl**: 33 violations across 9 chapters (matches the log).
+- **page_ledger.jsonl (the smoking gun)**: PAY-007 has ZERO Q-pass rows; PAY-002
+  has no Q-pass on pages 22-30; PAY-016/18/19/24/25/28/30/32 are Q-skipped on
+  their question pages. The text-layer solutions detector fired on each
+  chapter's FIRST pages (previous chapter's solution tail) → whole chapter
+  labeled "S" → Q-pass never ran → stems/options only via fragile retry.
+- **PAY-007 data loss quantified**: records = q1-10 + q23-26 = 14;
+  **q11-22 (12 questions) missing entirely** — A-pass only covered q1-10 and
+  targeted retry only fixes EXISTING incomplete records, so never-created
+  records are never retried.
+- **PAY-002-025/026**: solution-only phantom records — ch1's q25/26 solutions
+  spilled into ch2's page range and created phantom records.
+- **PAY-007-023/025**: `question_text == solution_text` verbatim — the run-12
+  question-shape narrowing let it through because the prose contains "which".
+- **PAY-026 q1**: a REAL stem ("...is called ___") rejected 3× as
+  "contaminated" (retry ×2 + rescue) → missing_stem.
+- **orphans.jsonl**: 4 meaningful fragments (PAY-011 p149 tables, PAY-017 p218
+  DRAIN options A/C/D, PAY-033 p356 option-D tail of q8).
+
+**New methods added (each test-first, full suite green):**
+
+1. **Q-pass coverage safety net** (`q_covered_pages` per chapter +
+   `page_has_question_content`/`window_has_question_content`): a window with
+   never-Q-covered pages runs the Q-pass whenever rendered-page OCR finds
+   question-stem anchors (or when OCR is unavailable). This is what finally
+   prevents the "whole chapter mislabeled S" silent question loss at the
+   SOURCE (ch2/7/16/18/19/24/25/28/30/32), instead of relying on the fragile
+   targeted retry.
+2. **`drop_phantom_solution_only_records`**: solution-only records (no
+   stem/options/answer provenance) are dropped ONLY with cross-chapter
+   duplicate proof (same q_no + ≥50% solution similarity in prior
+   questions.jsonl rows — ch1 q25/26 exists → ch2 phantom dropped). Without
+   that proof the record is kept and gate-flagged (a real lost question is
+   never silently deleted). Full records preserved in
+   `data/dropped_phantom_records.jsonl`.
+3. **Stem == solution verbatim rejection** (reverse-containment in
+   `_stem_reject_reason`): a would-be stem that is (near-)identical to its own
+   solution is contamination regardless of "which"/"is" question-shape words
+   (ch7 q23/25); real stems restated in longer solutions still pass (ch26 q1).
+4. **Orphan verified-duplicate rule** (recover_orphans rule 5): a q_no-less
+   fragment whose text duplicates an existing record's option/question content
+   (PAY-033 p356 option-D tail) is consumed deterministically, not orphaned.
+
+Tests: `Run14PersistentProblemFixesTests` (+8). Suite: **130 tests OK**.
+
 ### 4.28 Changelog — 2026-08-06 (final audit of the fresh PAY run: 90 flags / 25 of 33 chapters)
 
 Fresh run on current head (`PAY.pdf`, 33 chapters): validator reported

@@ -2208,5 +2208,171 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
             qp.shutil.which, qp.pytesseract.image_to_data = orig_which, orig_td
 
 
+class Run14PersistentProblemFixesTests(unittest.TestCase):
+    """run-14 (2nd pass) fixes driven by the OUTPUT DATA from the fresh PAY
+    run (Drive folder Output):
+
+    A. Phantom solution-only records (PAY-002-025/026): S-pass spilled the
+       PREVIOUS chapter's "Solution to Question 25/26" into ch2's page range
+       -> records with ONLY solution (no stem/options/answer), triple gate
+       violations forever. Dropped + preserved to dropped_phantom_records.
+    B. Stem == solution verbatim (PAY-007-023/025): question_text copied the
+       solution text; the run-12 question-shape narrowing let it through
+       because the prose contains "which"/"is". Reverse-containment now
+       catches identical fields no matter the shape.
+    C. Orphan verified duplicates (PAY-033 p356): a carry re-sent q8's option
+       D as a q_no-less fragment -> consumed as a verified duplicate instead
+       of lingering as orphan_unresolved.
+    D. Q-pass coverage safety net: pages the Q-pass never ran on get Q-passed
+       unless OCR proves pure-solution pages."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets, self._old_data, self._old_state = qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE
+        self._old_pace = qp._pace_gemini_call
+        qp.ASSETS_DIR = self.tmp / "assets"
+        qp.DATA_DIR = self.tmp / "data"
+        qp.STATE_FILE = self.tmp / "state.json"
+        qp._pace_gemini_call = lambda: None
+        (qp.ASSETS_DIR / "questions" / "PAY").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE = self._old_assets, self._old_data, self._old_state
+        qp._pace_gemini_call = self._old_pace
+        qp._RENDER_CACHE.clear()
+
+    # -- A. phantom solution-only records ---------------------------------
+    def test_phantom_solution_only_record_dropped_and_preserved(self):
+        # PAY-002-025 class: record created by S-pass spill (solution only),
+        # whose q_no + solution ALREADY shipped in ch1 (prior row)
+        recs = {25: {"q_no": 25, "question_text": None, "options": None,
+                     "correct_option": None,
+                     "solution_text": "Hysteria develops due to fixation in "
+                     "the phallic stage of development, not the genital stage.",
+                     "tables": [], "_prov": {"solution_text": "S_PASS"}},
+                1: {"q_no": 1, "question_text": "A patient is mute...",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "B", "solution_text": "Stupor...",
+                    "tables": [], "_prov": {"question_text": "Q_PASS"}}}
+        prior = [{"q_no": 25, "solution_text":
+                  "Hysteria develops due to fixation in the phallic stage of "
+                  "development, not the genital stage. The phallic stage is "
+                  "the third psychosexual stage."}]
+        stats = {}
+        dropped = qp.drop_phantom_solution_only_records(recs, "PAY-002", stats,
+                                                        prior_rows=prior)
+        self.assertEqual(dropped, [25])                 # phantom dropped
+        self.assertEqual(stats.get("phantom_solution_dropped"), 1)
+        self.assertIn(1, recs)                           # real record kept
+        # full record preserved in the ledger (never silently lost)
+        ledger = (qp.DATA_DIR / "dropped_phantom_records.jsonl")
+        self.assertTrue(ledger.exists())
+        entry = json.loads(ledger.read_text().splitlines()[0])
+        self.assertEqual(entry["q_no"], 25)
+        self.assertIn("Hysteria", entry["solution_text"])
+
+    def test_solution_only_record_without_prior_duplicate_kept(self):
+        # a real lost question whose solution was extracted (no prior
+        # duplicate anywhere) must NEVER be dropped -- it stays flagged by the
+        # gate instead of silently disappearing
+        recs = {11: {"q_no": 11, "question_text": None, "options": None,
+                     "correct_option": None,
+                     "solution_text": "Impulse control disorders include "
+                     "intermittent explosive disorder, kleptomania, and "
+                     "pyromania.", "tables": [],
+                     "_prov": {"solution_text": "S_PASS"}}}
+        stats = {}
+        dropped = qp.drop_phantom_solution_only_records(recs, "PAY-024", stats,
+                                                        prior_rows=[])
+        self.assertEqual(dropped, [])                    # kept (no dup proof)
+
+    def test_q_pass_record_with_solution_only_not_dropped(self):
+        # a Q-pass record (real question content prov) must never be dropped,
+        # even if stem/options are empty at this instant
+        recs = {7: {"q_no": 7, "question_text": None, "options": None,
+                    "correct_option": None,
+                    "solution_text": "some solution", "tables": [],
+                    "_prov": {"solution_text": "Q_PASS"}}}
+        stats = {}
+        dropped = qp.drop_phantom_solution_only_records(recs, "PAY-007", stats)
+        self.assertEqual(dropped, [])                    # Q-pass prov -> kept
+
+    # -- B. stem == solution verbatim contamination ------------------------
+    def test_stem_identical_to_solution_rejected_verbatim(self):
+        # PAY-007-023 class: "The patient has developed acute muscular
+        # dystonia ... within 1-5 days of drug intake." in BOTH fields; the
+        # text contains "which" so the old question-shape narrowing let it
+        # through. Reverse containment now catches it.
+        stem = ("The patient has developed acute muscular dystonia (spasm of "
+                "muscles of tongue, face, neck, and back) which is an "
+                "extrapyramidal side effect of haloperidol. This occurs within "
+                "1-5 days of drug intake.")
+        reason = qp._stem_reject_reason(stem, {"solution_text": stem})
+        self.assertIsNotNone(reason)
+        self.assertIn("verbatim", reason)
+
+    def test_real_stem_restated_in_solution_not_rejected(self):
+        # PAY-026 q1 class: real short question whose solution restates it --
+        # reverse containment fails (solution is much longer) -> NOT rejected
+        stem = "The acts that a person says or does to disclose himself as having the status of boy or man is called _______?"
+        solution = ("The acts that a person says or does to disclose himself "
+                    "as having the status of boy or man is called gender role. "
+                    "Gender role is the public manifestation of gender identity. "
+                    "It includes behavior, dress, and mannerisms that are "
+                    "culturally associated with masculinity or femininity.")
+        reason = qp._stem_reject_reason(stem, {"solution_text": solution})
+        self.assertIsNone(reason)                         # real stem survives
+
+    # -- C. orphan verified duplicate --------------------------------------
+    def test_orphan_option_tail_duplicate_consumed(self):
+        # PAY-033 p356 class: q8's option D re-sent as a q_no-less fragment
+        recs = {8: {"q_no": 8, "question_text": "Which statement is true?",
+                    "options": {"A": "a", "B": "b", "C": "c",
+                                "D": "(d) the person has recently shown, or is "
+                                     "showing, an inability to care for "
+                                     "themselves to a degree that places them "
+                                     "at risk of harm."},
+                    "correct_option": "D", "solution_text": "sol", "tables": []}}
+        orphan = {"chapter_id": "PAY-033", "batch_start": 356, "pdf_pages": [356],
+                  "new_pages": [356], "carry_q_no": None, "cut_part": None,
+                  "last_qn_in_batch": None, "pass": "Q",
+                  "item": {"q_no": None,
+                           "question_text": "(d) the person has recently shown "
+                                            "or is showing, an inability to "
+                                            "care for themselves to a degree "
+                                            "that places them at risk of harm.",
+                           "options": None, "correct_option": None,
+                           "solution_text": None, "tables": [],
+                           "has_figure_in_question": False,
+                           "has_figure_in_solution": False, "_prov": "Q_PASS"}}
+        stats = {}
+        remaining = qp.recover_orphans([orphan], recs, "PAY", 33, stats)
+        self.assertEqual(remaining, [])                    # consumed
+        self.assertEqual(stats.get("orphans_recovered"), 1)
+        self.assertEqual(recs[8]["question_text"], "Which statement is true?")  # unchanged
+
+    # -- D. Q-coverage: page-level question content ------------------------
+    def test_page_has_question_content_uses_ocr(self):
+        pdf = str(self.tmp / "x.pdf")
+        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
+        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
+        qp.ocr_page_anchors = lambda *a, **k: [("question", 1, 700.0)]
+        try:
+            self.assertTrue(qp.page_has_question_content(pdf, 24, {1: {}}))
+        finally:
+            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
+
+    def test_page_has_question_content_false_on_pure_solutions(self):
+        pdf = str(self.tmp / "x.pdf")
+        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
+        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
+        qp.ocr_page_anchors = lambda *a, **k: [("solution", 5, 700.0),
+                                               ("question", 5, 300.0)]
+        try:
+            self.assertFalse(qp.page_has_question_content(pdf, 22, {5: {}}))
+        finally:
+            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
+
+
 if __name__ == "__main__":
     unittest.main()

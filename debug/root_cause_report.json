@@ -195,5 +195,45 @@
       "stale PAY/PSY artifact check in the ZIP",
       "ch16/18/19/24 answers vs source (cross-chapter answer contamination check)"
     ]
+  },
+  "run_14b_output_audit": {
+    "output_source": "Drive folder Output (chapters.json + export_gate.jsonl + image_ownership.jsonl + integrity_flags.jsonl + orphans.jsonl + page_ledger.jsonl + PAY-001..033.jsonl)",
+    "verified": {
+      "chapters": "33 chapters, all PAY, NO stale PSY artifacts (chapters.json clean)",
+      "image_ownership": "17 records, all high confidence, full provenance (page4->PAY-001-001 question via full_page_vision; p213 via deterministic_ocr_geometry)",
+      "export_gate": "33 violations across 9 chapters (ch2/7/16/18/19/24/25/26/28) -- matches log",
+      "page_ledger_proof": "PAY-007 has ZERO Q-pass rows (whole chapter labeled S from text-layer); PAY-002 has no Q on pages 22-30; PAY-016/18/19/24/25/28/30/32 similarly Q-skipped on question pages",
+      "orphans": "4 meaningful unclaimed fragments (PAY-011 p149 tables; PAY-017 p218 DRAIN options A/C/D; PAY-033 p356 option-D tail)"
+    },
+    "confirmed_data_loss": {
+      "PAY-002": "q25/26 solution-only phantom records (ch1 spill -- ch1 q25/26 already shipped); stems/options/answers never extracted",
+      "PAY-007": "q23/25 question_text == solution_text verbatim (contamination missed by question-shape narrowing)",
+      "PAY-026": "q1 real stem rejected 3x as contaminated (retry x2 + rescue) -> missing_stem"
+    },
+    "fixes_implemented": [
+      "Q-coverage safety net: q_covered_pages per chapter; S-windows with never-Q-covered pages run Q-pass when rendered-page OCR shows question anchors (OCR unavailable -> run)",
+      "page_has_question_content helper (per-page OCR question-anchor test)",
+      "drop_phantom_solution_only_records: solution-only records dropped ONLY with cross-chapter duplicate proof (prior questions.jsonl same q_no + >=50% solution similarity); preserved to dropped_phantom_records.jsonl",
+      "_stem_reject_reason: reverse-containment rule -- stem == own solution verbatim rejected regardless of question shape (ch7 q23/25); real restated stems still pass (ch26 q1)",
+      "recover_orphans rule 5: verified-duplicate fragments (option tail re-sent) consumed deterministically (PAY-033 p356 class)"
+    ],
+    "tests_added": [
+      "test_phantom_solution_only_record_dropped_and_preserved",
+      "test_solution_only_record_without_prior_duplicate_kept",
+      "test_q_pass_record_with_solution_only_not_dropped",
+      "test_stem_identical_to_solution_rejected_verbatim",
+      "test_real_stem_restated_in_solution_not_rejected",
+      "test_orphan_option_tail_duplicate_consumed",
+      "test_page_has_question_content_uses_ocr",
+      "test_page_has_question_content_false_on_pure_solutions"
+    ],
+    "test_result": "130 tests OK (1 skipped: opt-in real-PDF fixture)",
+    "still_requires_railway_run": [
+      "ch7 must show Q-pass rows on pages 100-107 and records q1-22 (or book-true count) with no numbering gap",
+      "ch2 must show Q-pass on pages 22-30 and no q25/26 phantom records (dropped_phantom_records.jsonl entries instead)",
+      "ch16/18/19/24/25/28/30/32 Q-pass on question pages -> mass retry dependence gone",
+      "no question_text == solution_text in any record",
+      "export gate: only genuine unresolved images/orphans remain"
+    ]
   }
 }
