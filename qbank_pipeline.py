@@ -34,15 +34,13 @@ import difflib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import google.generativeai as genai
-from PIL import Image, ImageDraw
+from PIL import Image
 from pypdf import PdfReader
 import pytesseract
 
@@ -3671,101 +3669,64 @@ def _mat_mult(m1, m2):
 
 
 def image_positions_on_page(pdf_path, file_page):
-    """Best-effort map {image object idnum -> (y, x, draw_index, w, h)} for
-    every image XObject drawn on a page, by walking the content stream and
-    tracking the cm matrix before each `Do` -- RECURSING INTO Form XObjects
-    (run-13: figures are often drawn inside a Form / clip / mask wrapper, and
-    the old flat walk silently skipped those images, leaving them with no
-    position and therefore no geometry owner). (x, y) = the image's
-    BOTTOM-LEFT corner in PDF user space (origin at the page bottom-left),
-    so LARGER y == HIGHER on the page and LARGER x == further RIGHT; (w, h)
-    = drawn size in user-space points (from the cm scale). x/y feed the
-    block and option-image geometry; w/h feed the bbox overlay of the
-    full-page-vision pass (run-13). Returns {} on any parse hiccup -- callers
-    then fall back to plain reading order / the render-based passes."""
+    """Best-effort map {image object idnum -> (y, x, draw_index)} for every
+    image XObject drawn on a page, by walking the content stream and
+    tracking the cm matrix before each `Do`. (x, y) = the image's BOTTOM-LEFT
+    corner in PDF user space (origin at the page bottom-left), so LARGER y ==
+    HIGHER on the page and LARGER x == further RIGHT. x is used by the
+    option-image geometry (horizontal / 2x2 option layouts, run-10).
+    Returns {} on any parse hiccup -- callers then fall back to plain
+    reading order."""
     positions = {}
     try:
         page = PdfReader(pdf_path).pages[file_page - 1]
-        root_names = {str(name): ref for name, ref in _page_xobjects(page).items()}
+        xobjs = _page_xobjects(page)
+        names = {str(name): ref for name, ref in xobjs.items()}
         contents = page.get_contents()
         if contents is None:
             return {}
-        streams = []
-        if isinstance(contents, (list, tuple)):
-            for c in contents:
-                d = c.get_data() if hasattr(c, "get_data") else None
-                if d:
-                    streams.append(d)
-        else:
-            d = contents.get_data() if hasattr(contents, "get_data") else None
-            if d:
-                streams.append(d)
-        if not streams:
+        data = contents.get_data() if hasattr(contents, "get_data") else None
+        if not data:
             return {}
         import zlib
-        state = {"draw_idx": 0, "visited_forms": set()}
-
-        def _decompress(data):
-            try:
-                return zlib.decompress(data)
-            except Exception:
-                return data
-
-        def _walk(data, names):
-            tokens = re.findall(rb"/[^\s\[\]()<>{}/%]+|\([^)]*\)|\[[^\]]*\]|"
-                                rb"[-+]?\d*\.?\d+|[A-Za-z'\"]+", _decompress(data))
-            ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
-            stack = []
-            num_buf = []
-            i = 0
-            while i < len(tokens):
-                t = tokens[i]
-                if t == b"q":
-                    stack.append(ctm)
-                elif t == b"Q":
-                    ctm = stack.pop() if stack else ctm
-                elif t == b"cm" and len(num_buf) >= 6:
-                    m = tuple(float(x) for x in num_buf[-6:])
-                    ctm = _mat_mult(m, ctm)
+        try:
+            data = zlib.decompress(data)
+        except Exception:
+            pass
+        # tokenize the small subset we care about: q, Q, cm, Do
+        tokens = re.findall(rb"/[^\s\[\]()<>{}/%]+|\([^)]*\)|\[[^\]]*\]|"
+                            rb"[-+]?\d*\.?\d+|[A-Za-z'\"]+", data)
+        ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        stack = []
+        num_buf = []
+        draw_idx = 0
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t == b"q":
+                stack.append(ctm)
+            elif t == b"Q":
+                ctm = stack.pop() if stack else ctm
+            elif t == b"cm" and len(num_buf) >= 6:
+                m = tuple(float(x) for x in num_buf[-6:])
+                ctm = _mat_mult(m, ctm)
+                num_buf = []
+            elif t == b"Do" and num_buf:
+                name = num_buf[-1].decode("latin-1")
+                if name in names:
+                    obj = _resolve(names[name])
+                    if obj.get("/Subtype") == "/Image":
+                        oid = getattr(names[name], "idnum", None)
+                        key = oid if oid is not None else name
+                        positions[key] = (ctm[5], ctm[4], draw_idx)
+                        draw_idx += 1
+                num_buf = []
+            i += 1
+            if t not in (b"q", b"Q", b"cm", b"Do"):
+                if t.startswith(b"/") or re.fullmatch(rb"[-+]?\d*\.?\d+", t):
+                    num_buf.append(t)
+                else:
                     num_buf = []
-                elif t == b"Do" and num_buf:
-                    name = num_buf[-1].decode("latin-1")
-                    if name in names:
-                        obj = _resolve(names[name])
-                        sub = obj.get("/Subtype")
-                        if sub == "/Image":
-                            oid = getattr(names[name], "idnum", None)
-                            key = oid if oid is not None else name
-                            positions[key] = (ctm[5], ctm[4], state["draw_idx"],
-                                              ctm[0], ctm[3])
-                            state["draw_idx"] += 1
-                        elif sub == "/Form":
-                            # recurse with the Form's OWN resources; the form
-                            # content runs at the current CTM, so pass it down
-                            fid = getattr(names[name], "idnum", None)
-                            if fid in state["visited_forms"]:
-                                pass  # cycle guard: don't re-walk
-                            else:
-                                if fid is not None:
-                                    state["visited_forms"].add(fid)
-                                fdata = obj.get_data() if hasattr(obj, "get_data") else None
-                                if fdata:
-                                    fres = _resolve(obj.get("/Resources"))
-                                    fnames = {}
-                                    if fres:
-                                        fxobjs = _resolve(fres.get("/XObject"))
-                                        if fxobjs:
-                                            fnames = {str(n): r for n, r in fxobjs.items()}
-                                    _walk(fdata, fnames)
-                    num_buf = []
-                i += 1
-                if t not in (b"q", b"Q", b"cm", b"Do"):
-                    if t.startswith(b"/") or re.fullmatch(rb"[-+]?\d*\.?\d+", t):
-                        num_buf.append(t)
-                    else:
-                        num_buf = []
-        for data in streams:
-            _walk(data, root_names)
         return positions
     except Exception:
         return {}
@@ -3893,7 +3854,7 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
             oid = int(Path(rel).stem.rsplit("-", 1)[-1])
         except (ValueError, IndexError):
             oid = None
-        y, _x, didx, _w, _h = pos.get(oid, (None, None, 10**6, 0, 0))
+        y, _x, didx = pos.get(oid, (None, None, 10**6))
         return (-(y if y is not None else float("-inf")), didx)
 
     ordered_imgs = sorted(imgs, key=order_key)
@@ -3964,7 +3925,7 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
         if info is None:
             leftover.append(rel)
             continue
-        y_img, x_img, _didx, _w, _h = info
+        y_img, x_img, _didx = info
         # Closest header drawn ABOVE the image: iterate bottom-first, take
         # the first hit (the topmost header above would hand every figure on
         # the page to the first block).
@@ -4028,367 +3989,9 @@ def _order_imgs_by_position(imgs, pos):
             oid = int(Path(rel).stem.rsplit("-", 1)[-1])
         except (ValueError, IndexError):
             oid = None
-        y, _x, didx, _w, _h = pos.get(oid, (None, None, 10**6, 0, 0))
+        y, _x, didx = pos.get(oid, (None, None, 10**6))
         return (-(y if y is not None else float("-inf")), didx)
     return sorted(imgs, key=order_key)
-
-
-# ======================================================================
-# run-13 UNIFIED IMAGE-OWNERSHIP ARCHITECTURE (full-page context levels)
-# ======================================================================
-# The page-4 class: a REAL question-side figure (PSY-p4-7 -> Q1) was not
-# attached. The run-9 "geometry-first" system reads block headings from the
-# PDF TEXT LAYER; on this book's QUESTION pages the body-font text layer is
-# garbled/absent (broken ToUnicode), so question_headers_on_page finds no
-# headings, one_to_one's pdftotext probe also finds none ("ambiguous printed
-# owners -"), and the figure falls to an ISOLATED-crop Gemini call that
-# cannot see any printed anchor -- it guessed "decorative" for a real figure.
-# The synthetic tests passed because their PDFs use clean Helvetica text.
-#
-# The ownership ladder below is the unified design. Each level sees ONLY the
-# leftovers of the previous level, and every level records provenance to
-# data/image_ownership.jsonl:
-#   L1 deterministic text-layer geometry (run-9, closest heading above)
-#   L2 deterministic OCR-anchored geometry (NEW -- tesseract on the RENDERED
-#      page, immune to text-layer garble, zero Gemini calls; tesseract ships
-#      in the prod Docker image)
-#   L3 full-page vision (NEW -- rendered page with each leftover's drawn bbox
-#      highlighted + labeled; Gemini decides ONLY from printed layout
-#      anchors, one call per page with all leftovers batched; adjacent pages
-#      attached when a figure touches a page edge)
-#   L4 unresolved_images.jsonl (conservative -- never discard on a single
-#      model verdict; the export gate now flags these per chapter)
-# Never let a lower level override a higher one: each level only receives
-# what the previous one left unclaimed.
-
-_RENDER_CACHE = {}
-
-
-def render_page_png(pdf_path, file_page, dpi=150):
-    """(PIL.Image, scale_px_per_pt, page_height_pt) render of the page, or
-    (None, 0, 0) when no renderer is available. Tries pdftoppm (poppler-utils,
-    installed in the prod image) first, then PyMuPDF (self-contained).
-    Cached per (pdf, page, dpi)."""
-    key = (str(pdf_path), file_page, dpi)
-    if key in _RENDER_CACHE:
-        return _RENDER_CACHE[key]
-    out = None
-    if shutil.which("pdftoppm"):
-        try:
-            tmpdir = tempfile.mkdtemp(prefix="qbank_render_")
-            prefix = os.path.join(tmpdir, "page")
-            subprocess.run(["pdftoppm", "-f", str(file_page), "-l", str(file_page),
-                            "-r", str(dpi), "-png", "-singlefile",
-                            str(pdf_path), prefix],
-                           check=True, capture_output=True, timeout=180)
-            png_path = prefix + ".png"
-            if os.path.exists(png_path):
-                out = Image.open(png_path).convert("RGB")
-        except Exception as e:
-            print(f"  [WARN] pdftoppm render failed for page {file_page}: {e}")
-    if out is None:
-        try:
-            import fitz  # PyMuPDF -- self-contained, no system deps
-            doc = fitz.open(str(pdf_path))
-            page = doc[file_page - 1]
-            pix = page.get_pixmap(dpi=dpi)
-            out = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        except Exception as e:
-            print(f"  [WARN] PyMuPDF render failed for page {file_page}: {e}")
-    if out is None:
-        _RENDER_CACHE[key] = (None, 0, 0)
-        return _RENDER_CACHE[key]
-    scale = dpi / 72.0
-    page_h_pt = out.height / scale
-    _RENDER_CACHE[key] = (out, scale, page_h_pt)
-    return _RENDER_CACHE[key]
-
-
-def ocr_page_anchors(png, scale, page_h_pt):
-    """[(kind, q_no, y_pdf_pt)] block headings read by OCR from the RENDERED
-    page pixels (tesseract, --psm 6). kind in {"question","solution"};
-    y_pdf_pt is the line's center converted back to PDF user space (origin
-    bottom-left, LARGER y == HIGHER), the same space claim_block_images uses.
-    Returns [] when the tesseract binary is unavailable or OCR yields nothing
-    usable -- the caller then falls through to the vision level."""
-    if not shutil.which("tesseract"):
-        return []
-    try:
-        data = pytesseract.image_to_data(png, config="--psm 6",
-                                         output_type=pytesseract.Output.DICT)
-    except Exception:
-        return []
-    words = []
-    for i, txt in enumerate(data.get("text", []) or []):
-        t = (txt or "").strip()
-        if not t:
-            continue
-        try:
-            left = int(data["left"][i]); top = int(data["top"][i])
-            wdt = int(data["width"][i]); hgt = int(data["height"][i])
-            conf = float(data["conf"][i])
-        except (KeyError, ValueError, TypeError, IndexError):
-            continue
-        if conf < 40:
-            continue
-        words.append((left, top + hgt / 2.0, t))   # x_px, y_center_px
-    if not words:
-        return []
-    # group words into visual lines by vertical center
-    tol = max(6.0, scale * 6.0)   # ~half a line height in px at this dpi
-    words.sort(key=lambda w: (w[1], w[0]))
-    lines = []
-    cur = []
-    cur_y = None
-    for x, yc, t in words:
-        if cur and abs(yc - cur_y) > tol:
-            lines.append((cur_y, sorted(cur)))
-            cur = []
-        cur.append((x, t))
-        cur_y = yc if cur_y is None else (cur_y * 0.5 + yc * 0.5)
-    if cur:
-        lines.append((cur_y, sorted(cur)))
-    anchors = []
-    for _yc, wl in lines:
-        line = " ".join(t for _x, t in wl)
-        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", line)
-        if m:
-            anchors.append(("question", int(m.group(1)),
-                            (png.height - _yc) / scale))
-            continue
-        for sm in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", line, re.I):
-            anchors.append(("solution", int(sm.group(1)),
-                            (png.height - _yc) / scale))
-    return sorted(set(anchors), key=lambda a: -a[2])
-
-
-def _record_image_ownership(subject, chapter_id, page, rel, qid, slot,
-                            method, evidence, confidence="high"):
-    """Provenance ledger for EVERY automatic image assignment: owner, slot,
-    method (deterministic_geometry / deterministic_ocr_geometry /
-    model_figure_map / deterministic_one_to_one / full_page_vision ...),
-    evidence, confidence. Append-only; shipped in the export zip."""
-    entry = {"subject": subject, "chapter_id": chapter_id, "page": page,
-             "file": rel, "owner": qid, "slot": slot, "method": method,
-             "evidence": str(evidence or "")[:240], "confidence": confidence,
-             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    _append_jsonl(DATA_DIR / "image_ownership.jsonl", entry)
-
-
-def claim_block_images_ocr(imgs, pdf_path, file_page, subject, chapter_no,
-                           chapter_records, image_files_by_q, chapter_id=None,
-                           active_block=None, dpi=150):
-    """run-13 LEVEL 2 (deterministic OCR-anchored geometry): the SAME
-    closest-heading-above rule as claim_block_images, but the block headings
-    come from OCR of the RENDERED page instead of the (garbled/absent) PDF
-    text layer. Deterministic, zero Gemini calls. Runs only on leftovers from
-    L1. Returns the files STILL unclaimed (they flow to L3 vision)."""
-    if not imgs:
-        return []
-    rendered = render_page_png(pdf_path, file_page, dpi=dpi)
-    if not rendered[0]:
-        return imgs
-    img, scale, page_h_pt = rendered
-    anchors = ocr_page_anchors(img, scale, page_h_pt)
-    if not anchors:
-        return imgs
-    # identical filtering to block_headers_on_page: question headings below
-    # the first solution header are solution-prose list items, not stems
-    qs = [("question", qn, y) for k, qn, y in anchors if k == "question"]
-    ss = [("solution", qn, y) for k, qn, y in anchors if k == "solution"]
-    if ss:
-        first_sol_y = min(y for _k, _q, y in ss)
-        qs = [t for t in qs if t[2] > first_sol_y]
-    headers = sorted(qs + ss, key=lambda t: -t[2])
-    pos = image_positions_on_page(pdf_path, file_page)
-    if not pos:
-        return imgs
-    leftover = []
-    for rel in imgs:
-        try:
-            oid = int(Path(rel).stem.rsplit("-", 1)[-1])
-        except (ValueError, IndexError):
-            leftover.append(rel)
-            continue
-        info = pos.get(oid)
-        if info is None:
-            leftover.append(rel)
-            continue
-        y_img, x_img, _didx, _w, _h = info
-        owner = next(((k, qn) for k, qn, y_hdr in reversed(headers)
-                      if y_hdr > y_img), None)
-        if owner is None:
-            if active_block is not None:
-                owner = active_block          # cross-page carry (priority C)
-            else:
-                leftover.append(rel)
-                continue
-        kind, qn = owner
-        if qn not in chapter_records:
-            leftover.append(rel)
-            continue
-        new_rel = _rename_for_slot(rel, qn, kind, subject, chapter_no,
-                                   image_files_by_q)
-        if new_rel:
-            entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
-            entry[kind].append(new_rel)
-            qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
-            print(f"  [IMG] page {file_page}: OCR block position -> {rel} -> {qid} ({kind})")
-            _record_image_ownership(subject, chapter_id, file_page, rel, qid,
-                                    kind, "deterministic_ocr_geometry",
-                                    "closest OCR question/solution heading above image")
-        else:
-            leftover.append(rel)
-    return leftover
-
-
-FULL_PAGE_VISION_PROMPT = """A rendered page of an MCQ book is attached with some figures
-highlighted and labeled (red box + label like IMG-1). Decide the OWNER of each labeled
-figure using ONLY the printed page layout you can SEE in the render:
-- the printed question number ("1." / "1)" / "Q1.") drawn directly above the figure,
-- option letters (A. B. C. D.) drawn next to the figure,
-- "Solution to Question N:" headers,
-- the figure's position relative to those anchors.
-Do NOT infer ownership from the medical content of the figure itself.
-Valid question numbers: {Q_RANGE}.
-Return ONE JSON object mapping each label to:
-{{"q_no": <int|null>, "slot": "question"|"solution"|"option"|null,
-  "option": "A"|"B"|"C"|"D"|null, "confidence": "high"|"medium"|"low"|null,
-  "evidence": "<one short sentence quoting the printed anchor used>"}}
-- q_no null = the figure has no printed owner on the shown page(s).
-- slot "option" only when the figure sits ON a printed option line (A./B./C./D.).
-- "low" confidence or missing evidence = UNRESOLVED (return null rather than guess)."""
-
-
-def full_page_vision_ownership(model, pdf_path, file_page, rels, positions,
-                               subject, chapter_no, chapter_records,
-                               chapter_id, state, image_files_by_q,
-                               dpi=150, edge_tol_pt=36.0):
-    """run-13 LEVEL 3 (full-page vision): ONE Gemini call per page; every
-    leftover image on the page is highlighted on the RENDERED page with a
-    labeled bbox, and the model answers ONLY from printed layout anchors --
-    never from the figure's medical content (the failure mode of the old
-    isolated-crop 4th pass). Adjacent pages are rendered and attached as
-    context when a figure touches the page top/bottom edge (cross-page
-    blocks). Returns (claimed, still_unclaimed, verdicts)."""
-    claimed, still, verdicts = [], [], {}
-    if not rels:
-        return claimed, still, verdicts
-    render = render_page_png(pdf_path, file_page, dpi=dpi)
-    if not render[0]:
-        return claimed, list(rels), verdicts
-    page_img, scale, page_h_pt = render
-    labels = {}
-    for i, rel in enumerate(rels):
-        try:
-            oid = int(Path(rel).stem.rsplit("-", 1)[-1])
-        except (ValueError, IndexError):
-            oid = None
-        info = positions.get(oid) if oid is not None else None
-        if info is None:
-            still.append(rel)
-            continue
-        labels[f"IMG-{i + 1}"] = (rel, oid, info)
-    if not labels:
-        return claimed, still, verdicts
-    draw = ImageDraw.Draw(page_img)
-    font = None
-    try:
-        from PIL import ImageFont
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(10, int(14 * scale / 2)))
-    except Exception:
-        pass
-    for label, (_rel, _oid, info) in labels.items():
-        y_pt, x_pt, _didx, w_pt, h_pt = info
-        x0 = int(x_pt * scale); y0 = int((page_h_pt - (y_pt + h_pt)) * scale)
-        x1 = int((x_pt + w_pt) * scale); y1 = int((page_h_pt - y_pt) * scale)
-        lw = max(3, int(scale / 8))
-        draw.rectangle([x0, y0, x1, y1], outline="red", width=lw)
-        if font:
-            tw = max(10, int(len(label) * 9 * scale / 2))
-            draw.rectangle([x0, max(0, y0 - int(22 * scale / 2)),
-                            x0 + tw, y0], fill="red")
-            draw.text((x0 + 4, max(0, y0 - int(18 * scale / 2))),
-                      label, fill="white", font=font)
-    # cross-page context (LEVEL 3b): a figure touching the top/bottom edge
-    # may belong to a block that started/continues on the adjacent page
-    min_y = min(info[0] for _r, _o, info in labels.values())
-    max_top = max(info[0] + info[3] for _r, _o, info in labels.values())
-    context_imgs = []
-    if min_y < edge_tol_pt and file_page > 1:
-        ctx = render_page_png(pdf_path, file_page - 1, dpi=dpi)
-        if ctx[0]:
-            context_imgs.append((file_page - 1, ctx[0]))
-    if max_top > page_h_pt - edge_tol_pt:
-        ctx = render_page_png(pdf_path, file_page + 1, dpi=dpi)
-        if ctx[0]:
-            context_imgs.append((file_page + 1, ctx[0]))
-    q_min, q_max = (min(chapter_records), max(chapter_records)) if chapter_records else (0, 0)
-    prompt = FULL_PAGE_VISION_PROMPT.replace(
-        "{Q_RANGE}", f"{q_min}-{q_max} (chapter {subject}-{chapter_no:03d})")
-    parts = [prompt, page_img]
-    if context_imgs:
-        parts.append("Adjacent context page(s) attached (NOT highlighted) -- use them "
-                     "only to locate the block a highlighted figure continues from.")
-        for _pn, cimg in context_imgs:
-            parts.append(cimg)
-    _pace_gemini_call()
-    try:
-        resp = model.generate_content(parts, safety_settings=SAFETY_SETTINGS,
-                                      request_options={"retry": None})
-        state["calls_today"] += 1
-        save_state(state)
-        if not getattr(resp, "candidates", None):
-            return claimed, [r for r, _o, _i in labels.values()] + still, verdicts
-        text = (resp.text or "").strip()
-        text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
-        parsed = json.loads(text) if text else {}
-    except Exception as e:
-        print(f"  [IMG] full-page vision call failed for page {file_page}: {e}")
-        return claimed, [r for r, _o, _i in labels.values()] + still, verdicts
-    for label, (rel, _oid, _info) in labels.items():
-        v = parsed.get(label) if isinstance(parsed, dict) else None
-        if not isinstance(v, dict):
-            still.append(rel)
-            continue
-        verdicts[rel] = v
-        try:
-            qn = int(v.get("q_no"))
-        except (TypeError, ValueError):
-            still.append(rel)
-            continue
-        if qn not in chapter_records:
-            still.append(rel)
-            continue
-        slot = v.get("slot")
-        conf = str(v.get("confidence") or "").lower()
-        if slot not in ("question", "solution", "option") or conf not in ("high", "medium"):
-            still.append(rel)
-            continue
-        opt = None
-        if slot == "option":
-            opt = str(v.get("option") or "").strip().upper()
-            if opt not in ("A", "B", "C", "D"):
-                still.append(rel)
-                continue
-        new_rel = _rename_for_slot(rel, qn, slot, subject, chapter_no,
-                                   image_files_by_q, option_letter=opt)
-        if not new_rel:
-            still.append(rel)
-            continue
-        entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
-        entry.setdefault("option", {})
-        if slot == "option":
-            entry["option"].setdefault(opt, []).append(new_rel)
-        else:
-            entry[slot].append(new_rel)
-        qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
-        evidence = str(v.get("evidence") or "")[:200]
-        print(f"  [IMG] full-page vision: page {file_page} {rel} -> {qid} ({slot}) [{conf}]")
-        _record_image_ownership(subject, chapter_id, file_page, rel, qid, slot,
-                                "full_page_vision", evidence, conf)
-        claimed.append((rel, qid, slot))
-    return claimed, still, verdicts
 
 
 def claim_figure_map_images(fig_map, window_rows, subject, chapter_no,
@@ -4567,22 +4170,12 @@ def _ledger_pass(chapter_id, subject, chapter_no, pass_name, window_pages,
 
 
 def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger,
-                            chapter_id, unresolved_images=()):
+                            chapter_id):
     """run-11 EXPORT GATE: returns a list of (kind, q_no, detail) violations
     that must be ZERO before a chapter export counts as clean. Deterministic
     checks only -- no Gemini. This is what makes 'missing answer = 0 / missing
     solution = 0' insufficient: stems, options, orphans, images, asset refs
-    and unresolved pages are all gated too.
-
-    run-13: an unresolved IMAGE is now a gate violation too. A chapter whose
-    extracted figure never got a deterministic/vision owner is NOT clean --
-    the old gate only inspected CLAIMED images (broken_asset_ref), so
-    [GATE] CLEAN printed even while a source-verified Q1 figure sat in
-    unresolved_images.jsonl. Exceptions (deterministically NOT a relevant
-    figure, no human review needed): broken crops below MIN_IMAGE_BYTES and
-    images excluded at extraction (watermark object id). A single Gemini
-    "decorative" verdict is NOT an exception -- that verdict mislabeled a real
-    figure in production and must not clear the gate."""
+    and unresolved pages are all gated too."""
     violations = []
     for qn, rec in sorted(chapter_records.items()):
         if not (rec.get("question_text") or "").strip():
@@ -4611,12 +4204,6 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
     for l in unresolved_ledger:
         violations.append((f"unresolved_page_{l['pass']}", l["pages"],
                            l["status"]))
-    for u in unresolved_images or ():
-        if u.get("deterministic_junk"):
-            continue   # broken crop (<MIN_IMAGE_BYTES) -- not a real figure
-        violations.append(("unresolved_image", u.get("page"),
-                           f"{u.get('file')} (method={u.get('method') or '?'} "
-                           f"confidence={u.get('confidence') or '?'})"))
     return violations
 
 
@@ -4626,34 +4213,19 @@ def _record_chapter_ledger(chapter_id, ledger_rows):
         _append_jsonl(DATA_DIR / "page_ledger.jsonl", r)
 
 
-def _record_unresolved_image(subject, chapter_id, page, rel, reason,
-                             model_verdict=None, method="unresolved",
-                             confidence=None):
-    """Run-9 CONSERVATIVE rule (run-13 provenance + junk marking): an
-    extracted image with no deterministic owner must NOT be permanently
-    discarded on a single Gemini "decorative" verdict (PSY-p4-7 was called
-    decorative in one run yet belongs to Q1). It is RECORDED to
-    data/unresolved_images.jsonl -- kept on disk under its temp name with the
-    model verdict attached -- for human review. Only STRONG deterministic
-    evidence (watermark object id, already excluded at extraction; a broken
-    crop below MIN_IMAGE_BYTES, marked deterministic_junk) may permanently
-    classify non-figure. The export gate flags every entry that is NOT
-    deterministic_junk."""
-    size = 0
-    p = ASSETS_DIR / "questions" / rel
-    try:
-        size = p.stat().st_size if p.exists() else 0
-    except OSError:
-        size = 0
+def _record_unresolved_image(subject, chapter_id, page, rel, reason, model_verdict=None):
+    """Run-9 CONSERVATIVE-DECORATIVE rule: an extracted image with no
+    deterministic owner must NOT be permanently discarded on a single Gemini
+    "decorative" verdict (PSY-p4-7 was called decorative in one run yet
+    belongs to Q1). It is RECORDED to data/unresolved_images.jsonl -- kept on
+    disk under its temp name with the model verdict attached -- for human
+    review. Only STRONG deterministic evidence (watermark object id, which is
+    already excluded at extraction) may permanently classify decorative."""
     entry = {"subject": subject, "chapter_id": chapter_id, "page": page,
-             "file": rel, "reason": reason, "method": method,
-             "confidence": confidence,
-             "deterministic_junk": bool(size and size < MIN_IMAGE_BYTES),
-             "size_bytes": size}
+             "file": rel, "reason": reason}
     if model_verdict is not None:
         entry["model_verdict"] = model_verdict
     _append_jsonl(DATA_DIR / "unresolved_images.jsonl", entry)
-    return entry
 
 def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 only_chapter_no=None):
@@ -5075,16 +4647,6 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 leftover = claim_page_images(rels, pdf_path, file_page_num, subject,
                                              ch["chapter_no"], chapter_records,
                                              image_files_by_q, active_block=active_block)
-                # run-13 LEVEL 2 (deterministic OCR-anchored geometry): the
-                # text layer on this book's QUESTION pages is garbled, so
-                # L1 finds no headings there and question-side figures would
-                # fall straight to the model. OCR the RENDERED page and
-                # re-apply the closest-heading-above rule -- zero Gemini
-                # calls, immune to text-layer garble.
-                leftover = claim_block_images_ocr(
-                    leftover, pdf_path, file_page_num, subject, ch["chapter_no"],
-                    chapter_records, image_files_by_q, chapter_id=chapter_id,
-                    active_block=active_block)
                 leftover_by_page[file_page_num] = leftover
 
             # FIGURE-MAP pass (run-6 user ask, run-9 priority D): Gemini's
@@ -5192,29 +4754,12 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             elif qns:
                 print(f"  [INFO] third pass: page {um['page']} has {len(qns)} printed questions "
                       f"{qns} -- ambiguous owner, left for manual review")
-        # FOURTH pass (run-13 LEVEL 3 first, isolated-crop fallback after):
-        # L3 renders the page, highlights every leftover's drawn bbox and asks
-        # Gemini for ownership from the PRINTED LAYOUT (question numbers /
-        # option letters / solution headers) -- the page-4 class fix: the old
-        # isolated-crop call could not see any printed anchor and guessed
-        # "decorative" for a real Q1 figure. Only files the vision pass could
-        # not place (render unavailable / call failed / null verdict) fall
-        # through to the legacy one-image-per-call attribution, which remains
-        # conservative (a "decorative" verdict is never a discard).
-        chapter_unresolved_images = []
-        for um in unmatched_images:
-            if um.get("matched"):
-                continue
-            try:
-                vis_pos = image_positions_on_page(pdf_path, um["page"])
-            except Exception:
-                vis_pos = {}
-            _vis_claimed, vis_still, vis_verdicts = full_page_vision_ownership(
-                genai_model, pdf_path, um["page"], um["files"], vis_pos,
-                subject, ch["chapter_no"], chapter_records, chapter_id, state,
-                image_files_by_q)
-            um["files"] = vis_still
-            um["model_verdicts"] = vis_verdicts
+        # FOURTH pass (Gemini, ONE image per call, never grouped): the final
+        # safety net (Gap-2). The model attributes each leftover image to a
+        # printed q_no (with a question/solution slot), or confidently marks
+        # it decorative. Only files the model could not decide on (call
+        # failure / null verdict / number not in this chapter) -- or files
+        # left when the daily quota brake fires -- stay unmatched.
         for um in unmatched_images:
             if um.get("matched"):
                 continue
@@ -5250,13 +4795,10 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                     print(f"  [IMG] fourth pass: page {um['page']} {rel} model says "
                           f"decorative -- CONSERVATIVE: recorded to "
                           f"unresolved_images.jsonl, NOT discarded")
-                    rec = _record_unresolved_image(
-                        subject, chapter_id, um["page"], rel,
-                        "model-declared decorative (single "
-                        "verdict -- conservative, kept for review)",
-                        model_verdict={"decorative": True}, method="isolated_crop_vision")
-                    if rec:
-                        chapter_unresolved_images.append(rec)
+                    _record_unresolved_image(subject, chapter_id, um["page"], rel,
+                                            "model-declared decorative (single "
+                                            "verdict -- conservative, kept for review)",
+                                            model_verdict={"decorative": True})
                     continue
                 qn_attr = verdict.get("q_no")
                 if isinstance(qn_attr, bool) or not isinstance(qn_attr, int) \
@@ -5288,7 +4830,6 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
             if not still:
                 um["matched"] = True
             elif brake_hit:
-                um["brake_hit"] = True
                 print(f"  [WARN] image attribution stopped early (daily quota) -- "
                       f"{len(still)} file(s) from page {um['page']} stay queued")
         for um in unmatched_images:
@@ -5302,23 +4843,6 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 if um.get("model_verdicts"):
                     entry["model_verdicts"] = um["model_verdicts"]  # model's q_no/slot answers
                 _append_jsonl(DATA_DIR / "unmatched_images.jsonl", entry)
-                # run-13 L4: every file that exhausted ALL ownership levels is
-                # ALSO recorded to unresolved_images.jsonl so the export gate
-                # can never print CLEAN while a real figure lacks an owner
-                # (the page-4 false-clean class).
-                for rel in um["files"]:
-                    if um.get("brake_hit"):
-                        reason = "left queued by daily-quota brake (resume tomorrow)"
-                        method = "quota_brake"
-                    else:
-                        reason = ("no owner after L1 geometry + L2 OCR geometry + "
-                                  "L3 full-page vision + isolated fallback")
-                        method = "all_levels_failed"
-                    rec = _record_unresolved_image(
-                        subject, chapter_id, um["page"], rel, reason,
-                        method=method)
-                    if rec:
-                        chapter_unresolved_images.append(rec)
 
         # FAILED-PAGE DRAIN: second chance for recitation-skipped pages
         # BEFORE orphan recovery (drained fragments may join the orphan
@@ -5431,8 +4955,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
         # "0 missing answer / 0 missing solution".
         unresolved_ledger = [l for l in ledger_rows if l["status"] == PASS_STATUS_UNRESOLVED]
         violations = _export_gate_violations(chapter_records, image_files_by_q,
-                                             unresolved_ledger, chapter_id,
-                                             chapter_unresolved_images)
+                                             unresolved_ledger, chapter_id)
         if violations:
             stats["export_gate_violations"] = stats.get("export_gate_violations", 0) + len(violations)
             for kind, qn, detail in violations:

@@ -1,7 +1,8 @@
+# Bounded versions keep Railway builds reproducible while allowing security fixes.
+pypdf>=5.0,<7
+Pillow>=10.0,<12
+google-generativeai>=0.8.5,<0.9
+Flask>=3.0,<4
+gunicorn>=22,<24
+requests>=2.31,<3
 pytesseract>=0.3,<0.4
-# renderer fallback for the run-13 full-page image-ownership passes:
-# pdftoppm comes from poppler-utils in the Docker image (primary renderer),
-# so PyMuPDF is NOT a hard build dependency -- it is an optional fallback
-# for sandbox/Colab where poppler is absent. DO NOT put it in requirements:
-# a missing/compiling wheel must never fail a Railway build. Local use:
-# pip install pymupdf
