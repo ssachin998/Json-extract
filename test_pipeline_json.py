@@ -2374,5 +2374,157 @@ class Run14PersistentProblemFixesTests(unittest.TestCase):
             qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
 
 
+class Run16MemoryAndResumeTests(unittest.TestCase):
+    """run-16 SIGKILL/OOM investigation (independent of extraction quality):
+
+    PROVEN cause: _RENDER_CACHE was an unbounded module-global dict holding a
+    full-page PIL RGB render per page (~6.3 MB at 150 dpi). Q-activation OCR,
+    L2 OCR geometry, L3 full-page vision and its context pages rendered ~150
+    pages by chapter 11 of a 33-chapter book (~950 MB) -> the Railway
+    container's kernel OOM-killed the gunicorn worker (SIGKILL pid 3).
+
+    Fixes under test:
+    - render cache is a BOUNDED LRU (_RENDER_CACHE_MAX) + clear_render_cache()
+    - PyMuPDF documents closed; pdftoppm temp dirs removed
+    - full-page vision draws on a COPY (never mutates the cached render)
+    - questions.jsonl is rewritten ATOMICALLY per chapter (rewrite_questions_file)
+      so a worker death at any point leaves the file = last committed chapter;
+      a resume can never duplicate records (old append-mode deduped only at
+      the end of a full book -> mid-book deaths left duplicates)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_assets, self._old_data, self._old_state = qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE
+        self._old_max, self._old_pace = qp._RENDER_CACHE_MAX, qp._pace_gemini_call
+        qp.ASSETS_DIR = self.tmp / "assets"
+        qp.DATA_DIR = self.tmp / "data"
+        qp.STATE_FILE = self.tmp / "state.json"
+        qp._pace_gemini_call = lambda: None
+        (qp.ASSETS_DIR / "questions" / "PSY").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE = self._old_assets, self._old_data, self._old_state
+        qp._RENDER_CACHE_MAX, qp._pace_gemini_call = self._old_max, self._old_pace
+        qp.clear_render_cache()
+
+    def _mkpdf(self, n_pages, target=1):
+        pdf = self.tmp / f"pages{n_pages}_{target}.pdf"
+        _write_test_pdf_pages(pdf, [("1. Stem", 72, 700, 12)],
+                              [(7, "Im7", 300, 600)], target_page=target,
+                              total_pages=n_pages)
+        return pdf
+
+    # -- 1. render cache is bounded LRU (the OOM fix) ----------------------
+    def test_render_cache_bounded_lru_evicts_oldest(self):
+        qp._RENDER_CACHE_MAX = 3
+        pdf = self._mkpdf(10)
+        for p in range(1, 11):
+            qp.render_page_png(pdf, p, dpi=36)     # tiny renders, real path
+        self.assertLessEqual(len(qp._RENDER_CACHE), 3)     # bounded, always
+        self.assertNotIn((str(pdf), 1, 36), qp._RENDER_CACHE)   # oldest evicted
+        self.assertIn((str(pdf), 10, 36), qp._RENDER_CACHE)     # newest kept
+
+    def test_render_cache_stress_200_pages_stays_bounded(self):
+        qp._RENDER_CACHE_MAX = 10
+        pdf = self._mkpdf(200)
+        for p in range(1, 201):
+            qp.render_page_png(pdf, p, dpi=36)
+        self.assertLessEqual(len(qp._RENDER_CACHE), 10)
+        # the FULL-BOOK scenario that OOM-killed the worker stays tiny
+        total_bytes = 0
+        for key, (img, _s, _h) in qp._RENDER_CACHE.items():
+            if img is not None:
+                total_bytes += img.width * img.height * 3
+        self.assertLess(total_bytes, 10 * 1024 * 1024)   # < 10 MB at dpi 36
+
+    def test_clear_render_cache_empties(self):
+        qp._RENDER_CACHE_MAX = 100
+        pdf = self._mkpdf(5)
+        for p in range(1, 6):
+            qp.render_page_png(pdf, p, dpi=36)
+        self.assertEqual(qp.render_cache_size(), 5)
+        qp.clear_render_cache()
+        self.assertEqual(qp.render_cache_size(), 0)
+
+    # -- 2. full-page vision must not mutate the cached render -------------
+    def test_full_page_vision_draws_on_copy_not_cache(self):
+        pdf = self._mkpdf(4, target=4)      # stem+image ON page 4
+        rel = "PSY/PSY-p4-7.webp"
+        (qp.ASSETS_DIR / "questions" / "PSY" / "PSY-p4-7.webp").write_bytes(b"x" * 3000)
+        pos = qp.image_positions_on_page(pdf, 4)
+        render = qp.render_page_png(pdf, 4, dpi=36)
+        cached_img = render[0]
+        before = cached_img.tobytes()
+        class _M:
+            def __init__(self):
+                self.parts = None
+            def generate_content(self, parts, **kw):
+                self.parts = parts
+                class _R:
+                    candidates = [object()]
+                    text = json.dumps({"IMG-1": {"q_no": 1, "slot": "question",
+                                                 "confidence": "high",
+                                                 "evidence": "below Q1"}})
+                return _R()
+        model = _M()
+        owned = {}
+        claimed, still, _ = qp.full_page_vision_ownership(
+            model, pdf, 4, [rel], pos, "PSY", 1, {1: {}}, "PSY-001",
+            {"calls_today": 0}, owned, dpi=36)
+        self.assertEqual(still, [])
+        self.assertEqual([c[1] for c in claimed], ["PSY-001-001"])
+        # the model received a highlighted COPY, not the cached object
+        self.assertIsNot(model.parts[1], cached_img)
+        # the cached render is byte-identical to before the vision call
+        self.assertEqual(cached_img.tobytes(), before)
+
+    # -- 3. atomic per-chapter questions rewrite (resume safety) -----------
+    def test_rewrite_removes_partial_chapter_and_dedups(self):
+        path = qp.DATA_DIR / "questions.jsonl"
+        ch1_rows = [{"id": "PAY-001-001", "chapter_id": "PAY-001",
+                     "question": {"text": "s1"}},
+                    {"id": "PAY-001-002", "chapter_id": "PAY-001",
+                     "question": {"text": "s2"}}]
+        partial = [{"id": "PAY-002-025", "chapter_id": "PAY-002",
+                    "question": {"text": "partial-1"}},
+                   {"id": "PAY-002-026", "chapter_id": "PAY-002",
+                    "question": {"text": "partial-2"}}]
+        qp.rewrite_questions_file(path, "PAY-001", ch1_rows)
+        qp.rewrite_questions_file(path, "PAY-002", partial)   # SIGKILL after
+        # resume re-runs ch2 fully -> rewrite replaces the partial rows
+        new_ch2 = [{"id": "PAY-002-025", "chapter_id": "PAY-002",
+                    "question": {"text": "full-25"}},
+                   {"id": "PAY-002-026", "chapter_id": "PAY-002",
+                    "question": {"text": "full-26"}}]
+        qp.rewrite_questions_file(path, "PAY-002", new_ch2)
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        ids = [r["id"] for r in rows]
+        self.assertEqual(len(ids), len(set(ids)))            # no duplicates
+        self.assertIn("PAY-001-001", ids)                    # ch1 kept
+        self.assertEqual(rows[ids.index("PAY-002-025")]["question"]["text"],
+                         "full-25")                          # latest wins
+        self.assertNotIn("partial-1", [r["question"]["text"] for r in rows])
+        self.assertFalse(path.with_suffix(".jsonl.tmp").exists())  # tmp cleaned
+
+    def test_rewrite_twice_same_chapter_no_duplication(self):
+        path = qp.DATA_DIR / "questions.jsonl"
+        ch2 = [{"id": "PAY-002-001", "chapter_id": "PAY-002",
+                "question": {"text": "a"}}]
+        qp.rewrite_questions_file(path, "PAY-002", ch2)
+        qp.rewrite_questions_file(path, "PAY-002", ch2)      # resume re-run
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        self.assertEqual(len(rows), 1)                       # exactly once
+
+    # -- 4. render temp cleanup (pdftoppm dirs + fitz close) ---------------
+    def test_render_temp_dirs_are_removed(self):
+        qp._RENDER_CACHE_MAX = 100
+        pdf = self._mkpdf(6)
+        before = set(Path("/tmp").glob("qbank_render_*")) if Path("/tmp").exists() else set()
+        for p in range(1, 7):
+            qp.render_page_png(pdf, p, dpi=36)
+        after = set(Path("/tmp").glob("qbank_render_*")) if Path("/tmp").exists() else set()
+        self.assertEqual(after, before)   # no leaked temp render dirs
+
+
 if __name__ == "__main__":
     unittest.main()

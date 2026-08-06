@@ -513,9 +513,10 @@ def v2_test():
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel(pipeline.GEMINI_MODEL)
                 q_path = pipeline.DATA_DIR / "questions.jsonl"
-                with open(q_path, "a", encoding="utf-8") as qfh:
-                    pipeline.process_pdf(cfg, st, model, chapters_out, qfh,
-                                         only_chapter_no=chapter_no)
+                # run-16: per-chapter atomic rewrite inside process_pdf --
+                # pass the PATH, not an append handle (crash-safe resume).
+                pipeline.process_pdf(cfg, st, model, chapters_out, q_path,
+                                     only_chapter_no=chapter_no)
                 import json as _json
                 rows = [_json.loads(l) for l in q_path.read_text().splitlines() if l.strip()] \
                     if q_path.exists() else []

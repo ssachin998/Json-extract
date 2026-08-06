@@ -523,6 +523,49 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
+### 4.30 Changelog — 2026-08-06 (SIGKILL/OOM investigation + bounded-memory architecture)
+
+**Symptom:** the fresh Railway run terminated around Chapter 11 with
+`Worker (pid:3) was sent SIGKILL! Perhaps out of memory?` (gunicorn's guess).
+
+**Verdict: CONFIRMED OOM (kernel OOM-killer), not a gunicorn assumption.**
+`_RENDER_CACHE` was an UNBOUNDED module-global dict: every
+`render_page_png` call stored a full-page PIL RGB render (~6.3 MB at
+150 dpi letter). Q-activation OCR (every S-window), L2 OCR geometry and L3
+full-page vision (+2 context pages per call) rendered ~150 pages by chapter
+11 (~950 MB) — a Railway free container (512 MB) dies right there. The
+timeline matches exactly.
+
+**Fixes (bounded-memory architecture):**
+1. `_RENDER_CACHE_MAX = 10` — the render cache is now a bounded LRU
+   (oldest-evicted); `render_cache_size()`/`clear_render_cache()` helpers.
+2. `clear_render_cache()` + `gc.collect()` at chapter end + a `[MEM]` peak-RSS
+   telemetry line per chapter, so Railway logs show memory without waiting
+   for a SIGKILL.
+3. `full_page_vision_ownership` draws its highlight boxes on `page_img.copy()`
+   — it used to mutate the CACHED render (re-renders returned highlighted
+   images, and the drawn copy stayed resident).
+4. `render_page_png` closes the PyMuPDF document in `finally` and removes the
+   pdftoppm temp dir after loading (a ~6 MB PNG per page was leaking on disk).
+5. **Crash-safe resume:** `questions.jsonl` is now rewritten ATOMICALLY per
+   chapter (`rewrite_questions_file`: drop this chapter's old rows, append the
+   fresh ones, dedupe keep-LAST by id, `os.replace`). `main()`, `app.py`
+   (`/v2-test`) and `test_v2_chapter.py` pass the PATH instead of an append
+   handle. The old design deduped only at the END of a full book, so a
+   mid-book worker death after a re-run left duplicate rows behind; now ANY
+   death point leaves the file equal to the last committed chapter.
+
+**Resume verification:** `process_pdf` skips chapters in
+`progress["chapters_done"]` (saved AFTER the atomic rewrite). A death between
+rewrite and state-save re-runs the chapter, which REPLACES its rows (no dup);
+a death after the save skips it. Both paths are duplication-free. Unit-tested.
+
+Tests: `Run16MemoryAndResumeTests` (+7): bounded LRU eviction, 200-page
+stress stays ≤10 entries / <10 MB, clear empties, vision never mutates the
+cache (byte-identical), atomic rewrite removes partial chapters + dedupes
+keep-last + tmp cleaned, rewrite-twice is exactly-once, no leaked temp dirs.
+Suite: **137 tests OK**.
+
 ### 4.29 Changelog — 2026-08-06 (output-data audit of the fresh PAY run: 90 flags / 25 of 33)
 
 The user's Drive `Output` folder (chapters.json, export_gate.jsonl,

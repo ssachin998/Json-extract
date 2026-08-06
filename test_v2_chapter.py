@@ -54,9 +54,9 @@ def main():
     q_path = qp.DATA_DIR / "questions.jsonl"
     print(f"=== V2 3-pass single-chapter test: {subject} chapter {chapter_no} "
           f"(offset {page_offset}) -> {out_dir} ===")
-    with open(q_path, "a", encoding="utf-8") as qfh:
-        qp.process_pdf(cfg, state, model, chapters_out, qfh,
-                       only_chapter_no=chapter_no)
+    # run-16: per-chapter atomic rewrite inside process_pdf -- pass the PATH
+    qp.process_pdf(cfg, state, model, chapters_out, q_path,
+                   only_chapter_no=chapter_no)
 
     rows = [json.loads(l) for l in q_path.read_text().splitlines() if l.strip()] \
         if q_path.exists() else []

@@ -31,6 +31,7 @@ automatically from state.json)
 """
 
 import difflib
+import gc
 import json
 import os
 import re
@@ -4145,18 +4146,40 @@ def _order_imgs_by_position(imgs, pos):
 # Never let a lower level override a higher one: each level only receives
 # what the previous one left unclaimed.
 
+# run-16 BOUNDED-MEMORY: a full-page RGB render at 150 dpi (letter) is
+# ~6.3 MB. The old cache was a plain dict that NEVER evicted, so every page
+# rendered by Q-activation OCR, L2 OCR geometry, L3 full-page vision and its
+# context pages accumulated forever -- ~150 renders by chapter 11 of a 33-
+# chapter book (~950 MB) blew the Railway container's memory and the kernel
+# sent the worker SIGKILL ("Perhaps out of memory?" -- it WAS OOM). The
+# cache is now a bounded LRU; callers also clear it at chapter end.
+_RENDER_CACHE_MAX = 10          # ~65 MB worst case at 150 dpi
 _RENDER_CACHE = {}
+
+
+def render_cache_size():
+    return len(_RENDER_CACHE)
+
+
+def clear_render_cache():
+    """Drop every cached page render. Called at chapter end (pages of the
+    previous chapter are never re-needed) so peak memory stays small even on
+    a 300+ page book."""
+    _RENDER_CACHE.clear()
 
 
 def render_page_png(pdf_path, file_page, dpi=150):
     """(PIL.Image, scale_px_per_pt, page_height_pt) render of the page, or
     (None, 0, 0) when no renderer is available. Tries pdftoppm (poppler-utils,
     installed in the prod image) first, then PyMuPDF (self-contained).
-    Cached per (pdf, page, dpi)."""
+    Bounded LRU cache per (pdf, page, dpi) -- never unbounded (run-16)."""
     key = (str(pdf_path), file_page, dpi)
-    if key in _RENDER_CACHE:
-        return _RENDER_CACHE[key]
+    hit = _RENDER_CACHE.pop(key, None)      # LRU touch
+    if hit is not None:
+        _RENDER_CACHE[key] = hit
+        return hit
     out = None
+    tmpdir = None
     if shutil.which("pdftoppm"):
         try:
             tmpdir = tempfile.mkdtemp(prefix="qbank_render_")
@@ -4170,13 +4193,23 @@ def render_page_png(pdf_path, file_page, dpi=150):
                 out = Image.open(png_path).convert("RGB")
         except Exception as e:
             print(f"  [WARN] pdftoppm render failed for page {file_page}: {e}")
+        finally:
+            # run-16: the render PNG (~6 MB) was only needed to load the PIL
+            # image -- remove the temp dir instead of leaking it per page.
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
     if out is None:
         try:
             import fitz  # PyMuPDF -- self-contained, no system deps
             doc = fitz.open(str(pdf_path))
-            page = doc[file_page - 1]
-            pix = page.get_pixmap(dpi=dpi)
-            out = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            try:
+                page = doc[file_page - 1]
+                pix = page.get_pixmap(dpi=dpi)
+                out = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            finally:
+                # run-16: close the document immediately (native memory is
+                # freed here, not whenever the refcount happens to drop)
+                doc.close()
         except Exception as e:
             print(f"  [WARN] PyMuPDF render failed for page {file_page}: {e}")
     if out is None:
@@ -4185,6 +4218,8 @@ def render_page_png(pdf_path, file_page, dpi=150):
     scale = dpi / 72.0
     page_h_pt = out.height / scale
     _RENDER_CACHE[key] = (out, scale, page_h_pt)
+    while len(_RENDER_CACHE) > _RENDER_CACHE_MAX:
+        _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))   # evict oldest (LRU)
     return _RENDER_CACHE[key]
 
 
@@ -4431,6 +4466,11 @@ def full_page_vision_ownership(model, pdf_path, file_page, rels, positions,
               f"render unavailable ({len(rels)} leftover(s)) -- isolated fallback runs")
         return claimed, list(rels), verdicts
     page_img, scale, page_h_pt = render
+    # run-16: NEVER mutate the cached render (the red highlight boxes used to
+    # be drawn onto the cached PIL object -- a later render of the same page
+    # returned an already-highlighted image, and the mutated copy stayed in
+    # memory). Draw on a private copy; the cache keeps the clean page.
+    page_img = page_img.copy()
     labels = {}
     missing_pos = []
     for i, rel in enumerate(rels):
@@ -4907,7 +4947,7 @@ def _record_unresolved_image(subject, chapter_id, page, rel, reason,
     _append_jsonl(DATA_DIR / "unresolved_images.jsonl", entry)
     return entry
 
-def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
+def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 only_chapter_no=None):
     """only_chapter_no (v2 test hook): when set, every other chapter is
     skipped -- lets test_v2_chapter.py run the full 3-pass machinery on ONE
@@ -5783,9 +5823,13 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
                 image_files_by_q.get(qn, {"question": [], "solution": []})
             )
             final_q = repair_option_labels(final_q)
-            questions_fh.write(json.dumps(final_q, ensure_ascii=False) + "\n")
-            questions_fh.flush()
             chapter_rows.append(final_q)
+        # run-16 CRASH-SAFE COMMIT: the master questions.jsonl is rewritten
+        # atomically per chapter (never appended) -- a worker SIGKILL at ANY
+        # point leaves the file = the last committed chapter, and a resume
+        # can never duplicate rows. Old append-mode deduped only at the end
+        # of a full book, so mid-book deaths left duplicate rows behind.
+        rewrite_questions_file(questions_path, chapter_id, chapter_rows)
         # per-chapter file: written only NOW, when this chapter has FULLY
         # finished every process -- the batch loop of the NEXT chapter has
         # not started yet.
@@ -5828,6 +5872,23 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_fh,
               f" | unmatched images: {n_unmatched}"
               f" | rescue: {stats.get('rescue_filled', 0)} filled / {stats.get('rescue_calls', 0)} calls"
               f" | anchorless dropped: {stats.get('anchorless_dropped', 0)}")
+
+        # run-16 BOUNDED MEMORY: drop every cached page render of this
+        # chapter (pages are never re-needed), force a GC pass, and report
+        # peak RSS so the Railway log shows memory WITHOUT waiting for a
+        # kernel SIGKILL to guess. This is the chapter-11 OOM fix: the old
+        # unbounded render cache held ~150 full-page PIL renders (~950 MB)
+        # by that point.
+        clear_render_cache()
+        gc.collect()
+        try:
+            import resource as _resource
+            _rss_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+            print(f"  [MEM] chapter {ch['chapter_no']} committed: peak RSS "
+                  f"{_rss_kb / 1024.0:.0f} MB, render cache cleared "
+                  f"(bounded at {_RENDER_CACHE_MAX})")
+        except Exception:
+            pass
 
     # ALL chapters of this subject are complete now -> bundle everything into
     # a subject-named folder (per-chapter files were written as each chapter
@@ -6037,9 +6098,9 @@ def recover_pages(plan_path):
                    for qn, rec in sorted(records.items())]
         out_ids = [q["id"] for q in emitted]
         assert len(out_ids) == len(set(out_ids)), "duplicate ids after recovery"
-        with open(questions_path, "w", encoding="utf-8") as fh:
-            for q in others + emitted:
-                fh.write(json.dumps(q, ensure_ascii=False) + "\n")
+        # run-16: use the same atomic per-chapter rewrite as the main path so
+        # a death during recovery can never leave a half-written file either.
+        rewrite_questions_file(questions_path, chapter_id, emitted)
         all_lines = others + emitted  # next chapter's rebuild sees fresh rows
 
         n_no_solution = sum(1 for r in records.values() if not r.get("solution_text"))
@@ -6050,6 +6111,42 @@ def recover_pages(plan_path):
               f" | orphans unresolved: {len(orphans)}")
 
     print("[RECOVER] all planned chapters processed.")
+
+def rewrite_questions_file(path, chapter_id, chapter_rows):
+    """run-16 CRASH-SAFE RESUME: atomically rewrite questions.jsonl so a
+    committed chapter is EXACTLY-ONCE in the master file. Reads the existing
+    rows, drops any row belonging to this chapter (a partially-appended
+    attempt after a worker SIGKILL), appends the fresh rows, dedupes
+    keep-LAST by id, and renames a temp file over the master. ANY death
+    point (SIGKILL / redeploy / daily-quota exit) leaves the file equal to
+    the last committed chapter -- a resume can never duplicate records.
+
+    This replaces the old append-mode design, where main() deduped only at
+    the very end of a full book; a mid-book death after a re-run left
+    duplicate rows behind until a COMPLETE run happened to finish."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prior = []
+    if path.exists():
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            if not ln.strip():
+                continue
+            try:
+                prior.append(json.loads(ln))
+            except json.JSONDecodeError:
+                continue
+    prior = [r for r in prior if r.get("chapter_id") != chapter_id]
+    rows = prior + list(chapter_rows)
+    by_id = {}
+    for r in rows:
+        by_id[r.get("id")] = r          # keep LAST per id (newest wins)
+    tmp = path.with_suffix(".jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for rid in by_id:
+            fh.write(json.dumps(by_id[rid], ensure_ascii=False) + "\n")
+    os.replace(tmp, path)               # atomic on POSIX
+    return len(rows) - len(by_id)
+
 
 def _dedupe_questions_by_id(path):
     """questions.jsonl is append-only, and surgically re-running a chapter
@@ -6189,9 +6286,10 @@ def main():
     chapters_out = json.loads(chapters_path.read_text()) if chapters_path.exists() else []
 
     questions_path = DATA_DIR / "questions.jsonl"
-    with open(questions_path, "a", encoding="utf-8") as questions_fh:
-        for pdf_cfg in PDFS:
-            process_pdf(pdf_cfg, state, model, chapters_out, questions_fh)
+    # run-16: per-chapter atomic rewrite inside process_pdf -- no append
+    # handle, so a SIGKILL can never leave a half-appended chapter.
+    for pdf_cfg in PDFS:
+        process_pdf(pdf_cfg, state, model, chapters_out, questions_path)
 
     write_chapters(chapters_path, chapters_out)
     save_state(state)

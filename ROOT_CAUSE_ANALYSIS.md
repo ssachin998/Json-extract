@@ -707,3 +707,50 @@ Fix: recover_orphans rule 5 verified-duplicate consumption.
 
 **Packaging:** chapters.json has only PAY chapters (no stale PSY); export gate,
 orphans, ledger all present in the folder. No stale-artifact leak found.
+
+## 16. Run-16 audit — SIGKILL / OOM (bounded-memory architecture) (2026-08-06)
+
+**Symptom.** The fresh Railway run terminated around Chapter 11:
+`Worker (pid:3) was sent SIGKILL! Perhaps out of memory?` — gunicorn's guess.
+
+### A16-1 — Unbounded render cache = CONFIRMED OOM **[PROVEN]**
+
+`_RENDER_CACHE` was a module-global dict with no eviction. Every
+`render_page_png` call stored a full-page PIL RGB image (letter @ 150 dpi =
+1275×1650×3 ≈ 6.3 MB). Call sites render per page:
+- `window_has_question_content` / `page_has_question_content` (Q-activation
+  OCR on every S-window's new pages),
+- `claim_block_images_ocr` (L2 OCR geometry on every page with leftover
+  images),
+- `full_page_vision_ownership` (L3 page + up to 2 adjacent context pages).
+
+By chapter 11 of the 33-chapter PAY run (~pages 3..160), ~130-150 renders
+were cached ≈ 850 MB-1 GB. Railway free containers have 512 MB → the kernel
+OOM-killer SIGKILLed pid 3 exactly around chapter 11. The gunicorn message is
+a *guess*; the code + the run's page ledger prove the mechanism.
+
+Additional leaks found while tracing:
+- `full_page_vision_ownership` MUTATED the cached render (drew red boxes on
+  the cached PIL object) — re-renders returned already-highlighted images and
+  the drawn copy stayed resident.
+- PyMuPDF `doc` was never explicitly closed (native memory freed only when
+  the refcount happened to drop).
+- pdftoppm temp dirs (each holding a ~6 MB PNG) were never removed.
+
+### A16-2 — Resume after worker death could duplicate records **[PROVEN]**
+
+`main()` opened `questions.jsonl` in append mode; `_dedupe_questions_by_id`
+ran only at the very END of a full book. A SIGKILL mid-chapter leaves
+partially-flushed rows for a chapter NOT in `chapters_done`; on resume the
+chapter re-runs and appends again → duplicates persist until a COMPLETE run
+finishes. Fixed: per-chapter atomic rewrite (`rewrite_questions_file`) with
+keep-LAST-by-id dedupe and `os.replace`; `process_pdf` commits the chapter
+file before `save_state`, so every death point leaves the file = last
+committed chapter and resume is duplication-free (unit-tested, both
+orderings).
+
+**Bounded-memory architecture:** `_RENDER_CACHE_MAX=10` LRU + chapter-end
+`clear_render_cache()`/`gc.collect()` + `[MEM]` peak-RSS telemetry per
+chapter; PyMuPDF `doc.close()` in `finally`; pdftoppm temp-dir cleanup;
+vision draws on a copy. Tests: `Run16MemoryAndResumeTests` (+7). Suite
+137 OK. See `PIPELINE_WORKFLOW.md` 4.30.
