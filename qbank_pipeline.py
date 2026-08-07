@@ -1931,7 +1931,10 @@ def question_headers_on_page(pdf_path, file_page, chapter_records):
     headers, seen = [], set()
     for y, wl in _page_word_lines(pdf_path, file_page):
         line = " ".join(t for _, t in wl)
-        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", line)
+        # run-18: accept "Question N:" and "N -" too, not just "N." / "N)"
+        # -- some books print colon or dash after the number, and the old
+        # class silently matched ZERO headers on every page of those books.
+        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-–)]", line)
         if not m:
             continue
         qn = int(m.group(1))
@@ -2123,7 +2126,9 @@ def qns_printed_on_page(pdf_path, true_page, chapter_records):
     if not text.strip():
         return []
     found = set()
-    for m in re.finditer(r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", text):
+    # run-18: colon/dash-terminated headings ("Question 1:") were silently
+    # invisible to this scanner -- see question_headers_on_page.
+    for m in re.finditer(r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-–)]", text):
         qn = int(m.group(1))
         if qn in chapter_records:
             found.add(qn)
@@ -2194,7 +2199,7 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
         for qn in qns:
             if qn not in stem_re_cache:
                 stem_re_cache[qn] = re.compile(
-                    r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[.)]" % qn)
+                    r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[.:\-–)]" % qn)
             if stem_re_cache[qn].search(text):
                 pages[qn].add(page_no)
         for m in header_re.finditer(text):
@@ -3484,7 +3489,16 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                         keep, verdict = new_q, "kept-new (old variant contaminated)"
                     else:
                         co, cn = _stem_payload_coherence(old_q, rec), _stem_payload_coherence(new_q, rec)
-                        if abs(co - cn) >= STEM_COHERENCE_MARGIN and max(co, cn) > 0:
+                        old_interrog = bool(re.search(r"\?\s*$", old_q or ""))
+                        new_interrog = bool(re.search(r"\?\s*$", new_q or ""))
+                        if old_interrog != new_interrog and min(co, cn) > 0:
+                            # run-18: a genuinely interrogative stem beats a
+                            # declarative one even when raw coherence favors
+                            # the declarative side (PSY-006 q1 class -- see
+                            # rationale above the call site).
+                            keep, verdict = (old_q, "kept-old (new not interrogative)") \
+                                if old_interrog else (new_q, "kept-new (old not interrogative)")
+                        elif abs(co - cn) >= STEM_COHERENCE_MARGIN and max(co, cn) > 0:
                             keep, verdict = (old_q, "kept-old") if co > cn else (new_q, "kept-new")
                         else:
                             keep, verdict = old_q, "kept-old (undecidable -- review logged)"
@@ -4206,7 +4220,16 @@ def _ocr_anchors_from_data(data, scale, img_h):
     anchors = []
     for _yc, wl in lines:
         line = " ".join(t for _x, t in wl)
-        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.)]", line)
+        # run-18: accept "Question N:" / "N -" too, not just "N." / "N)" --
+        # some books print colon or dash after the number, and the old
+        # class silently matched ZERO headers on every page of those books,
+        # which starved the run-13/run-14 Q-pass activation safety nets
+        # below (they rely entirely on this function to prove question
+        # content). A stray false-positive here just costs one redundant
+        # Q-pass call on an already-covered page -- same safe-default
+        # philosophy as probe_batch_pages ("never let a window-sizer
+        # disable a pass"); a missed one silently drops real questions.
+        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-–)]", line)
         if m:
             anchors.append(("question", int(m.group(1)),
                             (img_h - _yc) / scale))
@@ -4246,10 +4269,23 @@ def ocr_page_anchors(png, scale, page_h_pt):
 
 def page_has_question_content(pdf_path, page, chapter_records, dpi=150):
     """Per-page variant: does THIS rendered page print a question-stem heading
-    (a q_no in chapter_records) above its first solution header (or no
-    solution header at all)? Rendered-page OCR -- immune to the garbled
-    body-font text layer. Returns False when OCR/render is unavailable (the
-    caller decides the safe default)."""
+    above its first solution header (or no solution header at all)?
+    Rendered-page OCR -- immune to the garbled body-font text layer. Returns
+    False when OCR/render is unavailable (the caller decides the safe
+    default).
+
+    run-18: this used to also require the OCR-read q_no to already be a KEY
+    in chapter_records. That is backwards for what this function exists to
+    do -- it is the Q-pass ACTIVATION safety net, called precisely to prove
+    a page has question content BEFORE any question on it has been
+    extracted. chapter_records is empty on a chapter's first batch by
+    definition, so the old check silently returned False on exactly the
+    highest-risk window (ch2 pages 22-26 / ch7 pages 100-104 class: the
+    section planner mislabels the chapter's very first pages "S", and this
+    net -- the only thing that can override that -- could never fire there).
+    A question-shaped OCR heading positioned above the page's own first
+    solution header is sufficient deterministic evidence on its own; no
+    prior extraction is required to trust it."""
     rendered = render_page_png(pdf_path, page, dpi=dpi)
     if not rendered[0]:
         return False
@@ -4261,7 +4297,7 @@ def page_has_question_content(pdf_path, page, chapter_records, dpi=150):
     for k, qn, y in anchors:
         if k != "question":
             continue
-        if qn in chapter_records and (sol_y is None or y > sol_y):
+        if sol_y is None or y > sol_y:
             return True
     return False
 
@@ -6145,7 +6181,7 @@ def build_auto_recovery_plan():
             text = pdftotext_page(cfg["path"], page_no)
             if not text.strip():
                 continue
-            if any(re.search(r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[.)]" % qn, text)
+            if any(re.search(r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[.:\-–)]" % qn, text)
                    for qn in qns):
                 found.append(page_no)
                 continue
