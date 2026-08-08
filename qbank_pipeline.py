@@ -3639,7 +3639,8 @@ def _anchorless_record(rec):
                 or (rec.get("solution_text") or "").strip())
 
 
-def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files):
+def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files,
+                         source_pages=None):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
 
     def valid_images(imgs, kind):
@@ -3710,6 +3711,10 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         "correct_options": [rec["correct_option"]] if rec["correct_option"] else [],
         "solution": {"text": sol_text, "images": sol_images, "tables": tables},
         "tags": [],
+        # run-19: which PDF page(s) this question was extracted from -- lets
+        # a downstream reviewer (human or the critique pass below) jump
+        # straight to source without re-deriving it from the page ledger.
+        "source_pages": sorted(source_pages) if source_pages else [],
         # run-13: quarantined suspect stem marker -- ships in questions.jsonl
         # so the post-run validator flags it too (not only the export gate).
         "stem_suspect": rec.get("_stem_suspect_reason"),
@@ -4749,6 +4754,194 @@ def _ledger_pass(chapter_id, subject, chapter_no, pass_name, window_pages,
     return row
 
 
+# ============================================================
+# run-19: CRITIQUE-AND-REPAIR PASS (Sachin's idea, isolated on purpose)
+# ============================================================
+# Toggle: flip to False to remove this entire step with zero effect on the
+# rest of the pipeline -- it only reads export-gate violations and, at most,
+# patches specific flagged fields on specific records after they're already
+# fully merged. Nothing upstream depends on it running.
+ENABLE_CRITIQUE_PASS = True
+
+# how many *distinct questions* this pass will spend a Gemini call on, per
+# chapter -- a bound, not a target, so one badly-flagged chapter can't blow
+# the day's quota on repeated re-checks.
+CRITIQUE_MAX_QUESTIONS_PER_CHAPTER = 15
+
+CRITIQUE_PROMPT = """You are reviewing ONE previously-extracted MCQ against its
+source textbook page(s). An earlier extraction pass flagged possible
+problems with it. Look ONLY at the page image(s) provided.
+
+CURRENT EXTRACTED RECORD (question {q_no}):
+{current_json}
+
+FLAGGED PROBLEM(S): {problems}
+
+Compare the current record against what is actually printed on the page(s).
+Return ONE JSON object, nothing else:
+{{
+  "verdict": "confirmed" | "corrected" | "cannot_verify",
+  "question_text": "..." | null,
+  "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}} | null,
+  "correct_option": "A"|"B"|"C"|"D" | null,
+  "solution_text": "..." | null,
+  "note": "one short sentence explaining the verdict"
+}}
+
+Rules:
+- "confirmed": the current record is actually correct despite the flag (the
+  flag was a false alarm) -- return the SAME values back, unchanged.
+- "corrected": you can see the true content on the page and the current
+  record is genuinely wrong or incomplete -- return the CORRECTED values.
+  Only fields you actually verified against the page should differ from the
+  current record; leave any field you did not need to touch exactly as it
+  was in the current record.
+- "cannot_verify": the page(s) provided don't show enough of this question
+  to confirm or correct it (e.g. it continues on a page not shown, or the
+  relevant text is illegible/obscured) -- return the current record's values
+  unchanged and say so in "note". Do NOT guess.
+- Preserve wording verbatim from the page -- do not paraphrase.
+- Never invent an option or answer that is not actually printed."""
+
+
+def _critique_prompt_for(q_no, rec, problems):
+    current = {
+        "question_text": rec.get("question_text"),
+        "options": rec.get("options"),
+        "correct_option": rec.get("correct_option"),
+        "solution_text": (rec.get("solution_text") or "")[:1500],
+    }
+    return CRITIQUE_PROMPT.format(
+        q_no=q_no,
+        current_json=json.dumps(current, ensure_ascii=False, indent=2),
+        problems="; ".join(problems),
+    )
+
+
+def critique_and_repair_chapter(chapter_id, chapter_records, violations,
+                                qn_source_pages, pdf_path, genai_model,
+                                dpi=150):
+    """run-19: for each question the deterministic export gate flagged,
+    show Gemini ONLY that question's source page(s) + its current extracted
+    JSON, and ask it to confirm or correct -- patch-only (a field the model
+    didn't need to touch is never overwritten, and a field it returns
+    unchanged is a no-op). Returns (n_confirmed, n_corrected, n_unverifiable,
+    n_skipped_no_page). Never raises -- a single question's critique failing
+    (API error, bad JSON back, etc.) is logged and skipped, the rest of the
+    chapter proceeds normally, and the export gate result already on disk
+    stands as the honest record of what happened.
+
+    Deliberately narrow: only touches question_text/options/correct_option/
+    solution_text, and only for q_nos that actually appear in `violations`.
+    It cannot invent a fix for something it can't see (cannot_verify), and
+    it never adds a question that wasn't already a merged record."""
+    if not ENABLE_CRITIQUE_PASS or not violations or genai_model is None:
+        return 0, 0, 0, 0
+    flagged = {}
+    for kind, qn, detail in violations:
+        if qn is None or qn not in chapter_records:
+            continue
+        flagged.setdefault(qn, []).append(f"{kind}: {detail}")
+    if not flagged:
+        return 0, 0, 0, 0
+    qns = sorted(flagged)[:CRITIQUE_MAX_QUESTIONS_PER_CHAPTER]
+    if len(flagged) > len(qns):
+        print(f"  [CRITIQUE] {chapter_id}: {len(flagged)} flagged questions, "
+              f"reviewing first {len(qns)} (CRITIQUE_MAX_QUESTIONS_PER_CHAPTER "
+              f"bound) -- rest stand as export-gate violations, unchanged")
+    n_confirmed = n_corrected = n_unverifiable = n_skipped = 0
+    for qn in qns:
+        pages = sorted(qn_source_pages.get(qn) or [])
+        if not pages:
+            print(f"  [CRITIQUE] q{qn}: no known source page on record -- "
+                  f"skipping (can't show Gemini a page)")
+            n_skipped += 1
+            continue
+        pages = pages[:3]   # a question never legitimately spans more than this
+        tmpdir = tempfile.mkdtemp(prefix="qbank_critique_")
+        try:
+            img_paths = []
+            for p in pages:
+                img, _scale, _ph = render_page_png(pdf_path, p, dpi=dpi)
+                if img is None:
+                    continue
+                fp = os.path.join(tmpdir, f"critique-{p}.png")
+                img.save(fp)
+                img_paths.append(fp)
+            if not img_paths:
+                print(f"  [CRITIQUE] q{qn}: could not render source page(s) "
+                      f"{pages} -- skipping")
+                n_skipped += 1
+                continue
+            rec = chapter_records[qn]
+            prompt = _critique_prompt_for(qn, rec, flagged[qn])
+            try:
+                result = call_gemini_on_pages(genai_model, img_paths, prompt=prompt)
+            except Exception as exc:
+                print(f"  [CRITIQUE] q{qn}: Gemini call failed ({exc}) -- "
+                      f"leaving record as-is")
+                n_skipped += 1
+                continue
+            # call_gemini_on_pages always returns a list (array-parsed) --
+            # a single-object critique response may come back as a 1-item
+            # list or a bare dict depending on the parser; handle both.
+            if isinstance(result, list):
+                result = result[0] if result else None
+            if not isinstance(result, dict):
+                print(f"  [CRITIQUE] q{qn}: unparseable response -- leaving "
+                      f"record as-is")
+                n_skipped += 1
+                continue
+            verdict = str(result.get("verdict") or "").strip().lower()
+            if verdict == "confirmed":
+                print(f"  [CRITIQUE] q{qn}: confirmed correct despite flag "
+                      f"-- {result.get('note', '')}")
+                n_confirmed += 1
+                continue
+            if verdict == "cannot_verify":
+                print(f"  [CRITIQUE] q{qn}: cannot verify from available "
+                      f"page(s) -- {result.get('note', '')}")
+                n_unverifiable += 1
+                continue
+            if verdict != "corrected":
+                print(f"  [CRITIQUE] q{qn}: unrecognized verdict "
+                      f"{verdict!r} -- leaving record as-is")
+                n_skipped += 1
+                continue
+            # patch-only: only overwrite a field if the model returned a
+            # non-empty value that actually differs from the current one --
+            # a flagged field the model left null/unchanged stays exactly
+            # as the earlier passes left it (still gate-visible, not hidden).
+            changed = []
+            for field in ("question_text", "solution_text"):
+                new_v = result.get(field)
+                if new_v and str(new_v).strip() and new_v != rec.get(field):
+                    rec[field] = new_v
+                    changed.append(field)
+            new_opts = result.get("options")
+            if isinstance(new_opts, dict) and any(str(v or "").strip() for v in new_opts.values()):
+                if new_opts != rec.get("options"):
+                    rec["options"] = new_opts
+                    changed.append("options")
+            new_ans = result.get("correct_option")
+            if new_ans and str(new_ans).strip().upper() in ("A", "B", "C", "D") \
+                    and new_ans != rec.get("correct_option"):
+                rec["correct_option"] = str(new_ans).strip().upper()
+                changed.append("correct_option")
+            if changed:
+                print(f"  [CRITIQUE] q{qn}: corrected {changed} -- "
+                      f"{result.get('note', '')}")
+                n_corrected += 1
+            else:
+                print(f"  [CRITIQUE] q{qn}: verdict=corrected but nothing "
+                      f"differed from the current record -- treating as "
+                      f"confirmed")
+                n_confirmed += 1
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    return n_confirmed, n_corrected, n_unverifiable, n_skipped
+
+
 def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger,
                             chapter_id, unresolved_images=(), unresolved_orphans=()):
     """run-11 EXPORT GATE: returns a list of (kind, q_no, detail) violations
@@ -4962,6 +5155,11 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
         pages_imaged = set()       # overlap pages must not be image-extracted twice
         unmatched_images = []      # no claimant yet -- retried at chapter end
         orphans = []               # Gemini items with null/invalid q_no (RC-2)
+        qn_source_pages = {}       # run-19: q_no -> sorted list of PDF pages
+                                    # any pass claimed to have extracted it
+                                    # from -- exported per-question, and used
+                                    # by the post-chapter critique pass below
+                                    # to know which page to re-show Gemini.
         stats = {"batches": 0, "duplicates_merged": 0, "conflicts": 0,
                  "carry_used": 0, "carry_merges": 0,
                  "orphans_recovered": 0, "orphans_buffered": 0, "orphans_remaining": 0,
@@ -5291,7 +5489,97 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     # Q-pass sees question-side figures, S-pass solution-side;
                     # keep the first non-empty map per pass for this window.
                     fig_map_by_pass[pass_name] = batch_meta["figure_map"]
+                # run-18: Gemini's Q-pass can occasionally confabulate a
+                # full, plausible-looking question (stem+options+answer)
+                # that has no basis on the actual page -- seen for real on
+                # PSY-002 q25/q26 (pages 31-33 render as an unrelated
+                # catatonic-signs glossary; the "hysteria"/"Big Five"
+                # questions it returned exist nowhere on those pages). A
+                # hallucinated item is indistinguishable from a real one by
+                # shape alone (well-formed stem, 4 options, matching
+                # solution) -- the only independent signal is whether the
+                # page actually PRINTS that question number anywhere. Only
+                # gate items claiming a q_no this chapter has never seen
+                # before (a genuine re-ask/continuation of an already-known
+                # q_no is not at risk of this failure mode); route ungated
+                # ones to the existing orphans review pathway rather than
+                # dropping them outright, since OCR itself can miss a
+                # genuine heading (that's a false negative here, not a false
+                # positive, and orphans already get a chapter-end recovery
+                # pass).
+                if pass_name == "Q" and items:
+                    known_qnos = [qn for qn in chapter_records if isinstance(qn, int)]
+                    known_max = max(known_qnos) if known_qnos else 0
+                    batch_qnos = sorted(set(
+                        it.get("q_no") for it in items
+                        if isinstance(it, dict) and isinstance(it.get("q_no"), int)))
+                    # connected runs (gap <= 2) within this batch's numbers --
+                    # a run is trusted (no OCR needed) if it's substantial
+                    # (>=5 items: a real fresh chapter start looks like this)
+                    # or it touches the chapter's already-established range.
+                    # A small run floating far above known_max validates
+                    # nothing about itself just by being internally
+                    # consecutive -- that was the exact gap that let q25+q26
+                    # wrongly confirm each other below.
+                    runs, cur_run = [], []
+                    for qn in batch_qnos:
+                        if cur_run and qn - cur_run[-1] > 2:
+                            runs.append(cur_run); cur_run = []
+                        cur_run.append(qn)
+                    if cur_run:
+                        runs.append(cur_run)
+                    trusted_qnos = set()
+                    for run in runs:
+                        if len(run) >= 5 or (known_max and min(run) - known_max <= 3):
+                            trusted_qnos.update(run)
+                    verified_items, unverified = [], []
+                    ocr_conf_cache = {}
+                    for it in items:
+                        qn = it.get("q_no") if isinstance(it, dict) else None
+                        if qn is None or qn in chapter_records or qn in trusted_qnos:
+                            verified_items.append(it)
+                            continue
+                        seen_here = ocr_conf_cache.get(id(window_pages))
+                        if seen_here is None:
+                            seen_here = set()
+                            for _p in window_pages:
+                                try:
+                                    _img, _scale, _ph = render_page_png(pdf_path, _p, dpi=150)
+                                    if _img:
+                                        for _k, _q, _y in ocr_page_anchors(_img, _scale, _ph):
+                                            if _k == "question":
+                                                seen_here.add(_q)
+                                except Exception:
+                                    pass
+                            ocr_conf_cache[id(window_pages)] = seen_here
+                        if qn in seen_here:
+                            verified_items.append(it)
+                        else:
+                            print(f"  [GUARD] q{qn}: unconfirmed by OCR AND a large jump "
+                                  f"from chapter max q{known_max} (pages "
+                                  f"{window_pages[0]}-{window_pages[-1]}) -- routing to "
+                                  f"orphans for review instead of auto-accepting "
+                                  f"(possible confabulation, run-18)")
+                            unverified.append(it)
+                    items = verified_items
+                    for it in unverified:
+                        orphans.append({
+                            "chapter_id": chapter_id, "batch_start": batch_start,
+                            "pdf_pages": window_pages, "new_pages": new_pages,
+                            "reason": "unconfirmed_discontinuous_qno",
+                            "pass": pass_name, "item": it,
+                        })
+                    stats["orphans_buffered"] = stats.get("orphans_buffered", 0) + len(unverified)
                 chapter_records, skipped = merge_question_records(chapter_records, items, stats)
+                for it in items:
+                    _qn = it.get("q_no") if isinstance(it, dict) else None
+                    if isinstance(_qn, (int, str)):
+                        try:
+                            _qn = int(_qn)
+                        except (TypeError, ValueError):
+                            _qn = None
+                    if _qn is not None and _qn in chapter_records:
+                        qn_source_pages.setdefault(_qn, set()).update(window_pages)
                 try:
                     last_qn_in_batch = max(int(it.get("q_no")) for it in items
                                            if it.get("q_no") is not None)
@@ -5789,11 +6077,29 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                   f"(stems/options/answers/solutions/orphans/images/assets all "
                   f"accounted)")
 
+        # run-19: CRITIQUE-AND-REPAIR (Sachin's idea) -- only runs if there
+        # were violations, only touches the specific flagged fields on the
+        # specific flagged questions, using each question's own source
+        # page(s). See ENABLE_CRITIQUE_PASS to disable entirely.
+        if violations and ENABLE_CRITIQUE_PASS:
+            n_conf, n_corr, n_unver, n_skip = critique_and_repair_chapter(
+                chapter_id, chapter_records, violations, qn_source_pages,
+                pdf_path, genai_model)
+            if n_conf or n_corr or n_unver or n_skip:
+                print(f"  [CRITIQUE] {chapter_id}: {n_conf} confirmed (false "
+                      f"alarm) | {n_corr} corrected | {n_unver} cannot-verify "
+                      f"| {n_skip} skipped")
+                stats["critique_confirmed"] = n_conf
+                stats["critique_corrected"] = n_corr
+                stats["critique_unverifiable"] = n_unver
+                stats["critique_skipped"] = n_skip
+
         chapter_rows = []
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
                 subject, chapter_id, ch["chapter_no"], qn, rec,
-                image_files_by_q.get(qn, {"question": [], "solution": []})
+                image_files_by_q.get(qn, {"question": [], "solution": []}),
+                source_pages=qn_source_pages.get(qn)
             )
             chapter_rows.append(final_q)
         # run-16 CRASH-SAFE COMMIT: the master questions.jsonl is rewritten
