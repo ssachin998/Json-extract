@@ -47,6 +47,14 @@ from PIL import Image, ImageDraw
 from pypdf import PdfReader
 import pytesseract
 
+# Phase-1 split-output layer: a strictly additive module that writes
+# data/split/{subject}/{chapter_id}/{questions,answers,solutions,...}.jsonl
+# AFTER every existing in-pipeline reconciliation. Does NOT modify the
+# existing extraction loop, chapter_records, or any output the dashboard
+# and validator consume. See split_outputs.py for the full design and
+# docs/SPLIT_OUTPUTS_DESIGN.md for the contract.
+import split_outputs
+
 # ============================================================
 # CONFIG — edit this section for each new subject PDF
 # ============================================================
@@ -6107,6 +6115,50 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 stats["critique_corrected"] = n_corr
                 stats["critique_unverifiable"] = n_unver
                 stats["critique_skipped"] = n_skip
+
+        # PHASE-1 SPLIT-OUTPUT LAYER (strictly additive). Runs AFTER every
+        # existing in-pipeline step (batches, orphans, drain, sweep, retry,
+        # rescue, anchorless drop, phantom drop, critique-and-repair) and
+        # BEFORE the existing build_final_question loop that writes the
+        # master data/questions.jsonl. The split is built from the same
+        # chapter_records dict the master file is built from, so the two
+        # are guaranteed consistent for this chapter.
+        #
+        # Phase-1 (observation-only): reconcile_qids grades every record
+        # using ONLY printed anchors (no Gemini calls, no behavior change
+        # to the existing loop). The Phase-2 plan for the
+        # neighbor_run / carry_forward_origin anchors is documented in
+        # split_outputs.py and the chapter_completeness.json it emits.
+        try:
+            reconciled = split_outputs.reconcile_qids(
+                chapter_records, qn_source_pages, pdf_path, page_files,
+                subject, ch["chapter_no"])
+            split_completeness = split_outputs.write_split_outputs(
+                chapter_id=chapter_id, subject=subject,
+                chapter_no=ch["chapter_no"],
+                chapter_records=chapter_records,
+                image_files_by_q=image_files_by_q,
+                qn_source_pages=qn_source_pages,
+                orphans=orphans,
+                chapter_unresolved_images=chapter_unresolved_images,
+                pdf_path=pdf_path, page_files=page_files,
+                reconciled=reconciled,
+                output_root=OUTPUT_ROOT)
+            n_kept = len(reconciled.get("kept") or {})
+            n_unres = len(reconciled.get("unresolved") or {})
+            print(f"  [SPLIT] {chapter_id}: {n_kept} graded record(s) "
+                  f"({n_unres} unresolved -> unresolved_qids.jsonl) -> "
+                  f"data/split/{subject}/{chapter_id}/  "
+                  f"({split_completeness['question_records']} questions / "
+                  f"{split_completeness['answer_records']} answers / "
+                  f"{split_completeness['solution_records']} solutions / "
+                  f"{split_completeness['image_manifest_records']} image-manifest rows)")
+        except Exception as e:
+            # A failure in the split layer MUST NOT affect the master
+            # pipeline output. The split is a sidecar; the master
+            # data/questions.jsonl rewrite below proceeds unaffected.
+            print(f"  [SPLIT] {chapter_id}: split-layer error ({e}) -- "
+                  f"master pipeline output unaffected, split files NOT written")
 
         chapter_rows = []
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
