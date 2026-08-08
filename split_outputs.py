@@ -459,6 +459,33 @@ def reconcile_qids(chapter_records: dict, qn_source_pages: dict,
                     rec["_unresolved_reason"] = "no_anchor_at_all"
                 unresolved[qn] = rec
                 continue
+        # CASE 2 ESCALATION (real-run bug fix, 2026-08-08):
+        # A record whose ONLY printed anchor is a "Solution to
+        # Question N:" header (the question is NOT on this chapter's
+        # pages; the real question lives in a different chapter)
+        # grades as RESOLVED on a single anchor, but the record
+        # itself is a phantom: no stem, no options, no answer
+        # were ever extracted from this chapter's page range. The
+        # S-pass fragment was preserved by the existing
+        # drop_phantom_solution_only_records (which only fires on
+        # cross-chapter duplicates), and the run-19 critique pass
+        # may have hallucinated a question_text from the solution
+        # prose. None of those are real questions for this chapter.
+        # Route them to unresolved with reason=
+        # missing_question_for_solution. The downstream consumer
+        # (master-data builder) sees an explicit gap rather than
+        # a fabricated question at this q_id. The master
+        # build_final_question loop is unaffected: it iterates
+        # chapter_records which is mutated in place below to
+        # exclude these records.
+        if (grade in ("RESOLVED", "RESOLVED_ANCHORED")
+                and _is_solution_only_with_header(anchors)
+                and _record_missing_options_or_answer(rec)):
+            rec["q_id_grade"] = "UNRESOLVED"
+            rec["q_no_anchors"] = anchors_full
+            rec["_unresolved_reason"] = "missing_question_for_solution"
+            unresolved[qn] = rec
+            continue
         # Default: keep as the graded record
         rec["q_id_grade"] = grade
         rec["q_no_anchors"] = anchors_full
@@ -489,6 +516,73 @@ def _record_mostly_empty(rec: dict) -> bool:
     has_stem = bool((rec.get("question_text") or "").strip())
     has_options = bool(rec.get("options"))
     return not (has_stem or has_options)
+
+
+def _is_solution_only_with_header(anchors: dict) -> bool:
+    """True when the only printed anchor for a record is a
+    printed_solution_header_match (a "Solution to Question N:"
+    header on the page) AND the record has no stem anchor and no
+    answer-key row anchor.
+
+    This is the deterministic signature of the
+    "missing_question_for_solution" case the real PSY-007 Railway
+    run on 2026-08-08 exposed: a record whose q_no appears only
+    as a solution-side reference (e.g. "Solution to Question 23:")
+    on a page that is otherwise a different chapter's content. The
+    real question text, options, and answer for this q_no live in
+    a different chapter's page range; what we have here is just
+    the S-pass fragment of the solution prose, plus a critique-hallucinated
+    question_text written by the run-19 critique pass.
+
+    The pre-fix behavior: the grader sees printed_solution_header_match
+    and returns RESOLVED, so the record is kept as a normal graded
+    question. questions.jsonl/answers.jsonl/solutions.jsonl all
+    carry this hallucinated q_id, and chapter_completeness.json
+    reports it as a graded question. The user's data confirms this
+    is wrong -- the real PSY-007 has Q1-Q10 only, and Q23-Q26
+    must NEVER appear in the three normal split files.
+
+    The post-fix behavior: a record matching this signature is
+    routed to unresolved_qids.jsonl with reason=
+    "missing_question_for_solution", and is removed from the
+    chapter_records dict the master build_final_question loop
+    consumes. The master questions.jsonl is therefore also
+    consistent with the three split files (no Q23-Q26 anywhere).
+
+    Conservative gating: this only fires when BOTH of the following
+    hold --
+      1. The record's only printed anchor is a solution header.
+         A record with a stem anchor OR an answer-key row anchor
+         is presumed to be a real question on the page; the
+         solution header alone is the only "but where is the
+         question?" case.
+      2. The record's options dict is empty or its correct_option
+         is None. A record that has options AND a correct_option
+         AND only a solution header would be the legitimate case
+         of a question whose stem is on a previous page (the
+         solution header is on this page, the question is on the
+         previous page); we don't catch that here.
+    """
+    if not anchors.get("printed_solution_header_match"):
+        return False
+    if anchors.get("printed_stem_match"):
+        return False
+    if anchors.get("answer_key_row_match"):
+        return False
+    return True
+
+
+def _record_missing_options_or_answer(rec: dict) -> bool:
+    """True when options is empty or correct_option is None -- the
+    signature that, combined with a solution-only printed anchor,
+    indicates a phantom question. See _is_solution_only_with_header."""
+    options = rec.get("options")
+    correct = rec.get("correct_option")
+    if not options or not isinstance(options, dict) or len(options) == 0:
+        return True
+    if correct is None or not str(correct).strip():
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
