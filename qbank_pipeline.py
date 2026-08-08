@@ -5485,6 +5485,25 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                  "chapter_id": chapter_id}
         # V2: per-pass carry-forward state (Q-pass and S-pass track their own
         # open items; A-pass items are one-shot key rows, no carry needed).
+        # PHASE-2 ANCHOR OBSERVATIONS (read-only hooks -- no behavior change):
+        # The split-output layer's reconcile_qids grader needs the
+        # run-18 GUARD's connected-run analysis (batch_qnos / runs /
+        # trusted_qnos) and the per-pass compute_carry() output to
+        # promote single-anchor records from PROVISIONAL to RESOLVED
+        # (design doc §2 / §3.1). Both live inside transient local
+        # variables in this loop, so we capture them here for the
+        # chapter-end reconcile step. Every entry is a plain dict so
+        # the split layer can read it without depending on this module's
+        # internal types. This is the "option (a)" from the Phase-2 plan
+        # (~6 lines of read-only observation per anchor; no Gemini call,
+        # no carry state mutation, no behavior change to the loop).
+        chapter_anchor_observations = {
+            "neighbor_runs": [],      # one per Q-pass window
+            "carry_forwards": [],     # one per (Q/S) carry-compute
+        }
+        # PHASE-2 PLAN: feed these into split_outputs.reconcile_qids()
+        # at chapter end. Until then they sit in memory and add zero
+        # observable behavior to the loop.
         carry_by_pass = {"Q": None, "S": None}     # FEATURE 2 payloads, per pass
         carry_trackers = {"Q": {}, "S": {}}        # q_no -> batch-seq of UNRESOLVED carry
         carry_banned = {"Q": set(), "S": set()}    # expired q_nos: never respawn
@@ -5865,6 +5884,20 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     for run in runs:
                         if len(run) >= 5 or (known_max and min(run) - known_max <= 3):
                             trusted_qnos.update(run)
+                    # PHASE-2 ANCHOR OBSERVATION: capture the GUARD's connected-run
+                    # analysis unchanged for the chapter-end reconcile step.
+                    # Read-only: nothing here mutates loop state. The grader
+                    # uses this to promote single-anchor records from
+                    # PROVISIONAL to RESOLVED when q_no is in a trusted run
+                    # (design doc §2 / §3.1). One entry per Q-pass window
+                    # that actually ran the GUARD.
+                    chapter_anchor_observations["neighbor_runs"].append({
+                        "window_pages": list(window_pages),
+                        "batch_qnos": list(batch_qnos),
+                        "runs": [list(r) for r in runs],
+                        "trusted_qnos": sorted(int(q) for q in trusted_qnos),
+                        "known_max": int(known_max),
+                    })
                     verified_items, unverified = [], []
                     ocr_conf_cache = {}
                     for it in items:
@@ -5963,6 +5996,23 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     # per-pass carry-forward (Feature 2), then stale-carry guard #1
                     carry_by_pass[pass_name] = compute_carry(
                         batch_meta, items, chapter_records, max(window_pages))
+                    # PHASE-2 ANCHOR OBSERVATION: capture the compute_carry()
+                    # output unchanged for the chapter-end reconcile step.
+                    # Read-only: nothing here mutates the carry state below.
+                    # The grader uses this to promote a single-anchor record
+                    # from PROVISIONAL to RESOLVED when it has a valid
+                    # carry-forward origin (design doc §2 / §3.1). One entry
+                    # per (Q/S) carry-compute. The carry dict is JSON-safe
+                    # via str() of last_open_question so the split layer
+                    # never has to deal with live dict references.
+                    _co = carry_by_pass[pass_name] or {}
+                    chapter_anchor_observations["carry_forwards"].append({
+                        "pass": str(pass_name),
+                        "window_pages": list(window_pages),
+                        "last_open_question": _co.get("last_open_question"),
+                        "cut_part": _co.get("cut_part"),
+                        "ends_mid_content": _co.get("ends_mid_content"),
+                    })
                     carry_by_pass[pass_name] = enforce_carry_expiry(
                         carry_by_pass[pass_name], stats["batches"],
                         carry_trackers[pass_name], carry_banned[pass_name],
@@ -6470,7 +6520,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
         try:
             reconciled = split_outputs.reconcile_qids(
                 chapter_records, qn_source_pages, pdf_path, page_files,
-                subject, ch["chapter_no"])
+                subject, ch["chapter_no"],
+                chapter_anchor_observations=chapter_anchor_observations)
             split_completeness = split_outputs.write_split_outputs(
                 chapter_id=chapter_id, subject=subject,
                 chapter_no=ch["chapter_no"],

@@ -48,33 +48,41 @@ Public entry points
       is written LAST as the "split is fully on disk" signal. Returns the
       chapter_completeness.json content as a dict for the caller's logs.
 
-Provenance taxonomy (confirmed in design doc §2)
-------------------------------------------------
+Provenance taxonomy (confirmed in design doc §2, Phase-2 upgrade landed)
+------------------------------------------------------------------------------
 - RESOLVED_ANCHORED  >=2 printed anchors agree + at least one of
                       printed_stem_match / printed_solution_header_match
                       is set
-- RESOLVED           1 printed anchor only (Phase 1: the connected-run
-                      and carry-forward origins are documented in the
-                      Phase-2 hook plan and not yet observed; single
-                      anchor stays RESOLVED, not PROVISIONAL)
-- PROVISIONAL        only the model's q_no, no printed anchor
+- RESOLVED           1 printed anchor OR (0 printed anchors but a
+                      trusted connected-run or carry-forward origin
+                      from the run-18 GUARD / compute_carry -- the
+                      Phase-2 promotion)
+- PROVISIONAL        0 printed anchors AND no Phase-2 origin
+                      (model-only q_no, weakest grade)
 - UNRESOLVED         no anchor at all, OR two printed anchors disagree
                       (Case 2: missing_question_for_solution), OR
                       only foreign / hallucination-source q_no
 
-Phase-2 plan (NOT implemented; documented for the next change)
---------------------------------------------------------------
-The full design doc §3.1 also calls for two non-printed anchors
-(neighbor_run from the run-18 GUARD's connected-run analysis, and
-carry_forward_origin from compute_carry). Both live inside the
-Q-pass block in process_pdf as transient local variables; capturing
-them requires either: (a) capturing the batch_qnos / runs / carry_obj
-into a per-chapter dict from inside the loop, or (b) re-running the
-connected-run analysis from the page_ledger.jsonl. Option (a) is the
-cleaner Phase-2 plan -- ~6 lines of read-only observation added to
-the existing loop, no behavior change. Until that lands, the grader
-distinguishes only the printed anchors above, which still covers
-the most common 2-anchor case in MARROW/PSY-style books.
+Phase-2 anchors (now populated, design doc §3.1)
+-------------------------------------------------
+The split writer accepts a `chapter_anchor_observations` dict
+captured read-only by process_pdf in the same chapter. Two
+non-printed anchors are derived from those observations and
+attached to q_no_anchors:
+  * neighbor_run: a {size, first, last, near_chapter_max} dict
+    from the run-18 GUARD's connected-run analysis (the q_no
+    appears in trusted_qnos when its run was >=5 items or
+    touched the chapter's known_max).
+  * carry_forward_origin: a {from_window, cut_part} dict from
+    compute_carry() (the q_no is the previous window's
+    last_open_question).
+A single-anchor record backed by EITHER of these is graded
+RESOLVED instead of PROVISIONAL, eliminating the silent
+single-anchor = PROVISIONAL class that the Phase-1 grader left
+on the table. The OCR anchors (ocr_stem_match,
+ocr_solution_header_match) are still pending -- they only
+matter for books where the text layer is garbled, and the
+live pipeline's OCR fallback already handles those pages.
 """
 
 from __future__ import annotations
@@ -302,22 +310,27 @@ def _harvest_anchors(chapter_records: dict, qn_source_pages: dict,
 # 3. Grader -- deterministic, 4-grade taxonomy.
 # ---------------------------------------------------------------------------
 
-def _grade_record(anchors: dict) -> str:
+def _grade_record(anchors: dict, has_neighbor_run: bool = False,
+                  has_carry_origin: bool = False) -> str:
     """Map the printed anchors found for one record to a q_id_grade.
 
-    The Phase-1 grader distinguishes:
+    Phase-1 grading (printed anchors only):
       - RESOLVED_ANCHORED: >=2 printed anchors + at least one of the
         two high-confidence printed anchors (printed_stem_match or
         printed_solution_header_match) is set
       - RESOLVED:           exactly 1 printed anchor
       - PROVISIONAL:        no printed anchor at all (model-only q_no)
-      - UNRESOLVED:         impossible from printed anchors alone in
-        Phase 1; the caller (reconcile_qids) sets this when:
-          * two printed anchors disagree on the q_no (impossible if
-            anchors were harvested correctly per-q_no, but kept here
-            for forward-compat)
-          * the record is a Case 2 / missing_question_for_solution
-            scenario (set explicitly by reconcile_qids)
+      - UNRESOLVED:         impossible from printed anchors alone;
+        the caller (reconcile_qids) sets this when the record is a
+        Case 2 / missing_question_for_solution scenario.
+
+    Phase-2 upgrade (design doc §2): a single-anchor record is promoted
+    from PROVISIONAL to RESOLVED when EITHER has_neighbor_run
+    (the q_no is in a trusted connected-run from the run-18 GUARD)
+    OR has_carry_origin (the q_no has a valid carry-forward origin
+    from compute_carry()). Both flags come from the read-only
+    chapter_anchor_observations passed by process_pdf -- no Gemini
+    call, no behavior change to records that already have >=2 anchors.
     """
     matches = sum(bool(anchors.get(k)) for k in (
         "printed_stem_match",
@@ -325,10 +338,23 @@ def _grade_record(anchors: dict) -> str:
         "answer_key_row_match",
     ))
     if matches == 0:
+        # Phase-2 promotion: zero printed anchors + a trusted run or a
+        # carry origin means the model-only q_no is still defensible
+        # (the printed-page evidence is silent for borderline-anchored
+        # questions, not actually wrong).
+        if has_neighbor_run or has_carry_origin:
+            return "RESOLVED"
         return "PROVISIONAL"
     if matches >= 2 and (anchors.get("printed_stem_match")
                          or anchors.get("printed_solution_header_match")):
         return "RESOLVED_ANCHORED"
+    if matches == 1 and (has_neighbor_run or has_carry_origin):
+        # Phase-2 promotion: a borderline single-anchor record backed
+        # by a trusted connected-run or a carry-forward origin is
+        # RESOLVED, not PROVISIONAL. Without this promotion every
+        # single-anchor record was PROVISIONAL even when the GUARD had
+        # already proven its q_no was part of a trusted chapter range.
+        return "RESOLVED"
     return "RESOLVED"
 
 
@@ -368,11 +394,24 @@ def _collect_provs(rec: dict) -> tuple:
 
 
 def _build_q_no_anchors(rec: dict, qn: int, anchors: dict,
-                        source_pages: list) -> dict:
+                        source_pages: list,
+                        neighbor_run_obs: dict = None,
+                        carry_origin_obs: dict = None) -> dict:
     """Build the q_no_anchors vector for one record. Only fields that
     are actually populated are present; missing anchors are absent
     (not null), which matches the design's intent -- a consumer can
-    distinguish 'no anchor' from 'anchor present but null'."""
+    distinguish 'no anchor' from 'anchor present but null'.
+
+    Phase-2 additions: when the caller passes a neighbor_run_obs dict
+    (the run-18 GUARD's first observation where q_no appears in
+    trusted_qnos) and/or a carry_origin_obs dict (the first
+    compute_carry() observation where q_no is last_open_question),
+    inject the corresponding Phase-2 anchors as their design-doc
+    section-3.1 shapes:
+      * neighbor_run = {size, first, last, near_chapter_max}
+      * carry_forward_origin = {from_window (list), cut_part}
+    Both dicts are optional; missing observations stay absent.
+    """
     provs, model_q_no, disagree = _collect_provs(rec)
     if model_q_no is None:
         model_q_no = qn
@@ -389,6 +428,26 @@ def _build_q_no_anchors(rec: dict, qn: int, anchors: dict,
             "kind": "page_set",
             "pages": sorted(set(int(p) for p in source_pages)),
         }
+    # Phase-2 anchor injection: only attach when there's meaningful
+    # data, so empty observations stay absent rather than appearing
+    # as `{}` placeholders in the consumer's diff.
+    if neighbor_run_obs:
+        trusted = neighbor_run_obs.get("trusted_qnos") or []
+        out["neighbor_run"] = {
+            "size": len(trusted),
+            "first": min(trusted) if trusted else None,
+            "last": max(trusted) if trusted else None,
+            "near_chapter_max": bool(
+                neighbor_run_obs.get("known_max", 0)
+                and trusted
+                and min(trusted) - neighbor_run_obs["known_max"] <= 3
+            ),
+        }
+    if carry_origin_obs:
+        out["carry_forward_origin"] = {
+            "from_window": list(carry_origin_obs.get("window_pages") or []),
+            "cut_part": carry_origin_obs.get("cut_part"),
+        }
     out["provenance_notes"] = provs[:]  # short-form mirror for the design spec
     return out
 
@@ -399,7 +458,8 @@ def _build_q_no_anchors(rec: dict, qn: int, anchors: dict,
 
 def reconcile_qids(chapter_records: dict, qn_source_pages: dict,
                    pdf_path: str, page_files, subject: str,
-                   chapter_no: int) -> dict:
+                   chapter_no: int,
+                   chapter_anchor_observations: dict = None) -> dict:
     """Walk the chapter's pages, harvest every printed anchor, grade
     every record, and split the chapter_records dict into
     (kept_records, unresolved_records). Kept records have a non-null
@@ -414,10 +474,33 @@ def reconcile_qids(chapter_records: dict, qn_source_pages: dict,
       4. returns a dict {qn: rec} for the UNRESOLVED records, so the
          caller can write them to unresolved_qids.jsonl with full
          provenance.
+
+    chapter_anchor_observations (Phase-2, optional): a dict with two
+    lists ("neighbor_runs" and "carry_forwards") captured read-only by
+    process_pdf in this exact chapter. The grader promotes single-anchor
+    records from PROVISIONAL to RESOLVED when q_no is in a trusted run
+    or has a valid carry-forward origin (design doc §2). None = fall
+    back to Phase-1 single-anchor = RESOLVED (or PROVISIONAL on
+    0 anchors, same as before -- no behavior change for callers that
+    don't pass observations).
     """
     qn_set = set(chapter_records)
     per_qn_anchors = _harvest_anchors(chapter_records, qn_source_pages,
                                       pdf_path, page_files)
+    # PHASE-2: precompute per-qn lookups on the observation hooks so
+    # _grade_record stays O(1) per record. Both dicts are {} when the
+    # caller doesn't pass observations (Phase-1 behaviour).
+    neighbor_trusted_qns = {}   # qn -> first observation dict it appears in
+    carry_origin = {}           # qn -> first carry_forwards dict for the pass
+    if chapter_anchor_observations:
+        for nr in chapter_anchor_observations.get("neighbor_runs") or []:
+            for qn in nr.get("trusted_qnos") or []:
+                if qn in qn_set and qn not in neighbor_trusted_qns:
+                    neighbor_trusted_qns[qn] = nr
+        for co in chapter_anchor_observations.get("carry_forwards") or []:
+            qn = co.get("last_open_question")
+            if qn in qn_set and qn not in carry_origin:
+                carry_origin[qn] = co
     kept: dict = {}
     unresolved: dict = {}
     for qn, rec in chapter_records.items():
@@ -426,8 +509,16 @@ def reconcile_qids(chapter_records: dict, qn_source_pages: dict,
         sp = qn_source_pages.get(qn) or []
         if isinstance(sp, set):
             sp = sorted(sp)
-        anchors_full = _build_q_no_anchors(rec, qn, anchors, sp)
-        grade = _grade_record(anchors)
+        # Phase-2: precomputed per-qn lookups (empty when the caller
+        # did not pass chapter_anchor_observations).
+        nr_obs = neighbor_trusted_qns.get(qn)
+        co_obs = carry_origin.get(qn)
+        anchors_full = _build_q_no_anchors(rec, qn, anchors, sp,
+                                          neighbor_run_obs=nr_obs,
+                                          carry_origin_obs=co_obs)
+        grade = _grade_record(anchors,
+                              has_neighbor_run=bool(nr_obs),
+                              has_carry_origin=bool(co_obs))
         # The design lists 4 UNRESOLVED conditions; only one is
         # observable in Phase 1 without modifying the loop:
         #   no_anchor_at_all -- when a record is in chapter_records but
@@ -981,14 +1072,16 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
         "extraction_status_counts": extraction_counts,
         "pass_provenance_summary": pass_summary,
 
-        # Phase-2 hook plan: the missing anchors from design doc §3.1
-        # that the Phase-1 grader does not yet observe (would require
-        # read-only observation hooks in process_pdf). Documented here
-        # so the next change can lift them without re-reading the
-        # design doc.
+        # Phase-2 plan: the two non-printed anchors from design doc §3.1
+        # are now populated by the read-only observation hooks in
+        # process_pdf (neighbor_run, carry_forward_origin). The OCR
+        # anchors are still pending (they only matter for books where
+        # the text layer is garbled; the live pipeline's OCR fallback
+        # already handles those pages and the split layer's printed-
+        # anchor scan is the dominant signal for MARROW/PSY-style
+        # books). Documented here so the next change knows what is
+        # still left to lift.
         "phase2_pending_anchors": {
-            "neighbor_run": "design doc §3.1: run-18 GUARD's connected-run analysis",
-            "carry_forward_origin": "design doc §3.1: compute_carry() output per window",
             "ocr_stem_match": "design doc §3.1: only populated when text layer was garbled",
             "ocr_solution_header_match": "design doc §3.1: only populated when text layer was garbled",
         },
