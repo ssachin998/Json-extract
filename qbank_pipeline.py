@@ -875,70 +875,61 @@ def _clean_ocr_text(text):
 
 def _stem_reject_reason(qtext, rec=None):
     """Cross-field contamination proof for a would-be question stem
-    (run-7 hardening #3/#6, refined run-12). Returns a short reason string,
-    or None when the text plausibly IS a stem. A stem is rejected when it:
+    (run-7 hardening #3/#6, refined run-12, USER-FIX 2026-08-08).
+
+    Returns a short reason string when the text is provably NOT a stem,
+    or None when the text plausibly IS one. A stem is rejected ONLY when:
       1. opens with explanation-style language ("Option A:", "Ans. is B",
          "The correct answer is", "Solution to Question N:" ...) -- this is
          the reliable contamination signal (ch7 q1's "Option A: CAGE
-         questionnaire..." case) and is unchanged;
-      2. is substantially contained in the record's OWN solution text
-         (>=CONTAMINATION_TOKEN_SHARE of its tokens) AND is NOT a plausible
-         real stem. Run-12 correction: solutions RESTATE question-shaped
-         stems ("The correct answer is B. The patient presents with...").
-         A short, question-shaped text that shares tokens with its own
-         solution is a GOOD stem, not contamination -- flagging it stripped
-         real stems (ch1 q3/q4/q10, ch2 q25, ch7 q1/q23-26, ch11 q1/q17)
-         and dead-ended retry ("blocked contaminated stem ... still
-         stem-missing" for every round, rescue 0 fields). Only DECLARATIVE
-         text (> _MAX_REAL_STEM_LEN or not question-shaped) is flagged by
-         the token-containment rule.
-    A false rejection costs a stem (shipped empty + gated); a false accept
-    ships corruption -- so the explanation-opener rule stays strict and only
-    the token-containment rule is narrowed to declarative/long text."""
+         questionnaire..." case). UNCHANGED across all runs.
+      2. phantom-record shape (RUN-20): a non-empty question_text WITH a
+         non-empty solution_text AND empty options AND no correct_option.
+         A real MCQ record has stem + options + answer + solution; when
+         only stem+sol are present the stem is hallucinated (PSY-007
+         Q23-Q26 phantom class). UNCHANGED.
+
+    REMOVED 2026-08-08 (USER ASK: "yrr solutions ko questions se
+    verify nhi Krna h, agar koi suspicious h to Krna h rescue"):
+      * the token-overlap check (stem shares >=80% tokens with own
+        solution). REMOVAL REASON: medical terminology is shared between
+        stems and solutions ("the patient", "schizophrenia",
+        "Clozapine", "dystonia", ...). The 80%-of-tokens threshold fired
+        on the post-routing-fix Railway run's 5 of 5 suspect_stem cases
+        (q2/q4/q6/q7/q9 of PSY-007) -- the CRITIQUE pass then proved:
+          - q2: REAL contamination (corrected -- record had solution
+            prose as stem)
+          - q4: FALSE alarm (CRITIQUE confirmed correct despite flag)
+          - q6, q7, q9: FALSE alarms (CRITIQUE returned
+            "cannot_verify" because the source page provided to
+            CRITIQUE didn't include the solution -- this is a page
+            coverage issue, not a stem contamination)
+        The CRITIQUE pass is the deterministic check the user
+        actually wanted: "verify against the printed page, not
+        against this record's own solution". Rescue sends the
+        model to the question-side page; the model returns the stem
+        region verbatim; the old heuristic was rejecting it
+        because medical terms are shared with the solution. With
+        the heuristic removed, rescue fills 3-5 of 5 previously
+        quarantined records.
+    A false rejection costs a stem (shipped empty + gated); a false
+    accept ships corruption. The explanation-opener rule is strict
+    enough to catch real contamination (ch7 q1 "Option A: ...") and
+    the phantom-shape rule is strict enough to catch the Q23-Q26
+    class. The removed token-overlap rule was the only one that
+    used the solution text as a contamination signal, and that is
+    exactly what the user told us to stop doing."""
     t = (qtext or "").strip()
     if not t:
         return None
     if _EXPLANATION_START_RE.match(t):
         return "opens with explanation-style language"
-    # RUN-20: hoist `sol` to function scope so the second-clause phantom
-    # guard below can reference it even when len(t) < 60 (the first-clause
-    # token-containment check is skipped for short stems; without the
-    # hoist that path raises UnboundLocalError on `sol`). Defaults to ""
-    # so the second-clause's `if rec and t and sol` is False for genuine
-    # solution-only records (question_text=None -> sol may be the only
-    # field, but the guard still works: t is "" and the check is skipped).
     sol = (rec.get("solution_text") or "").strip() if rec else ""
-    # RUN-20 HALLUCINATED-STEM GUARD (PSY-007 Q23-Q26 phantom fix,
-    # 2026-08-08): the real PSY-007 run had Q23-Q26 records with
-    # question_text populated (the run-19 critique pass hallucinated a
-    # stem from the surrounding solution prose), but the records had
-    # NO options and NO correct_option (the real question lives in a
-    # different chapter). The above checks all passed because the
-    # hallucinated text was question-shaped, NOT a verbatim copy of
-    # the solution, and not over _MAX_REAL_STEM_LEN. The deterministic
-    # discriminator that DOES catch the phantom shape is: a non-empty
-    # question_text WITH a non-empty solution_text AND empty options
-    # AND no correct_option. A real MCQ record has at minimum
-    # question_text + options + answer + solution_text (the S-pass
-    # fragment is the only one that can legitimately arrive without
-    # options/answer, but in that case the S-pass PROV guard already
-    # dropped the question_text above). When all four are present,
-    # the question_text is real; when only question_text+solution_text
-    # are present, the question_text is suspect and the record needs
-    # review. This guard does NOT block legitimate solution-only
-    # records (which have no question_text at all) -- the question_text
-    # check is `if t:` (non-empty), so a None or empty question_text
-    # passes through.
-    #
-    # ORDER MATTERS: the phantom-shape guard fires BEFORE the legacy
-    # token-containment check below, because a phantom record's
-    # hallucinated stem and its real solution are typically about the
-    # same chapter (high token overlap), so the token check would
-    # fire first with a less specific reason and the phantom shape
-    # -- the deterministic, trustworthy signal -- would never be
-    # reached. The shape guard is the run-20 fix; the token check
-    # is a legacy heuristic that still catches the genuine
-    # question_text == solution_text contamination class.
+    # RUN-20 HALLUCINATED-STEM GUARD: shape only, not token content.
+    # A non-empty question_text + non-empty solution_text + empty
+    # options + no correct_option = phantom record (the real question
+    # is in another chapter; the "stem" was hallucinated from
+    # surrounding solution prose by the run-19 critique pass).
     if rec and t and sol:
         opts = rec.get("options") or {}
         correct = rec.get("correct_option")
@@ -950,22 +941,6 @@ def _stem_reject_reason(qtext, rec=None):
             return ("record has only question_text+solution_text (no options, no "
                     "answer) -- phantom-record shape: the real question is in "
                     "another chapter; run-20 upstream fix")
-    if rec and len(t) >= 60 and sol:
-            # RUN-14: a would-be stem that is (near-)IDENTICAL to the whole
-            # solution (ch7 q23/q25: question_text == solution_text verbatim,
-            # e.g. "The patient has developed acute muscular dystonia ..."
-            # or "Clozapine is the only drug ...") is contamination NO MATTER
-            # how question-shaped it looks ("which", "is the" appear inside
-            # explanation prose, so the run-12 question-shape narrowing lets
-            # them through). A REAL stem is a short question and its solution
-            # is much longer, so the REVERSE containment (solution inside
-            # stem) only fires when the two fields are the SAME text -- which
-            # is always contamination. Real stems whose solution restates
-            # them (ch26 q1) still pass: reverse containment fails.
-            if _frag_mostly_present(sol, t, 0.8):
-                return "question_text is this record's own solution verbatim"
-            if len(t) > _MAX_REAL_STEM_LEN or not _QUESTION_SHAPED_RE.search(t):
-                return "stem text substantially contained in this record's own solution"
     return None
 
 

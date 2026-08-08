@@ -107,64 +107,66 @@ def fake_call_gemini_on_pages(model, image_paths, context="", prompt=None):
 
 
 def make_chapter_records():
-    """Create 5 contaminated records (q2/q4/q6/q7/q9) with suspect stems."""
-    def make_rec(qn, qtext, opts, ans, sol, _stem_suspect_reason):
+    """Create 5 records that need stem-recovery (empty question_text).
+
+    USER-FIX 2026-08-08: the old test created records with non-empty
+    stems and `_stem_suspect_reason` set, expecting the rescue pass
+    to fill them. Per the user ("yrr solutions ko questions se
+    verify nhi Krna h, agar koi suspicious h to Krna h rescue"), the
+    contamination heuristic no longer flags medical-term shared
+    stems -- so the genuine use case for rescue stem-recovery is
+    records with truly EMPTY question_text (the model returned no
+    stem at all, or it was lost downstream). This test now models
+    that genuine use case.
+    """
+    def make_rec(qn, opts, ans, sol):
         return {
-            "question_text": qtext,
+            # Empty question_text: the rescue pass is invoked to refill
+            # this from the question-side page.
+            "question_text": None,
             "options": opts,
             "correct_option": ans,
             "solution_text": sol,
             "tables": [],
             "has_figure_in_question": False,
             "has_figure_in_solution": False,
-            "_stem_suspect_reason": _stem_suspect_reason,
-            "_prov": {"question_text": "Q_PASS"},
+            "_prov": {"options": "Q_PASS"},
         }
     return {
         2: make_rec(
             2,
-            "A patient on long-term haloperidol develops involuntary chewing movements and tongue protrusion. The most appropriate next step is",
             {"A": "Add a benzodiazepine", "B": "Switch to an atypical antipsychotic",
              "C": "Increase the haloperidol dose", "D": "Add an anticholinergic"},
             "B",
             "Tardive dyskinesia, a late-onset movement disorder from chronic typical antipsychotic use. Management involves discontinuing or reducing the haloperidol and switching to an atypical such as clozapine or quetiapine.",
-            "stem text substantially contained in this record's own solution",
         ),
         4: make_rec(
             4,
-            "Clozapine is reserved for treatment-resistant schizophrenia because of the risk of agranulocytosis",
             {"A": "Tardive dyskinesia", "B": "Agranulocytosis",
              "C": "Neuroleptic malignant syndrome", "D": "Metabolic syndrome"},
             "B",
-            "Agranulocytosis, which requires regular monitoring. Clozapine is reserved for treatment-resistant schizophrenia because of the risk of agranulocytosis. The risk of agranulocytosis is the most serious adverse effect that requires regular monitoring.",
-            "stem text substantially contained in this record's own solution",
+            "Agranulocytosis, which requires regular monitoring. Clozapine is reserved for treatment-resistant schizophrenia because of the risk of agranulocytosis.",
         ),
         6: make_rec(
             6,
-            "A patient on long-term haloperidol develops involuntary chewing movements and tongue protrusion. The most appropriate next step is to switch to an atypical",
             {"A": "Add a benzodiazepine", "B": "Switch to an atypical antipsychotic",
              "C": "Increase the haloperidol dose", "D": "Add an anticholinergic"},
             "B",
-            "Tardive dyskinesia, a late-onset movement disorder from chronic typical antipsychotic use. The most appropriate next step is to switch to an atypical such as clozapine or quetiapine. Management involves discontinuing or reducing the haloperidol.",
-            "stem text substantially contained in this record's own solution",
+            "Tardive dyskinesia, a late-onset movement disorder from chronic typical antipsychotic use. The most appropriate next step is to switch to an atypical such as clozapine or quetiapine.",
         ),
         7: make_rec(
             7,
-            "A patient on lithium and haloperidol presents with fever, muscle rigidity, altered consciousness, and autonomic instability. The most likely diagnosis is neuroleptic malignant syndrome",
             {"A": "Serotonin syndrome", "B": "Neuroleptic malignant syndrome",
              "C": "Malignant hyperthermia", "D": "Acute dystonia"},
             "B",
-            "Neuroleptic malignant syndrome, a life-threatening complication of antipsychotics with the classic tetrad of hyperthermia, lead-pipe rigidity, altered mental status, and autonomic instability. The most likely diagnosis is neuroleptic malignant syndrome. Stop the antipsychotic and start dantrolene or bromocriptine.",
-            "stem text substantially contained in this record's own solution",
+            "Neuroleptic malignant syndrome, a life-threatening complication of antipsychotics with the classic tetrad of hyperthermia, lead-pipe rigidity, altered mental status, and autonomic instability. Stop the antipsychotic and start dantrolene or bromocriptine.",
         ),
         9: make_rec(
             9,
-            "A college student with command auditory hallucinations tells the ER she is going to jump off the balcony because the devil told her to. The most appropriate immediate management is involuntary hospitalization",
             {"A": "Outpatient therapy", "B": "Involuntary hospitalization",
              "C": "Start an antidepressant", "D": "Prescribe a benzodiazepine"},
             "B",
-            "Involuntary hospitalization for safety. The most appropriate immediate management is involuntary hospitalization. The patient is a danger to herself (suicidal ideation with command hallucinations) and requires inpatient stabilization on an antipsychotic, not outpatient therapy or an antidepressant.",
-            "stem text substantially contained in this record's own solution",
+            "Involuntary hospitalization for safety. The patient is a danger to herself (suicidal ideation with command hallucinations) and requires inpatient stabilization on an antipsychotic, not outpatient therapy or an antidepressant.",
         ),
     }
 

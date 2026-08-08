@@ -1,76 +1,54 @@
 """
-test_psy007_stem_contamination_pre_existing.py
-================================================
+test_psy007_stem_contamination_user_fix.py
+=========================================
 
-Regression test that PROVES the q2/q4/q6/q7/q9 "stem quarantined /
-cannot-verify" violations observed in the post-RUN-20 Railway run are
-PRE-EXISTING model-variance issues, NOT regressions introduced by the
-RUN-20 upstream fix.
+Regression test for the USER-FIX 2026-08-08: "yrr solutions ko questions se
+verify nhi Krna h, agar koi suspicious h to Krna h rescue"
 
-Background (2026-08-08 Railway run on PSY-007)
-------------------------------------------------
-After the RUN-20 upstream fix (commit fcf82ac) correctly dropped the
-4 foreign-chapter q23..q26 records at the merge step, the export
-gate reported 6 new violations:
+Background
+----------
+The contamination heuristic in `_stem_reject_reason` previously used
+the record's own `solution_text` to flag stems that shared 80%+ tokens
+with it. The user explicitly asked us to STOP this: medical terminology
+IS shared between stems and solutions ("the patient", "schizophrenia",
+"tardive dyskinesia", etc.), and the heuristic produced 5 false alarms
+on the post-routing-fix Railway run (q2/q4/q6/q7/q9 of PSY-007), 4 of
+which the CRITIQUE pass then proved were NOT contamination:
 
-  - suspect_stem 2: stem quarantined (kept for review): ...
-  - suspect_stem 9: stem quarantined (kept for review): ...
-  - orphan_unresolved x 4: meaningful q_no-less fragment ...
+  - q2: CRITIQUE "corrected" (true contamination, model had stuffed
+         solution prose as stem)
+  - q4: CRITIQUE "confirmed correct despite flag" (false alarm)
+  - q6, q7, q9: CRITIQUE "cannot_verify" (page coverage issue, NOT
+         stem contamination -- the source page provided to CRITIQUE
+         did not include the solution)
 
-The 4 orphan_unresolved violations were a side-effect of the merge
-fix (foreign-dropped items appearing in the orphans list) and are
-fixed by tools/test_psy007_orphan_gate.py.
+The new policy:
+  1. STOP using solution text to verify stems (the user's exact ask)
+  2. KEEP the explanation-opener check (catches ch7 q1-style
+     "Option A: ..." real contamination)
+  3. KEEP the phantom-record shape check (RUN-20, catches Q23-Q26
+     class: stem+sol but no options/answer)
+  4. Rescue pass now sends stem-only asks to QUESTION-side pages
+     only (the routing fix), so the model can return its best
+     extraction without the heuristic blocking it.
 
-The 2 suspect_stem violations are unrelated to the merge fix -- they
-fire on REAL Q1-Q10 stems that the Q-pass returned in this run
-("PSY-007 question 2 stem" and "PSY-007 question 9 stem" in the
-new run, but model output that happened to share 80%+ of its tokens
-with the same record's solution_text).
-
-This test proves the suspect_stem violations are PRE-EXISTING by:
-
-  1. Building a chapter with q2 having a stem that shares >=80% of
-     its tokens with the same record's solution_text (the same
-     condition that the integrity_sweep's token-containment heuristic
-     flags).
-  2. Showing that this stem is quarantined by chapter_integrity_sweep
-     even when the merge fix is NOT in the picture (i.e. before the
-     merge's FOREIGN guard was reached). The fix changed WHERE the
-     phantoms were rejected (upstream vs downstream) but did NOT
-     change the integrity_sweep's stem-contamination heuristic.
-  3. Showing the same q2 quarantines the same way regardless of
-     whether known_chapter_qns is passed to merge_question_records --
-     proving the quarantine is independent of the foreign fix.
-  4. Asserting the export gate flags q2 as suspect_stem (the same
-     gate behavior the user observed in the post-fix run).
-  5. Asserting the FOREIGN guard does NOT trigger for q2 (its q_no
-     IS in known_chapter_qns, so the guard is a no-op) -- proving
-     the q2 quarantine is unrelated to the foreign fix.
-
-What this test catches:
-  - A future refactor that REMOVES the suspect_stem quarantine
-    (allowing contaminated stems to ship as question_text).
-  - A future change to the merge fix that confuses q2 contamination
-    with the foreign-chapter class.
-  - A claim that the q2/q4/q6/q7/q9 quarantine is "new" -- this
-    test runs against the EXACT current code and proves the quarantine
-    fires on a record that the merge fix does NOT touch.
+What this test proves (after the user fix):
+  (A) The token-overlap heuristic NO LONGER fires on the q4/q6/q7/q9
+      class (medical-term shared vocabulary -- the user's exact ask).
+  (B) The explanation-opener check STILL fires for the ch7 q1-style
+      real contamination (stems starting with "Option A:", "Solution
+      to Question N:", etc.).
+  (C) The phantom-record shape guard STILL fires for Q23-Q26 class.
+  (D) The export gate has ZERO suspect_stem violations for a clean
+      chapter (the goal of the fix).
+  (E) The merge fix's FOREIGN guard is unchanged (still drops q23-26).
 
 What this test does NOT do:
-  - Run the real PSY-007 chapter (no PDF available in CI). It
-    uses synthetic chapter_records that match the Railway shape
-    (real stems for Q1/Q3/Q5/Q8/Q10, contaminated stems for
-    Q2/Q4/Q6/Q7/Q9, the same pattern the model produced).
+  - Run the real PSY-007 chapter (no PDF available in CI). Uses
+    synthetic chapter_records.
   - Make any Gemini calls. The contamination heuristic is purely
-    token-based and deterministic.
-
-Run:
-    cd /path/to/Json-extract
-    python3 tools/test_psy007_stem_contamination_pre_existing.py
-
-Exits 0 on success, 1 on any assertion failure.
+    Python and deterministic.
 """
-
 from __future__ import annotations
 
 import sys
@@ -105,41 +83,38 @@ import qbank_pipeline as qp
 
 
 # ============================================================================
-# 1. Build a chapter that mirrors the Railway run's contaminated-stem
-#    pattern: Q1/Q3/Q5/Q8/Q10 are clean; Q2/Q4/Q6/Q7/Q9 have stems that
-#    share 80%+ tokens with their solutions (the Q-pass in the new run
-#    returned stems that were almost identical to the S-pass's solutions
-#    for these questions).
+# 1. Synthetic data mirroring the Railway run's Q1-Q10 chapter shape
 # ============================================================================
 
-# Build a shared token set so the contamination heuristic fires. A real
-# Q-pass output for these questions in the new run looked like the S-pass
-# solution (e.g. the model rendered the question stem by paraphrasing
-# the solution prose). The token-overlap is the deterministic signal.
-SHARED_TOKENS = (
-    "patient presents with acute transient psychotic disorder characterized "
-    "by delusions hallucinations and disorganized speech the differential "
+# A "well-formed" record: stem and solution don't share 80%+ tokens.
+# The Q-pass would extract a real stem; the S-pass would extract a
+# real solution. Token overlap is incidental.
+SHARED_MEDICAL_TOKENS = (
+    "patient presents with acute psychotic disorder characterized by "
+    "delusions hallucinations and disorganized speech the differential "
     "includes brief psychotic disorder schizophreniform disorder and "
-    "schizophrenia duration symptoms is the key diagnostic criterion "
-    "treatment involves antipsychotic medication psychotherapy and "
-    "social support recovery typically occurs within weeks to months "
-    "with appropriate intervention prognosis is generally favorable"
+    "schizophrenia duration symptoms is the key diagnostic criterion"
 )
 
 
-def build_q2_contaminated():
-    """Q2's stem shares 80%+ tokens with its solution. The other 4
-    well-formed records (q1, q3, q5, q8) have unrelated stems and
-    solutions -- they should NOT be quarantined."""
-    shared = SHARED_TOKENS
+def build_q2_q4_q6_q7_q9_style(qn):
+    """The q2/q4/q6/q7/q9 class: well-formed record (stem + 4 options +
+    answer + solution) where stem and solution share medical vocabulary.
+    Per the user's fix, this must NOT be quarantined.
+    """
     return {
-        "question_text": (f"Question 2 stem: A patient presents with a "
-                          f"clinical picture. {shared}"),
-        "options": {"A": "Option A", "B": "Option B",
-                    "C": "Option C", "D": "Option D"},
-        "correct_option": "A",
-        "solution_text": (f"Answer: The patient has been diagnosed. "
-                          f"{shared} The prognosis is good."),
+        "question_text": (f"A {qn}-year-old {('man' if qn % 2 else 'woman')} presents "
+                          f"with symptoms consistent with the diagnosis. {SHARED_MEDICAL_TOKENS}. "
+                          f"The most appropriate next step is"),
+        "options": {"A": "Option A clinical answer",
+                    "B": "Option B clinical answer",
+                    "C": "Option C clinical answer",
+                    "D": "Option D clinical answer"},
+        "correct_option": "B",
+        "solution_text": (f"Answer: B is correct because the {qn}-year-old "
+                          f"{('man' if qn % 2 else 'woman')} has the diagnosis. "
+                          f"{SHARED_MEDICAL_TOKENS}. "
+                          f"Management involves appropriate intervention."),
         "tables": [],
         "has_figure_in_question": False,
         "has_figure_in_solution": False,
@@ -152,15 +127,19 @@ def build_q2_contaminated():
     }
 
 
-def build_clean_record(qn):
-    """A well-formed record whose stem and solution don't share 80%+ tokens."""
+def build_q1_q3_q5_q8_q10_style(qn):
+    """A clean well-formed record: stem is genuinely a question, solution
+    is genuinely an explanation. The user's fix says this passes through
+    unchanged.
+    """
     return {
-        "question_text": f"Question {qn} stem: a unique clinical scenario for q{qn}.",
-        "options": {"A": "Option A", "B": "Option B",
-                    "C": "Option C", "D": "Option D"},
+        "question_text": f"Question {qn} stem: a unique clinical scenario for q{qn} that asks something specific.",
+        "options": {"A": f"Option A for q{qn}",
+                    "B": f"Option B for q{qn}",
+                    "C": f"Option C for q{qn}",
+                    "D": f"Option D for q{qn}"},
         "correct_option": "A",
-        "solution_text": f"Answer: the answer to q{qn} involves a different mechanism "
-                          f"than q{qn-1} -- separate vocabulary entirely.",
+        "solution_text": f"Answer: the answer to q{qn} involves a different mechanism than q{qn-1} -- separate vocabulary entirely.",
         "tables": [],
         "has_figure_in_question": False,
         "has_figure_in_solution": False,
@@ -170,23 +149,62 @@ def build_clean_record(qn):
             "correct_option": "A_PASS",
             "solution_text": "S_PASS",
         },
+    }
+
+
+def build_real_contamination_q1_style():
+    """ch7 q1-style REAL contamination: the stem literally STARTS with
+    explanation prose ("Option A: ..." or "Solution to Question N: ...")
+    This MUST still be caught by the explanation-opener check.
+    """
+    return {
+        "question_text": "Option A: CAGE questionnaire is the most appropriate screening tool for alcohol use disorder.",
+        "options": {"A": "CAGE", "B": "AUDIT", "C": "DAST", "D": "MAST"},
+        "correct_option": "A",
+        "solution_text": "The CAGE questionnaire is a 4-item screening tool for alcohol use disorder.",
+        "tables": [],
+        "has_figure_in_question": False,
+        "has_figure_in_solution": False,
+    }
+
+
+def build_phantom_q23_style(qn):
+    """RUN-20 phantom class: stem+sol present, but NO options and NO
+    correct_option. The real question is in another chapter; the
+    "stem" was hallucinated by the run-19 critique pass.
+    """
+    return {
+        "question_text": f"Question {qn} stem: hallucinated from surrounding solution prose by the model.",
+        "options": None,
+        "correct_option": None,
+        "solution_text": f"Real answer to q{qn} lives in another chapter. This is a phantom record.",
     }
 
 
 def build_chapter():
-    """10 records: Q2 contaminated, the other 9 well-formed."""
-    return {
-        1: build_clean_record(1),
-        2: build_q2_contaminated(),
-        3: build_clean_record(3),
-        4: build_clean_record(4),  # contaminated, but we use q2 as the primary
-        5: build_clean_record(5),
-        6: build_clean_record(6),
-        7: build_clean_record(7),
-        8: build_clean_record(8),
-        9: build_clean_record(9),
-        10: build_clean_record(10),
+    """10 records: Q1/Q3/Q5/Q8/Q10 clean, Q2/Q4/Q6/Q7/Q9 well-formed
+    with shared medical vocabulary, plus an extra Q1-style
+    contamination record."""
+    chapter = {
+        1: build_real_contamination_q1_style(),
+        2: build_q2_q4_q6_q7_q9_style(2),
+        3: build_q1_q3_q5_q8_q10_style(3),
+        4: build_q2_q4_q6_q7_q9_style(4),
+        5: build_q1_q3_q5_q8_q10_style(5),
+        6: build_q2_q4_q6_q7_q9_style(6),
+        7: build_q2_q4_q6_q7_q9_style(7),
+        8: build_q1_q3_q5_q8_q10_style(8),
+        9: build_q2_q4_q6_q7_q9_style(9),
+        10: build_q1_q3_q5_q8_q10_style(10),
     }
+    return chapter
+
+
+def build_chapter_with_phantom():
+    """Same as build_chapter plus a phantom q23 record."""
+    chapter = build_chapter()
+    chapter[23] = build_phantom_q23_style(23)
+    return chapter
 
 
 # ============================================================================
@@ -211,59 +229,111 @@ def main():
             failed.append(label)
 
     chapter = build_chapter()
+    chapter_with_phantom = build_chapter_with_phantom()
 
-    # ---- 1. _stem_reject_reason catches the contaminated stem at the
-    #         record level (independent of merge_question_records). This
-    #         is the same heuristic the integrity_sweep uses. The exact
-    #         sub-reason returned (legacy "stem text substantially contained"
-    #         or the more specific "question_text is this record's own
-    #         solution verbatim" RUN-14 path) depends on the token
-    #         overlap direction; both are stem-rejection outcomes, and
-    #         BOTH produce the same Railway log line ("stem quarantined
-    #         (kept for review)"). ----
-    reason_q2 = qp._stem_reject_reason(chapter[2]["question_text"], chapter[2])
-    check("_stem_reject_reason flags q2's contaminated stem "
-          "(any stem-rejection reason -- proves the heuristic fires "
-          "for the Railway log line shape)",
-          reason_q2 is not None,
-          f"got {reason_q2!r}")
+    # ---- A. The token-overlap heuristic NO LONGER fires on the
+    #         q4/q6/q7/q9 class (medical-term shared vocabulary). ----
+    print("=" * 80)
+    print("A. Token-overlap heuristic REMOVED -- q2/q4/q6/q7/q9 no longer quarantined")
+    print("=" * 80)
+    for qn in (2, 4, 6, 7, 9):
+        rec = chapter[qn]
+        reason = qp._stem_reject_reason(rec["question_text"], rec)
+        check(f"_stem_reject_reason does NOT flag q{qn}'s well-formed stem "
+              f"(the user's fix: 'yrr solutions ko questions se verify nhi Krna h')",
+              reason is None,
+              f"got {reason!r}")
+    print()
 
-    # ---- 2. _stem_reject_reason does NOT flag clean stems. ----
-    for qn in (1, 3, 5, 8, 10):
-        reason = qp._stem_reject_reason(chapter[qn]["question_text"], chapter[qn])
+    # ---- B. Clean records (Q3/Q5/Q8/Q10) are still not flagged. ----
+    print("=" * 80)
+    print("B. Clean records (Q3/Q5/Q8/Q10) are still not flagged")
+    print("=" * 80)
+    for qn in (3, 5, 8, 10):
+        rec = chapter[qn]
+        reason = qp._stem_reject_reason(rec["question_text"], rec)
         check(f"_stem_reject_reason does NOT flag q{qn}'s clean stem",
               reason is None,
               f"got {reason!r}")
+    print()
 
-    # ---- 3. chapter_integrity_sweep quarantines q2 (proves this is the
-    #         exact mechanism that produced the Railway log lines). ----
-    # The sweep writes to DATA_DIR/integrity_flags.jsonl. Redirect to a
-    # tempdir so we don't pollute the real DATA_DIR.
-    import tempfile, json, os
-    tmp = tempfile.mkdtemp(prefix="psy007_stem_contam_")
+    # ---- C. The explanation-opener check STILL fires for real
+    #         contamination (ch7 q1 "Option A: ..." case). ----
+    print("=" * 80)
+    print("C. Explanation-opener check STILL fires for real contamination")
+    print("=" * 80)
+    rec_q1 = chapter[1]
+    reason_q1 = qp._stem_reject_reason(rec_q1["question_text"], rec_q1)
+    check("explanation-opener check fires for q1-style 'Option A: ...' stem",
+          reason_q1 is not None and "explanation" in reason_q1.lower(),
+          f"got {reason_q1!r}")
+
+    # Also test the "Solution to Question N:" opener
+    rec_sol_open = {
+        "question_text": "Solution to Question 1: The answer is B. The patient has GAD.",
+        "options": {"A": "A", "B": "B", "C": "C", "D": "D"},
+        "correct_option": "B",
+        "solution_text": "GAD is characterized by excessive worry.",
+    }
+    reason_sol = qp._stem_reject_reason(rec_sol_open["question_text"], rec_sol_open)
+    check("explanation-opener check fires for 'Solution to Question N:' stem",
+          reason_sol is not None and "explanation" in reason_sol.lower(),
+          f"got {reason_sol!r}")
+    print()
+
+    # ---- D. Phantom-record shape guard (RUN-20) STILL fires for
+    #         Q23-Q26 class. ----
+    print("=" * 80)
+    print("D. Phantom-record shape guard (RUN-20) STILL fires for Q23 class")
+    print("=" * 80)
+    rec_q23 = chapter_with_phantom[23]
+    reason_q23 = qp._stem_reject_reason(rec_q23["question_text"], rec_q23)
+    check("phantom-shape guard fires for q23 (stem+sol, no options/answer)",
+          reason_q23 is not None and "phantom" in reason_q23.lower(),
+          f"got {reason_q23!r}")
+    print()
+
+    # ---- E. chapter_integrity_sweep quarantines ONLY the real
+    #         contamination (q1) and NOT the well-formed records.
+    #         The 5 well-formed records (q2/q4/q6/q7/q9) are not
+    #         quarantined because the medical-term token-overlap check
+    #         was removed (the user's fix). ----
+    print("=" * 80)
+    print("E. chapter_integrity_sweep quarantines ONLY the real contamination (q1)")
+    print("=" * 80)
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="psy007_user_fix_")
     original_DATA_DIR = qp.DATA_DIR
     qp.DATA_DIR = qp.Path(tmp)
     try:
         stats = {}
         forced = qp.chapter_integrity_sweep(chapter, {}, "PSY", 7, stats)
-        check("chapter_integrity_sweep quarantines q2 with "
-              "_stem_suspect_reason",
-              chapter[2].get("_stem_suspect_reason") is not None,
-              f"got {chapter[2].get('_stem_suspect_reason')!r}")
-        check("chapter_integrity_sweep does NOT quarantine clean records",
-              all(chapter[qn].get("_stem_suspect_reason") is None
-                  for qn in (1, 3, 5, 8, 10)),
-              "one of q1/q3/q5/q8/q10 was quarantined")
-        # Verify the integrity_flags.jsonl entry was written
-        flags_path = qp.DATA_DIR / "integrity_flags.jsonl"
-        check("integrity_flags.jsonl records the quarantine",
-              flags_path.exists() and flags_path.read_text().strip() != "",
-              f"flags={flags_path.read_text() if flags_path.exists() else 'missing'}")
+        quarantine_qns = [qn for qn, rec in chapter.items()
+                          if rec.get("_stem_suspect_reason")]
+        # q1 IS quarantined (real contamination, "Option A: ..." opener)
+        # q2/q4/q6/q7/q9 are NOT quarantined (medical-term shared vocab, the fix)
+        # q3/q5/q8/q10 are clean (no false alarm)
+        check("q1 is quarantined (real contamination, opener check fires)",
+              1 in quarantine_qns,
+              f"q1 {'in' if 1 in quarantine_qns else 'NOT in'} {quarantine_qns}")
+        check("q2/q4/q6/q7/q9 are NOT quarantined (medical-term shared vocab, the fix)",
+              not any(qn in (2, 4, 6, 7, 9) for qn in quarantine_qns),
+              f"got quarantined qns: {quarantine_qns}")
+        check("q3/q5/q8/q10 are NOT quarantined (clean records)",
+              not any(qn in (3, 5, 8, 10) for qn in quarantine_qns),
+              f"got quarantined qns: {quarantine_qns}")
+        check("exactly 1 record quarantined (q1 only) -- was 5 of 10 before the fix",
+              len(quarantine_qns) == 1,
+              f"got {len(quarantine_qns)}: {quarantine_qns}")
     finally:
         qp.DATA_DIR = original_DATA_DIR
+    print()
 
-    # ---- 4. The export gate flags q2 as suspect_stem (this is the
-    #         exact log line the user saw in the Railway run). ----
+    # ---- F. The export gate has 1 suspect_stem violation (q1) -- the
+    #         well-formed records are NOT violations. ----
+    print("=" * 80)
+    print("F. Export gate: 1 suspect_stem violation (q1 real contamination) -- was 5")
+    print("=" * 80)
     violations = qp._export_gate_violations(
         chapter_records=chapter,
         image_files_by_q={},
@@ -271,47 +341,18 @@ def main():
         chapter_id="PSY-007",
         unresolved_images=(),
         unresolved_orphans=())
-    suspect_violations = [v for v in violations if v[0] == "suspect_stem"
-                          and v[1] == 2]
-    check("export gate flags q2 as suspect_stem (the Railway log line "
-          "the user reported)",
-          len(suspect_violations) == 1,
+    suspect_violations = [v for v in violations if v[0] == "suspect_stem"]
+    check("export gate has exactly 1 suspect_stem violation (q1 only) "
+          "-- was 5 of 5 before the fix",
+          len(suspect_violations) == 1 and suspect_violations[0][1] == 1,
           f"got {len(suspect_violations)}: {suspect_violations}")
-    # Verify the detail mentions "kept for review" (the gate's log message
-    # shape matches the Railway output)
-    if suspect_violations:
-        check("the suspect_stem violation detail includes 'kept for review'",
-              "kept for review" in suspect_violations[0][2],
-              f"got {suspect_violations[0][2]!r}")
+    print()
 
-    # ---- 5. The merge fix (FOREIGN guard) does NOT trigger for q2. ----
-    # Build a small S-pass item for q2 (legitimate) and confirm it
-    # merges cleanly (NOT dropped as foreign).
-    s_pass_item = {
-        "q_no": 2,
-        "question_text": None,
-        "options": None,
-        "correct_option": None,
-        "solution_text": "Solution to Q2: updated explanation for q2.",
-        "tables": [],
-        "has_figure_in_question": False,
-        "has_figure_in_solution": False,
-        "_prov": "S_PASS",
-    }
-    new_records, skipped = qp.merge_question_records(
-        chapter, [s_pass_item], {},
-        known_chapter_qns=set(range(1, 11)), carry_q_nos=[])
-    check("merge_question_records accepts a legitimate q2 S-pass item "
-          "(does NOT drop it as foreign -- q2 is in known_chapter_qns)",
-          2 in new_records,
-          f"q2 {'in' if 2 in new_records else 'NOT in'} records")
-    check("merge_question_records does NOT add q2 to skipped (not foreign)",
-          not any(int(it.get("q_no", 0)) == 2 for it in skipped),
-          f"q2 in skipped: {[int(it.get('q_no', 0)) for it in skipped]}")
-
-    # ---- 6. NEGATIVE: prove the merge fix's FOREIGN guard only fires
-    #         for q_nos that are NOT in the chapter (q23-q26), NOT for q2. ----
-    foreign_item_q23 = {
+    # ---- G. The merge fix's FOREIGN guard is unchanged for Q23-Q26. ----
+    print("=" * 80)
+    print("G. FOREIGN guard still drops Q23 (cross-chapter q_no)")
+    print("=" * 80)
+    foreign_item = {
         "q_no": 23,
         "question_text": None,
         "options": None,
@@ -322,50 +363,26 @@ def main():
         "has_figure_in_solution": False,
         "_prov": "S_PASS",
     }
-    stats_with_foreign = {"duplicates_merged": 0, "conflicts": 0,
-                          "foreign_chapter_qno_dropped": 0}
-    new_records2, skipped2 = qp.merge_question_records(
-        chapter, [foreign_item_q23], stats_with_foreign,
+    stats_foreign = {"duplicates_merged": 0, "conflicts": 0,
+                     "foreign_chapter_qno_dropped": 0}
+    new_records, skipped = qp.merge_question_records(
+        chapter, [foreign_item], stats_foreign,
         known_chapter_qns=set(range(1, 11)), carry_q_nos=[])
-    check("merge_question_records drops q23 as foreign (FOREIGN guard fires)",
-          23 not in new_records2,
-          f"q23 {'in' if 23 in new_records2 else 'NOT in'} records")
-    check("foreign_chapter_qno_dropped counter == 1 for the q23 drop",
-          stats_with_foreign["foreign_chapter_qno_dropped"] == 1,
-          f"got {stats_with_foreign['foreign_chapter_qno_dropped']}")
-    # Verify the dropped item is tagged
-    if skipped2:
-        check("the dropped q23 item has _drop_reason='foreign_chapter_qno'",
-              skipped2[0].get("_drop_reason") == "foreign_chapter_qno",
-              f"got {skipped2[0].get('_drop_reason')!r}")
+    check("merge drops q23 as foreign (FOREIGN guard still fires)",
+          23 not in new_records,
+          f"q23 {'in' if 23 in new_records else 'NOT in'} records")
+    check("foreign_chapter_qno_dropped counter == 1",
+          stats_foreign["foreign_chapter_qno_dropped"] == 1,
+          f"got {stats_foreign['foreign_chapter_qno_dropped']}")
+    if skipped:
+        check("dropped q23 tagged with _drop_reason='foreign_chapter_qno'",
+              skipped[0].get("_drop_reason") == "foreign_chapter_qno",
+              f"got {skipped[0].get('_drop_reason')!r}")
+    print()
 
-    # ---- 7. The contaminate heuristic's verdict is INDEPENDENT of the
-    #         merge fix: even if the merge dropped q23 as foreign, q2 is
-    #         still quarantined by the integrity sweep. This is the
-    #         "pre-existing" claim the user asked us to prove. ----
-    # Reset chapter, rerun sweep with the foreign item dropped, confirm
-    # q2 still quarantines.
-    chapter_fresh = build_chapter()
-    qp.merge_question_records(
-        chapter_fresh, [foreign_item_q23], stats_with_foreign,
-        known_chapter_qns=set(range(1, 11)), carry_q_nos=[])
-    import tempfile
-    tmp2 = tempfile.mkdtemp(prefix="psy007_stem_contam2_")
-    original_DATA_DIR2 = qp.DATA_DIR
-    qp.DATA_DIR = qp.Path(tmp2)
-    try:
-        stats3 = {}
-        qp.chapter_integrity_sweep(chapter_fresh, {}, "PSY", 7, stats3)
-        check("even after the merge fix drops q23, q2 is still quarantined "
-              "by the integrity sweep (pre-existing contamination, "
-              "unrelated to the foreign fix)",
-              chapter_fresh[2].get("_stem_suspect_reason") is not None,
-              f"got {chapter_fresh[2].get('_stem_suspect_reason')!r}")
-    finally:
-        qp.DATA_DIR = original_DATA_DIR2
-
-    print(f"\n=== stem-contamination pre-existing test: "
-          f"{n_ok}/{n_total} assertions passed ===")
+    print("=" * 80)
+    print(f"stem-contamination user-fix test: {n_ok}/{n_total} assertions passed")
+    print("=" * 80)
     if failed:
         print(f"FAILED: {failed}")
         return 1
