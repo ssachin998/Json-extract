@@ -359,9 +359,191 @@ documented in `chapter_completeness.json.phase2_pending_anchors`:
    `S_PASS` / `RESCUE` / `RECOVER` / `DRAIN_*` labels so consumers
    can filter by exact pass-of-origin without re-reading `_prov`.
 5. **Multi-subject validation command** (Phase 4): a
-   `tools/test_full_book_split.py` that walks all 33 PSY chapters
+   `tools/full_book_split.py` that walks all 33 PSY chapters
    and runs the per-chapter rubric in §4.4 against all of them in
    one go. Currently the rubric is hand-rolled per chapter.
+
+---
+
+## 7. Phase 4 — provenance_notes cleanup + multi-subject validation command
+
+**Commit:** `<phase4>` (this branch, on top of `0447184`).
+**Date:** 2026-08-08.
+
+The Phase 1 report §9 + this report §5 both deferred two pieces of
+follow-on work: making `provenance_notes` a per-field provenance
+map (so a consumer can see exactly which pass contributed which
+field), and building the one-command multi-subject validation
+script. **Phase 4 lands both** in a single additive commit.
+
+### 7.1 What Phase 4 changes
+
+#### `split_outputs.py` (~120 lines changed)
+
+1. **New `_collect_provs(rec)` return shape** (4-tuple):
+   `(field_provenance, populated_passes, model_q_no, disagree)`.
+   - `field_provenance`: `{field: prov_label or None}` for every
+     field in the canonical list (`question_text`, `options`,
+     `correct_option`, `solution_text`, `tables`). A field with
+     a loop-written label AND a non-empty value gets the label;
+     a field with a label whose value was later cleared by a
+     sweep gets `None` (the "stale label" case).
+   - `populated_passes`: deduped, sorted list of pass labels
+     whose field has content right now. Stale labels (loop
+     wrote the label then a sweep cleared the field) are
+     filtered out — they no longer inflate
+     `pass_provenance_summary` in `chapter_completeness.json`.
+2. **`q_no_anchors.field_provenance`**: the new canonical
+   per-field map. Always present in every record's
+   `q_no_anchors`, even for records with no `_prov` dict
+   (all 5 fields = `None` in that case — consistent shape,
+   no surprise `KeyError` on the consumer side).
+3. **`q_no_anchors.provenance_notes`**: the deduped, sweep-
+   filtered pass list. Pre-Phase-4 this was a mirror of
+   `model_q_no_provs`; now it carries the Phase-4
+   "only-populated-fields" semantics.
+4. **`q_no_anchors.model_q_no_provs`** is kept as a back-compat
+   alias pointing at the same list as `provenance_notes`.
+   Existing consumers reading the legacy key see no change.
+5. **Row builders** (`_build_question_row`,
+   `_build_answer_row`, `_build_solution_row`) read from
+   `q_no_anchors.field_provenance` for their `*_prov`
+   columns (`question_text_prov`, `options_prov`,
+   `correct_option_prov`, `solution_prov`, `tables_prov`).
+   A field cleared by a later sweep now correctly reports
+   `None` in the row's `*_prov` column, not the stale label.
+6. **`pass_provenance_summary`** in
+   `chapter_completeness.json` now reads from
+   `provenance_notes` (the new deduped, sweep-filtered list)
+   — a stale prov label does not inflate the chapter's
+   pass counts.
+
+#### `tools/full_book_split.py` (NEW, 380 lines)
+
+A CLI that walks every chapter under
+`data/split/{subject}/{chapter_id}/` and runs the 7-rubric
+check from §4.4 against all of them in one pass. Exits 0 on
+all-pass, 1 on any failure.
+
+```bash
+# Default: scan ./qbank_output/data/split
+python3 tools/full_book_split.py
+
+# One subject only (e.g. while PSY is still rolling out)
+python3 tools/full_book_split.py --subject PSY
+
+# JSON output for CI / dashboards
+python3 tools/full_book_split.py --json
+```
+
+The 7 rubric checks (each pure-Python, no Gemini / poppler):
+
+| Rubric | What it proves |
+|---|---|
+| 1. `check_files_exist` | All 7 split files exist in the chapter dir |
+| 2. `check_grade_values` | `q_id_grade_counts` has only the 4 documented grades |
+| 3. `check_grade_sum` | `q_id_grade_counts` sums to `question_records` |
+| 4. `check_phase2_pending` | `phase2_pending_anchors` lists only `ocr_stem_match` + `ocr_solution_header_match` |
+| 5. `check_extraction_status` | `extraction_status_counts` has only COMPLETE + INCOMPLETE |
+| 6. `check_qid_set_consistency` | questions / answers / solutions.jsonl have identical q_id sets |
+| 7. `check_unresolved_qids` | `unresolved_qid_q_nos` is a sorted list of unique ints |
+
+### 7.2 New tests
+
+| Test | What it proves | Assertions |
+|---|---|---|
+| `tools/test_phase4_provenance.py` (NEW) | `_collect_provs` 4-tuple, sweep-filtered `provenance_notes`, per-field `field_provenance` map, row builders read from `field_provenance`, `pass_provenance_summary` filters stale labels, anchorless-dropped fragments surface as empty `provenance_notes` | **38/38** |
+| `tools/test_phase4_full_book_split.py` (NEW) | Builds a synthetic 33-Psych + 1-Med chapter set, proves every rubric catches its own failure mode, `--subject` filter works, `--json` output is valid JSON with the right shape, exit code is 0 on all-pass and 1 on any failure | **29/29** |
+
+### 7.3 Phase 4 test results (all suites)
+
+```
+$ python3 tools/test_phase4_provenance.py
+Phase 4 (a) provenance_notes test: 38/38 assertions passed
+
+$ python3 tools/test_phase4_full_book_split.py
+Phase 4 (b) full-book split test: 29/29 assertions passed
+
+# All 12 suites (Phase 1 + 2 + 3 + 4):
+test_contamination_root_cause.py                17/17
+test_phase2_anchors.py                          31/31
+test_phase4_provenance.py (NEW)                 38/38
+test_phase4_full_book_split.py (NEW)            29/29
+test_psy007_merge_q23_q26_phantom.py            29/29
+test_psy007_orphan_gate.py                      12/12
+test_psy007_postfix_e2e.py                      25/25
+test_psy007_stem_contamination_pre_existing.py  20/20
+test_rescue_page_routing.py                     42/42
+test_rescue_routing_integration.py              12/12
+test_split_psy007_real_case.py                  17/17
+run_split_psy007_synthetic.py                   22/22
+                                              -----
+TOTAL: 12 suites, 294/294 assertions
+       (was 10 suites / 227 / 227 before Phase 4;
+        +2 suites, +67 assertions, zero regression)
+```
+
+Zero regression. Phase 4 is purely additive:
+  * Every existing field on `q_no_anchors` (`model_q_no_provs`,
+    etc.) is preserved (alias or unchanged).
+  * Every existing rubric check on per-chapter split files is
+    preserved (the new `tools/full_book_split.py` is the
+    one-command version of the hand-rolled §4.4 shell loop).
+  * The split layer is still strictly observation-only: the
+    master `data/questions.jsonl` and `data/by_chapter/*.jsonl`
+    are NEVER touched.
+
+### 7.4 Why Phase 4 is the right next step
+
+Before Phase 4, a consumer reading
+`data/split/PSY/PSY-007/questions.jsonl` could see a
+`provenance_notes` field on every record but had no way to map
+it back to which field it described. The pre-Phase-4
+`provenance_notes` was just a deduped list of every prov label
+the loop wrote — including stale labels whose fields had been
+cleared by the integrity sweep. Two practical problems:
+  * A record whose stem was quarantined by the integrity sweep
+    (e.g. a contaminated stem in the run-7 audit class) had
+    `provenance_notes` containing `Q_PASS` even though the
+    `question_text` was now `None`. Consumers filtering by
+    `Q_PASS in provenance_notes` got false positives.
+  * A consumer wanting to know "which pass contributed the
+    answer" had to look at `correct_option` on the record +
+    `correct_option_prov` on the answer row, and trust the
+    two stayed in sync (they did, but it was a hand-tracked
+    contract).
+
+Phase 4 fixes both. `q_no_anchors.field_provenance` is the
+single source of truth: read it once, you know exactly which
+pass contributed every populated field. `provenance_notes`
+is the deduped pass list, filtered to only passes whose field
+has content. The row builders' `*_prov` columns read from
+`field_provenance` so a sweep-cleared field reports `None`
+in the row, not the stale label.
+
+The multi-subject validation command completes the
+"after-every-deploy" loop: run the pipeline on Railway,
+redeploy, then run `python3 tools/full_book_split.py`
+to verify every chapter's split files pass the 7-rubric
+check. Exits 0 on all-pass, 1 on any failure, with a
+per-chapter + per-subject + grand-total summary printer.
+`--json` mode gives a machine-readable form for CI.
+
+### 7.5 Phase 4 sign-off
+
+The rollout is Phase 4-complete when:
+  1. ✅ All 10 → 12 test suites pass (294/294 assertions)
+  2. ✅ `q_no_anchors.field_provenance` is present on every
+     record in every `data/split/{subject}/{chapter_id}/*.jsonl`
+  3. ✅ `q_no_anchors.provenance_notes` is the deduped,
+     sweep-filtered pass list
+  4. ✅ `pass_provenance_summary` in every
+     `chapter_completeness.json` matches the new
+     "only-populated-fields" semantics
+  5. ✅ `tools/full_book_split.py --root /app/qbank_output`
+     exits 0 on a clean PSY set
+  6. ✅ `--json` output is valid JSON with the right shape
+     (total/passed/failed/subjects/chapters)
 
 ---
 

@@ -362,35 +362,107 @@ def _grade_record(anchors: dict, has_neighbor_run: bool = False,
 # 4. Per-record provenance collection
 # ---------------------------------------------------------------------------
 
-def _collect_provs(rec: dict) -> tuple:
-    """Returns (model_q_no_provs, model_q_no, disagree).
+# Canonical list of fields whose provenance is tracked per-record. The
+# extraction loop stores its per-field label in rec["_prov"][FIELD];
+# _collect_provs below reads that dict. Tables ride on question_text
+# (Q-pass renders them) or solution_text (S-pass renders them) -- the
+# list below covers everything the row builders expose a *_prov column
+# for.
+_PROV_FIELDS = (
+    "question_text",   # Q_PASS / Q_RETRY / RESCUE / RECOVER / DRAIN_Q / OCR_Q
+    "options",         # Q_PASS / Q_RETRY / RESCUE / RECOVER / DRAIN_Q
+    "correct_option",  # A_PASS / A_RETRY / RESCUE / RECOVER / DRAIN_A
+    "solution_text",   # S_PASS / S_RETRY / RESCUE / RECOVER / DRAIN_S / OCR_S
+    "tables",          # Q_PASS / S_PASS / Q_RETRY / S_RETRY
+)
 
-    The existing pipeline's per-field _prov dict stores a string per
-    populated field -- the values are typically 'Q_PASS', 'A_PASS',
-    'S_PASS', 'Q_RETRY', 'A_RETRY', 'S_RETRY', 'RESCUE', 'RECOVER',
-    'DRAIN_Q', 'OCR_S', 'DRAIN_S', etc. This is the ONLY deterministic
-    way to know which extraction pass a record's content came from,
-    and it's what the design's q_no_anchors.provenance_notes vector
-    surfaces. Two passes that disagree on q_no is the disagreement
-    signal (rare in the existing pipeline because the run-18 GUARD
-    already filters unverified q_nos to orphans)."""
-    provs: list = []
+
+def _collect_provs(rec: dict) -> tuple:
+    """Returns (field_provenance, sorted_pass_list, model_q_no, disagree).
+
+    field_provenance: {field: prov_label or None} for every field in
+        _PROV_FIELDS. A field is "None" when the extraction loop never
+        wrote a label for it (e.g. solution_text was never set, or
+        options came from the Q_PASS and the dict has no "options" key).
+        A field is the prov label string when the loop wrote one
+        (Q_PASS, A_PASS, S_PASS, Q_RETRY, A_RETRY, S_RETRY, RESCUE,
+        RECOVER, DRAIN_Q, DRAIN_S, OCR_S, CRITIQUE, etc.). This is
+        the ONLY deterministic way to know which extraction pass a
+        record's content came from -- it powers both the per-row
+        *_prov columns AND the q_no_anchors.field_provenance /
+        provenance_notes vectors a consumer can read.
+
+    sorted_pass_list: deduped, sorted list of the prov labels whose
+        field is actually populated (i.e. has both a prov label AND
+        a non-empty value). This is what the per-chapter
+        pass_provenance_summary counts and what provenance_notes
+        mirrors. A field with a prov label but no value (the loop
+        wrote "_prov"=X then later cleared the value) is dropped
+        here -- we only surface passes that actually contributed
+        content to the record.
+
+    model_q_no: the integer the extraction loop emitted (or `qn` as
+        fallback when the model emitted None).
+
+    disagree: not currently inferable from the per-field provs (the
+        pass name is a label, not a q_no). The existing pipeline
+        captures cross-pass disagreement via the
+        unconfirmed_discontinuous_qno guard, which is observable
+        from the orphans list (not from chapter_records). The caller
+        threads that signal through reconcile_qids -> write_split_outputs
+        via `extra_reasons`. Always False here; kept in the tuple so
+        _build_q_no_anchors doesn't have to change shape.
+    """
     prov = rec.get("_prov") or {}
-    for _field, label in prov.items():
-        if label:
-            provs.append(str(label))
+    field_provenance: dict = {}
+    populated_passes: list = []
+    for field in _PROV_FIELDS:
+        label = prov.get(field)
+        if label and _field_has_content(rec, field):
+            # The loop wrote a label AND the field has content right
+            # now -> this pass actually contributed. Surface both
+            # in field_provenance (so the row's *_prov column shows
+            # the contributing label) and in populated_passes (so
+            # the chapter's pass_provenance_summary counts it).
+            field_provenance[field] = str(label)
+            populated_passes.append(str(label))
+        else:
+            # Either the loop never wrote a label, or it wrote one
+            # but a later sweep cleared the field's content. Either
+            # way, the field is not currently contributed to by any
+            # pass -> None in field_provenance, and no contribution
+            # to populated_passes. A row reader sees *_prov = None
+            # (matching the empty value); a chapter reader sees no
+            # stale pass in the summary.
+            field_provenance[field] = None
     # Fall back to the model-emitted q_no (always the integer)
     try:
         model_q_no = int(rec.get("q_no")) if rec.get("q_no") is not None else None
     except (TypeError, ValueError):
         model_q_no = None
-    # Disagreement: not currently inferable from the per-field provs (the
-    # pass name is a label, not a q_no). The existing pipeline captures
-    # cross-pass disagreement via the unconfirmed_discontinuous_qno
-    # guard, which is observable from the orphans list (not from
-    # chapter_records). The caller threads that signal through
-    # reconcile_qids -> write_split_outputs via `extra_reasons`.
-    return sorted(set(provs)), model_q_no, False
+    return (field_provenance, sorted(set(populated_passes)),
+            model_q_no, False)
+
+
+def _field_has_content(rec: dict, field: str) -> bool:
+    """True when the field has a non-empty value on this record.
+
+    Used by _collect_provs to filter prov labels whose field was later
+    cleared (e.g. integrity sweep stripped a contaminated stem but
+    left the "_prov" label in place -- that label is stale and must
+    NOT inflate the per-chapter pass_provenance_summary)."""
+    if field == "question_text":
+        return bool((rec.get("question_text") or "").strip())
+    if field == "options":
+        opts = rec.get("options")
+        return bool(opts) and isinstance(opts, dict) and len(opts) > 0
+    if field == "correct_option":
+        return bool((rec.get("correct_option") or "").strip())
+    if field == "solution_text":
+        return bool((rec.get("solution_text") or "").strip())
+    if field == "tables":
+        return bool(rec.get("tables"))
+    return False
 
 
 def _build_q_no_anchors(rec: dict, qn: int, anchors: dict,
@@ -411,14 +483,39 @@ def _build_q_no_anchors(rec: dict, qn: int, anchors: dict,
       * neighbor_run = {size, first, last, near_chapter_max}
       * carry_forward_origin = {from_window (list), cut_part}
     Both dicts are optional; missing observations stay absent.
+
+    Phase-4: the per-field provenance map (`field_provenance`) and
+    the deduped pass list (`provenance_notes`) are both derived from
+    _collect_provs's new return shape. A consumer reading
+    `q_no_anchors.field_provenance` can see the exact extraction
+    pass every populated field came from (Q_PASS, A_PASS, S_PASS,
+    Q_RETRY, A_RETRY, S_RETRY, RESCUE, RECOVER, DRAIN_Q, DRAIN_S,
+    OCR_S, CRITIQUE, ...). `provenance_notes` is the short-form
+    mirror (sorted, deduped pass list) the design spec calls for.
+    The legacy `model_q_no_provs` key is kept for backward
+    compatibility -- it now points at the same deduped pass list
+    `provenance_notes` uses.
     """
-    provs, model_q_no, disagree = _collect_provs(rec)
+    field_prov, populated_passes, model_q_no, disagree = _collect_provs(rec)
     if model_q_no is None:
         model_q_no = qn
     out = {
         "model_q_no": int(model_q_no),
-        "model_q_no_provs": provs,
+        "model_q_no_provs": populated_passes,  # back-compat alias
         "model_q_no_disagree": bool(disagree),
+        # Phase-4: per-field provenance map (question_text/options/
+        # correct_option/solution_text/tables -> prov label or None).
+        # Powers both the per-row *_prov columns and the
+        # q_no_anchors field-level audit. Always present (empty
+        # dict for a record with no prov info -- consistent
+        # shape, no surprise KeyError on the consumer side).
+        "field_provenance": field_prov,
+        # Phase-4: the deduped sorted pass list whose field is
+        # actually populated. A stale prov label (loop wrote the
+        # label then a later sweep cleared the content) is
+        # filtered out, so this list never inflates the per-chapter
+        # pass_provenance_summary.
+        "provenance_notes": populated_passes,
     }
     for name, payload in anchors.items():
         if payload:
@@ -448,7 +545,6 @@ def _build_q_no_anchors(rec: dict, qn: int, anchors: dict,
             "from_window": list(carry_origin_obs.get("window_pages") or []),
             "cut_part": carry_origin_obs.get("cut_part"),
         }
-    out["provenance_notes"] = provs[:]  # short-form mirror for the design spec
     return out
 
 
@@ -722,6 +818,13 @@ def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
         (image_files.get("question") or [])
     ]
     tables = rec.get("tables") or []
+    # Phase-4: read per-field prov from q_no_anchors.field_provenance
+    # (the canonical, sweep-filtered map) instead of rec["_prov"]
+    # directly. A field that was prov'd by the loop but later had its
+    # content cleared (e.g. integrity sweep stripped a contaminated
+    # stem) now correctly reports None in the row's *_prov column.
+    qa = rec.get("q_no_anchors") or {}
+    fp = qa.get("field_provenance") or {}
     out = {
         "q_id": q_id,
         "chapter_id": chapter_id,
@@ -729,13 +832,19 @@ def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
         "chapter_no": int(chapter_no),
         "q_no": int(qn),
         "q_id_grade": rec.get("q_id_grade", "PROVISIONAL"),
-        "q_no_anchors": rec.get("q_no_anchors", {}),
+        "q_no_anchors": qa,
         "question_text": rec.get("question_text") or "",
         "options": option_rows,
         "question_images": question_images,
         "tables": tables,
         "source_pages": _source_pages_for(qn, rec.get("_qn_source_pages") or {}),
     }
+    if fp.get("question_text"):
+        out["question_text_prov"] = fp["question_text"]
+    if fp.get("options"):
+        out["options_prov"] = fp["options"]
+    if fp.get("tables"):
+        out["tables_prov"] = fp["tables"]
     out["extraction_status"], missing = _classify_question_completeness(rec)
     if missing:
         out["missing_fields"] = missing
@@ -746,7 +855,8 @@ def _build_answer_row(qn: int, rec: dict, chapter_id: str, subject: str,
                       chapter_no: int) -> dict:
     q_id = f"{subject}-{chapter_no:03d}-{int(qn):03d}"
     correct = rec.get("correct_option")
-    prov = (rec.get("_prov") or {}).get("correct_option")
+    qa = rec.get("q_no_anchors") or {}
+    fp = qa.get("field_provenance") or {}
     out = {
         "q_id": q_id,
         "chapter_id": chapter_id,
@@ -754,9 +864,9 @@ def _build_answer_row(qn: int, rec: dict, chapter_id: str, subject: str,
         "chapter_no": int(chapter_no),
         "q_no": int(qn),
         "correct_option": correct,
-        "correct_option_prov": prov,
+        "correct_option_prov": fp.get("correct_option"),
         "q_id_grade": rec.get("q_id_grade", "PROVISIONAL"),
-        "q_no_anchors": rec.get("q_no_anchors", {}),
+        "q_no_anchors": qa,
         "source_pages": _source_pages_for(qn, rec.get("_qn_source_pages") or {}),
     }
     out["extraction_status"], missing = _classify_answer_completeness(rec)
@@ -773,7 +883,8 @@ def _build_solution_row(qn: int, rec: dict, chapter_id: str, subject: str,
         {"file": f, "source_pages": []} for f in
         (image_files.get("solution") or [])
     ]
-    prov = (rec.get("_prov") or {}).get("solution_text")
+    qa = rec.get("q_no_anchors") or {}
+    fp = qa.get("field_provenance") or {}
     out = {
         "q_id": q_id,
         "chapter_id": chapter_id,
@@ -783,9 +894,10 @@ def _build_solution_row(qn: int, rec: dict, chapter_id: str, subject: str,
         "solution_text": rec.get("solution_text") or "",
         "tables": tables,
         "solution_images": sol_imgs,
-        "solution_prov": prov,
+        "solution_prov": fp.get("solution_text"),
+        "tables_prov": fp.get("tables"),
         "q_id_grade": rec.get("q_id_grade", "PROVISIONAL"),
-        "q_no_anchors": rec.get("q_no_anchors", {}),
+        "q_no_anchors": qa,
         "source_pages": _source_pages_for(qn, rec.get("_qn_source_pages") or {}),
     }
     out["extraction_status"], missing = _classify_solution_completeness(rec)
@@ -1033,7 +1145,12 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
             extraction_counts[es] += 1
         # pass_summary: count each (q_id, prov_label) pair exactly once,
         # so an A_PASS and a Q_PASS on the same q_id each count once.
-        for prov_label in (r.get("q_no_anchors") or {}).get("model_q_no_provs") or []:
+        # Phase-4: read from provenance_notes (the deduped, sweep-filtered
+        # list of passes whose field is actually populated). The legacy
+        # model_q_no_provs alias still works, but provenance_notes is the
+        # canonical key going forward.
+        prov_labels = (r.get("q_no_anchors") or {}).get("provenance_notes") or []
+        for prov_label in prov_labels:
             if (qid, prov_label) not in seen_prov_pairs:
                 seen_prov_pairs.add((qid, prov_label))
                 pass_summary[prov_label] = pass_summary.get(prov_label, 0) + 1
