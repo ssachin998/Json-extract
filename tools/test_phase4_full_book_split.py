@@ -119,10 +119,9 @@ def _build_clean_chapter(split_root: Path, subject: str, chapter_no: int,
                                           "INCOMPLETE": 0},
             "pass_provenance_summary": {"Q_PASS": n_records, "A_PASS": n_records,
                                          "S_PASS": n_records},
-            "phase2_pending_anchors": {
-                "ocr_stem_match": "design doc §3.1: only populated when text layer was garbled",
-                "ocr_solution_header_match": "design doc §3.1: only populated when text layer was garbled",
-            },
+            # Phase 5: all 4 anchor families populated by default,
+            # so the pending dict is empty.
+            "phase2_pending_anchors": {},
         })
     return chapter_dir
 
@@ -250,11 +249,14 @@ def main():
     # Rebuild C3
     _build_clean_chapter(split_root, "PSY", 3, 13)
 
-    # C4: phase2_pending_anchors still lists neighbor_run (stale)
+    # C4: phase2_pending_anchors is non-empty (Phase 5 contract:
+    # the dict must be {} for a clean chapter -- all 4 anchor
+    # families are populated by default). Inject a stale key to
+    # prove the rubric catches it.
     comp_path = psy_chapters[3] / "chapter_completeness.json"
     comp = json.loads(comp_path.read_text())
     comp["phase2_pending_anchors"]["neighbor_run"] = \
-        "stale: Phase 2 lifted this"
+        "stale: Phase 2 lifted this (and Phase 5 lifted the OCR anchors too)"
     comp_path.write_text(json.dumps(comp, indent=2))
     result = subprocess.run(
         [sys.executable, str(TOOL), "--root", str(split_root)],

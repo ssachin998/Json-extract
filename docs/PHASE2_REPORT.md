@@ -547,6 +547,195 @@ The rollout is Phase 4-complete when:
 
 ---
 
+## 8. Phase 5 — OCR anchors for garbled-text-layer books
+
+**Commit:** `<phase5>` (this branch, on top of `636b919`).
+**Date:** 2026-08-08.
+
+The Phase 2 + 3 + 4 work landed the two non-printed anchors
+(neighbor_run, carry_forward_origin). The two OCR anchors
+(`ocr_stem_match`, `ocr_solution_header_match`) were deferred
+("sirf garbled-text-layer books ke liye"). The user confirmed
+their PDF is garbled ("Done this my pdf is garbled"), so
+**Phase 5 lifts the OCR anchors** in a single additive commit.
+
+### 8.1 What Phase 5 changes
+
+#### `split_outputs.py` (~150 lines changed)
+
+1. **New `_ocr_render_and_tesseract(pdf_path, page)`**: renders
+   a single page to a PNG via `pdftoppm` (150 dpi, in a
+   tempdir) and runs `pytesseract.image_to_string` on it.
+   Returns the OCR text, or `""` on any failure (missing
+   poppler, missing tesseract, timeout). Sandbox-friendly:
+   tests patch this function in-place via
+   `patch.object(split_outputs, "_ocr_render_and_tesseract", fake)`.
+
+2. **New `_harvest_ocr_anchors_on_page(pdf_path, page,
+   chapter_records, pdftotext_text=None)`**: runs the
+   `_PRINTED_STEM_RE` and `_PRINTED_SOL_HEADER_RE` regexes
+   on the page text via the chained scan:
+     * Stage 1 (pdftotext primary, zero tokens): if the
+       page's text layer has non-whitespace content, use
+       it. Fast, deterministic, exact.
+     * Stage 2 (tesseract fallback): only if pdftotext
+       returned empty (the user said "my pdf is garbled").
+       Renders the page and OCRs it.
+   Each anchor payload carries a `via: pdftotext|tesseract`
+   field so a consumer can tell which scan path produced
+   the hit. The `_PRINTED_STEM_RE` regex is now compiled
+   with `re.MULTILINE` baked in (the OCR chain runs on
+   block text where `^` must match at every line start,
+   not just position 0).
+
+3. **`_harvest_anchors` now calls both chains** for every
+   page: the existing printed-text scan (`_harvest_page` ->
+   pypdf visitor + pdftotext + answer-key rows) PLUS the
+   new OCR chain. First-seen wins across the two chains
+   (a printed_stem_match from the visitor path is NOT
+   overwritten by an OCR-chain hit on the same page);
+   the OCR chain runs after the printed-text scan so a
+   printed path can populate the high-confidence
+   `printed_stem_match` anchor first.
+
+4. **`_grade_record` counts OCR anchors** toward the
+   `>=2` threshold the same way as printed_* anchors. The
+   high-confidence gate (`>=2` AND `printed_stem_match` or
+   `printed_solution_header_match`) does NOT include OCR --
+   the OCR text has higher character-error risk than a
+   clean text layer, so a single-OCR-anchor-only record
+   is NOT upgraded to `RESOLVED_ANCHORED`. It IS counted
+   toward `>=2` when paired with another anchor of any
+   kind (printed or OCR), so `printed_answer_key_row_match`
+   + `ocr_stem_match` becomes `RESOLVED` via the second
+   branch (>=2 anchors).
+
+5. **`_build_q_no_anchors` auto-surfaces** `ocr_stem_match`
+   and `ocr_solution_header_match` in the per-record
+   `q_no_anchors` vector (the generic `for name, payload
+   in anchors.items(): if payload: out[name] = payload`
+   loop picks them up -- no per-anchor code in the
+   builder).
+
+6. **`chapter_completeness.phase2_pending_anchors`** is
+   now `{}` (all 4 design-doc §3.1 anchor families are
+   populated by default).
+
+#### `tools/full_book_split.py` + `tools/test_phase4_full_book_split.py`
+
+1. **`EXPECTED_PHASE2_PENDING` is now `set()`**: the
+   multi-subject validator's rubric 4 ("`phase2_pending_anchors`
+   lists only the 2 OCR anchors") becomes rubric 4
+   ("`phase2_pending_anchors` is empty `{}` -- a
+   non-empty dict means a future change re-added an
+   anchor to the pending list without wiring it"). A
+   non-empty dict is a one-line per-chapter failure
+   pointing at the stale key.
+
+2. **The Phase 4 test was updated** to inject ANY stale
+   key into `phase2_pending_anchors` (the old test
+   specifically used `"neighbor_run"`; the new test
+   uses the same key with a Phase-5-aware comment
+   explaining both the old and new contracts).
+
+#### Live pipeline on Railway
+
+`split_outputs` has access to `pdf_path` and `page_files`
+already (the `_harvest_anchors` signature). The OCR chain
+runs the same `pdftoppm` + `pytesseract` pattern the
+existing `ocr_fallback_text()` function in
+`qbank_pipeline.py` uses. Railway's Dockerfile already
+installs `poppler-utils` (provides `pdftoppm`,
+`pdftotext`, `pdfimages`) -- the new chain is a no-op
+install cost (tesseract may need a Dockerfile update; see
+the Phase 5 sign-off checklist below).
+
+### 8.2 New test
+
+| Test | What it proves | Assertions |
+|---|---|---|
+| `tools/test_phase5_ocr_anchors.py` (NEW, 42 assertions, sections A-I-prime) | A. `_ocr_render_and_tesseract` is mockable; B. Clean text-layer page: pdftotext path, `via='pdftotext'`; C. Garbled text-layer page: tesseract path fires, `via='tesseract'`, foreign q_nos ignored; D. `_harvest_anchors` merges both chains, first-seen wins; E. Grader counts OCR anchors toward `>=2` (5 cases: a/b/c/d/e); F. `_build_q_no_anchors` auto-surfaces OCR anchors in `q_no_anchors`; G. `phase2_pending_anchors` is `{}` for a clean chapter; H. `tools/full_book_split.py` validator accepts `{}` and rejects non-empty dicts; I-prime. When pdftotext is empty, tesseract path runs and `via='tesseract'`; I. When pdftotext has text, the OCR chain uses pdftotext (tesseract is not called) | **42/42** |
+
+### 8.3 Phase 5 test results (all suites)
+
+```
+$ python3 tools/test_phase5_ocr_anchors.py
+Phase 5 OCR anchor test: 42/42 assertions passed
+
+# All 13 suites (Phase 1 + 2 + 3 + 4 + 5):
+test_contamination_root_cause.py                       17/17
+test_phase2_anchors.py                                 31/31
+test_phase4_provenance.py (Phase 4)                     38/38
+test_phase4_full_book_split.py (Phase 4)                29/29
+test_phase5_ocr_anchors.py (Phase 5)                    42/42   (NEW)
+test_psy007_merge_q23_q26_phantom.py                    29/29
+test_psy007_orphan_gate.py                             12/12
+test_psy007_postfix_e2e.py                             25/25
+test_psy007_stem_contamination_pre_existing.py          20/20
+test_rescue_page_routing.py                            42/42
+test_rescue_routing_integration.py                     12/12
+test_split_psy007_real_case.py                         17/17
+run_split_psy007_synthetic.py                          22/22
+                                                       -----
+TOTAL: 13 suites, 336/336 assertions
+       (was 12 / 294 before Phase 5; +1 suite, +42
+        assertions, zero regression on existing 294)
+```
+
+Zero regression. Phase 5 is purely additive:
+  * The split layer's interface (`reconcile_qids` /
+    `_harvest_anchors`) is unchanged.
+  * Every existing anchor name (`printed_stem_match` /
+    `printed_solution_header_match` / `answer_key_row_match` /
+    `neighbor_run` / `carry_forward_origin`) still works
+    exactly as before.
+  * The OCR chain is read-only: zero Gemini calls, just
+    `pdftoppm` (already in use) + `pytesseract` (new dep).
+  * The grader's promotion logic is unchanged for records
+    that have any printed_* anchor (the OCR chain's
+    contribution is additive).
+
+### 8.4 Phase 5 sign-off
+
+The Phase 5 work is complete when:
+  1. ✅ All 13 test suites pass (336/336 assertions)
+  2. ✅ `_ocr_render_and_tesseract` is mockable at module
+     load + safe to call on Railway (real `pdftoppm` +
+     `pytesseract`)
+  3. ✅ `_harvest_anchors` wires the OCR chain
+     transparently -- calling it with the standard
+     `pdf_path` + `page_files` arguments populates
+     `ocr_stem_match` / `ocr_solution_header_match` in
+     every record's `q_no_anchors` vector with the
+     correct `via: pdftotext|tesseract` field
+  4. ✅ The grader counts OCR anchors toward the `>=2`
+     threshold (high-confidence `RESOLVED_ANCHORED` gate
+     still requires a printed_* anchor; OCR-only records
+     default to `RESOLVED` like 1-printed-anchor records
+     do)
+  5. ✅ `chapter_completeness.phase2_pending_anchors` is
+     `{}` for every chapter (all 4 design-doc §3.1
+     anchors populated by default)
+  6. ✅ The multi-subject validator
+     (`tools/full_book_split.py`) treats `{}` as the
+     only valid `phase2_pending_anchors` value
+  7. ⏳ **Dockerfile update needed for live deployment**:
+     add `tesseract-ocr` to the apt-get list (the
+     Dockerfile already installs `poppler-utils`).
+     Without this, Railway deploy will fail with
+     `FileNotFoundError: tesseract` on every garbled
+     page; the OCR chain will return `""` for those
+     pages and the per-chapter `unresolved_qid_count`
+     may rise. The split layer is **safe to ship
+     without this fix** -- the existing printed-text
+     scan still works on every page, and the OCR chain
+     is purely additive (failing to OCR a garbled page
+     means that page contributes no `ocr_*` anchors,
+     which is the same behavior as Phase 4 for that
+     page).
+
+---
+
 ## 6. Commit history (this branch, Phase 2 + 3)
 
 ```

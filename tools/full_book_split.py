@@ -16,9 +16,14 @@ of them in one pass. The per-chapter rubric is:
        ({RESOLVED_ANCHORED, RESOLVED, PROVISIONAL, UNRESOLVED})
   3. q_id_grade_counts sums to question_records
        (i.e. every record is counted exactly once)
-  4. phase2_pending_anchors lists ONLY the two OCR anchors
-       (ocr_stem_match, ocr_solution_header_match) -- the design
-       doc's "what is still pending" list
+  4. phase2_pending_anchors is empty {} -- Phase 5 lifted the
+       two OCR anchors too (pdftotext primary, tesseract fallback
+       for garbled pages). All four design-doc §3.1 anchor families
+       (printed_stem_match / printed_solution_header_match /
+       ocr_stem_match / ocr_solution_header_match / answer_key_row_match)
+       are now populated by default for every chapter. A non-empty
+       `phase2_pending_anchors` is a sign a future change re-added
+       an anchor to the "pending" list without wiring it.
   5. extraction_status_counts has only COMPLETE + INCOMPLETE
   6. The three split files (questions/answers/solutions) have
        IDENTICAL q_id sets (a record in questions.jsonl MUST be
@@ -122,7 +127,7 @@ EXPECTED_SPLIT_FILES = (
 
 ALLOWED_GRADES = {"RESOLVED_ANCHORED", "RESOLVED", "PROVISIONAL", "UNRESOLVED"}
 ALLOWED_STATUS = {"COMPLETE", "INCOMPLETE"}
-EXPECTED_PHASE2_PENDING = {"ocr_stem_match", "ocr_solution_header_match"}
+EXPECTED_PHASE2_PENDING = set()  # Phase 5: all 4 anchors populated, dict is empty
 
 
 # ===========================================================================
@@ -185,17 +190,17 @@ def check_grade_sum(comp: dict) -> tuple:
 
 
 def check_phase2_pending(comp: dict) -> tuple:
-    """Rubric 4: phase2_pending_anchors lists ONLY the 2 OCR anchors
-    (neighbor_run + carry_forward_origin must NOT be listed any more --
-    Phase 2 lifted them)."""
+    """Rubric 4: phase2_pending_anchors is empty {}. Phase 5 lifted
+    the two OCR anchors too (pdftotext primary, tesseract fallback
+    for garbled pages). A non-empty dict means a future change
+    re-added an anchor to the 'pending' list without wiring it.
+    """
     pending = comp.get("phase2_pending_anchors") or {}
     actual = set(pending.keys())
     extra = actual - EXPECTED_PHASE2_PENDING
-    missing = EXPECTED_PHASE2_PENDING - actual
-    if extra or missing:
+    if extra:
         return False, (f"phase2_pending_anchors keys = {sorted(actual)}; "
-                       f"expected {sorted(EXPECTED_PHASE2_PENDING)} "
-                       f"(extra={extra}, missing={missing})")
+                       f"expected empty dict (extra={extra})")
     return True, ""
 
 

@@ -161,8 +161,14 @@ def _atomic_json_write(path: Path, obj: dict) -> None:
 #    evidence the existing extraction loop already trusts.
 # ---------------------------------------------------------------------------
 
+# re.MULTILINE baked in at compile time: the OCR chain runs on
+# block text (pdftotext output is a single multi-line string), so
+# `^` must match at every line start to find stems that aren't on
+# the first line. The compiled-pattern search-flag path doesn't
+# affect ^-behavior, so the flag has to be at compile time.
 _PRINTED_STEM_RE = re.compile(
-    r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-\u2013)]"
+    r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-\u2013)]",
+    re.MULTILINE,
 )
 _PRINTED_SOL_HEADER_RE = re.compile(
     r"Solution\s+to\s+Question\s+(\d{1,3})", re.IGNORECASE
@@ -196,6 +202,121 @@ def _pdftotext_page(pdf_path: str, true_page: int) -> str:
         return out.stdout or ""
     except Exception:
         return ""
+
+
+def _ocr_render_and_tesseract(pdf_path: str, true_page: int) -> str:
+    """OCR fallback for a single page when the text layer is empty /
+    garbled. Renders the page to a PNG via pdftoppm (150 dpi, in a
+    temp dir to keep the filesystem clean) and runs tesseract on
+    the resulting image via pytesseract.image_to_string.
+
+    Returns the OCR text (empty string on any failure -- the caller
+    treats an empty OCR result as "no anchors found on this page"
+    and the grader falls back to PROVISIONAL on the affected record).
+
+    Sandbox-friendly: tests mock this at module load (the existing
+    PIL/pytesseract stubs in tools/test_phase2_anchors.py +
+    test_phase4_provenance.py). On Railway the real pdftoppm +
+    tesseract binaries are installed by the same Dockerfile that
+    installs poppler-utils.
+    """
+    try:
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory(prefix="split_ocr_") as tmpdir:
+            prefix = str(Path(tmpdir) / "p")
+            try:
+                subprocess.run(
+                    ["pdftoppm", "-png", "-r", "150",
+                     "-f", str(true_page), "-l", str(true_page),
+                     str(pdf_path), prefix],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except Exception:
+                return ""
+            # pdftoppm names output files like "p-005.png" -- glob one.
+            pngs = sorted(Path(tmpdir).glob("p-*.png"))
+            if not pngs:
+                return ""
+            try:
+                from PIL import Image
+                import pytesseract
+                img = Image.open(pngs[0])
+                return pytesseract.image_to_string(img) or ""
+            except Exception:
+                return ""
+    except Exception:
+        return ""
+
+
+def _harvest_ocr_anchors_on_page(pdf_path: str, file_page: int,
+                                 chapter_records: dict,
+                                 pdftotext_text: str = None) -> dict:
+    """Run the printed_stem + solution_header regexes on a single
+    page via the OCR chain (pdftotext primary, tesseract fallback).
+    Returns {qn: {anchor_name: payload}} for the OCR hits.
+
+    Each payload carries a `via: pdftotext|tesseract` field so a
+    consumer reading the split record can tell which scan path
+    produced the hit. pdftotext is tried first (fast, exact when
+    the text layer is readable); tesseract runs ONLY when
+    pdftotext returns empty (garbled / scanned-only page).
+
+    Conservative gating: a hit counts only if its q_no is in
+    `chapter_records` (cross-chapter "Question N:" / "Solution to
+    Question N:" headers on the printed page are ignored here, the
+    same way the existing _harvest_page handles them).
+    """
+    found: dict = {}
+    qn_set = set(chapter_records)
+    # Stage 1: pdftotext (zero-token). If the text layer has any
+    # non-whitespace content, that's the entire harvest for this page.
+    if pdftotext_text is None:
+        pdftotext_text = _pdftotext_page(pdf_path, file_page)
+    if (pdftotext_text or "").strip():
+        text = pdftotext_text
+        via = "pdftotext"
+    else:
+        # Stage 2: tesseract OCR fallback. Garbled-page case.
+        text = _ocr_render_and_tesseract(pdf_path, file_page)
+        via = "tesseract"
+    if not text or not text.strip():
+        return found
+    # _PRINTED_STEM_RE is compiled with re.MULTILINE baked in (see
+    # the regex definition), so ^ matches at every line start -- the
+    # OCR chain runs on block text (pdftotext output is a single
+    # multi-line string) and needs to find stems that aren't on the
+    # first line of the page.
+    for m in _PRINTED_STEM_RE.finditer(text):
+        try:
+            qn = int(m.group(1))
+        except (TypeError, ValueError):
+            qn = None
+        if qn is None or qn not in qn_set:
+            continue
+        # Skip a "Solution to Question N:" line that happens to also
+        # match the stem regex (same logic as the printed path).
+        if re.match(r"\s*solution\s+to\s+question\s+\d", text[m.start():m.start()+40], re.I):
+            continue
+        found.setdefault(qn, {})["ocr_stem_match"] = {
+            "page": file_page,
+            "via": via,
+            "header_text": text[m.start():m.end()].strip()[:80],
+        }
+    for m in _PRINTED_SOL_HEADER_RE.finditer(text):
+        try:
+            qn = int(m.group(1))
+        except (TypeError, ValueError):
+            qn = None
+        if qn is None or qn not in qn_set:
+            continue
+        found.setdefault(qn, {})["ocr_solution_header_match"] = {
+            "page": file_page,
+            "via": via,
+            "header_text": text[m.start():m.end()].strip()[:80],
+        }
+    return found
 
 
 def _page_word_lines(pdf_path: str, file_page: int):
@@ -277,7 +398,30 @@ def _harvest_anchors(chapter_records: dict, qn_source_pages: dict,
     pages ONCE, reading each page's text layer (zero Gemini calls)
     and recording the strongest printed evidence found for each q_no.
     Pages come from page_files when given (the in-pipeline path),
-    else from qn_source_pages (the synthetic harness path)."""
+    else from qn_source_pages (the synthetic harness path).
+
+    Two scan chains run per page (user-confirmed Phase-5 design
+    "Both stages, chained"):
+
+      1. Printed-text scan: pypdf text visitor + pdftotext +
+         _ANSWER_KEY_ROW_RE. Cheap (zero Gemini tokens), exact
+         when the text layer is readable. Drives the
+         printed_stem_match / printed_solution_header_match /
+         answer_key_row_match anchor names.
+
+      2. OCR chain: pdftotext primary (zero-token), tesseract
+         fallback for pages whose text layer is empty/garbled.
+         Drives the ocr_stem_match / ocr_solution_header_match
+         anchor names. Each payload carries a `via: pdftotext|
+         tesseract` field. The OCR chain is read-only and adds no
+         Gemini calls -- it's poppler + tesseract on the local
+         machine (Railway Dockerfile already installs both).
+
+    First-seen wins across both chains (later pages don't overwrite
+    a confirmed anchor on an earlier page), so the final
+    per-qn_per_qn_anchor dict is the strongest evidence the chapter
+    has for each q_no.
+    """
     pages: list
     if page_files:
         pages = []
@@ -299,10 +443,19 @@ def _harvest_anchors(chapter_records: dict, qn_source_pages: dict,
         return {qn: {} for qn in chapter_records}
     per_qn: dict = {qn: {} for qn in chapter_records}
     for p in pages:
+        # Chain 1: printed-text scan (pypdf visitor + pdftotext).
         page_harvest = _harvest_page(pdf_path, p, chapter_records)
-        for qn, anchors in page_harvest.items():
-            for name, payload in anchors.items():
-                per_qn[qn].setdefault(name, payload)
+        # Chain 2: OCR chain (pdftotext primary, tesseract fallback).
+        # We pass the pdftotext text _harvest_page already read so
+        # the OCR chain doesn't pay for a second pdftotext subprocess.
+        pdftotext_text = _pdftotext_page(pdf_path, p)
+        ocr_harvest = _harvest_ocr_anchors_on_page(
+            pdf_path, p, chapter_records, pdftotext_text=pdftotext_text)
+        # Merge: first-seen wins across the two chains.
+        for source in (page_harvest, ocr_harvest):
+            for qn, anchors in source.items():
+                for name, payload in anchors.items():
+                    per_qn[qn].setdefault(name, payload)
     return per_qn
 
 
@@ -312,7 +465,7 @@ def _harvest_anchors(chapter_records: dict, qn_source_pages: dict,
 
 def _grade_record(anchors: dict, has_neighbor_run: bool = False,
                   has_carry_origin: bool = False) -> str:
-    """Map the printed anchors found for one record to a q_id_grade.
+    """Map the anchors found for one record to a q_id_grade.
 
     Phase-1 grading (printed anchors only):
       - RESOLVED_ANCHORED: >=2 printed anchors + at least one of the
@@ -331,11 +484,27 @@ def _grade_record(anchors: dict, has_neighbor_run: bool = False,
     from compute_carry()). Both flags come from the read-only
     chapter_anchor_observations passed by process_pdf -- no Gemini
     call, no behavior change to records that already have >=2 anchors.
+
+    Phase-5 upgrade: the two OCR anchor names
+    (ocr_stem_match / ocr_solution_header_match) count toward the
+    1/2+ threshold the same way as printed_* anchors. The high-
+    confidence "first 2" gate (printed_stem_match /
+    printed_solution_header_match) does NOT include OCR -- the OCR
+    payload's `via` field tells a consumer where the hit came from,
+    but a single-OCR-anchor-only record is NOT upgraded to
+    RESOLVED_ANCHORED (the OCR text has higher character-error
+    risk than a clean text layer). It IS counted toward the >=2
+    threshold when paired with another anchor of any kind (printed
+    or OCR), so a record with printed_answer_key_row_match +
+    ocr_stem_match becomes RESOLVED_ANCHORED via the second
+    branch (>=2 anchors) without the high-confidence gate.
     """
     matches = sum(bool(anchors.get(k)) for k in (
         "printed_stem_match",
         "printed_solution_header_match",
         "answer_key_row_match",
+        "ocr_stem_match",
+        "ocr_solution_header_match",
     ))
     if matches == 0:
         # Phase-2 promotion: zero printed anchors + a trusted run or a
@@ -1189,19 +1358,16 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
         "extraction_status_counts": extraction_counts,
         "pass_provenance_summary": pass_summary,
 
-        # Phase-2 plan: the two non-printed anchors from design doc §3.1
-        # are now populated by the read-only observation hooks in
-        # process_pdf (neighbor_run, carry_forward_origin). The OCR
-        # anchors are still pending (they only matter for books where
-        # the text layer is garbled; the live pipeline's OCR fallback
-        # already handles those pages and the split layer's printed-
-        # anchor scan is the dominant signal for MARROW/PSY-style
-        # books). Documented here so the next change knows what is
-        # still left to lift.
-        "phase2_pending_anchors": {
-            "ocr_stem_match": "design doc §3.1: only populated when text layer was garbled",
-            "ocr_solution_header_match": "design doc §3.1: only populated when text layer was garbled",
-        },
+        # Phase-2 plan completed: the two non-printed anchors from
+        # design doc §3.1 (neighbor_run, carry_forward_origin) are
+        # populated by the read-only observation hooks in process_pdf.
+        # Phase-5 completed: the two OCR anchors (ocr_stem_match,
+        # ocr_solution_header_match) are populated by the chained
+        # scan in _harvest_anchors (pdftotext primary, tesseract
+        # fallback for garbled pages). The phase2_pending_anchors
+        # dict is now empty -- every design-doc §3.1 anchor is
+        # populated by default for every chapter.
+        "phase2_pending_anchors": {},
     }
     _atomic_json_write(chapter_dir / "chapter_completeness.json", completeness)
     return completeness
