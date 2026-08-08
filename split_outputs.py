@@ -447,7 +447,16 @@ def reconcile_qids(chapter_records: dict, qn_source_pages: dict,
             if _record_mostly_empty(rec) and not anchors:
                 rec["q_id_grade"] = "UNRESOLVED"
                 rec["q_no_anchors"] = anchors_full
-                rec.setdefault("_unresolved_reason", "no_anchor_at_all")
+                # Distinguish Case 2 (solution survived, question gone)
+                # from the no-anchor empty record: Case 2 keeps the
+                # solution_text and is marked missing_question_for_solution
+                # so a master-data builder sees the explicit gap. The
+                # no-anchor empty record has nothing left and gets
+                # no_anchor_at_all.
+                if (rec.get("solution_text") or "").strip():
+                    rec["_unresolved_reason"] = "missing_question_for_solution"
+                else:
+                    rec["_unresolved_reason"] = "no_anchor_at_all"
                 unresolved[qn] = rec
                 continue
         # Default: keep as the graded record
@@ -464,16 +473,22 @@ def reconcile_qids(chapter_records: dict, qn_source_pages: dict,
     }
 
 
+
 def _record_mostly_empty(rec: dict) -> bool:
-    """True when the record has none of the four content fields. Used
-    to gate the "no_anchor_at_all" -> UNRESOLVED escalation (see
-    reconcile_qids)."""
-    return not any([
-        (rec.get("question_text") or "").strip(),
-        rec.get("options"),
-        rec.get("correct_option"),
-        (rec.get("solution_text") or "").strip(),
-    ])
+    """True when the record has no QUESTION-side content -- the
+    question stem is missing AND the options are missing (the answer
+    and solution are optional). Used to gate the "no_anchor_at_all"
+    -> UNRESOLVED escalation (see reconcile_qids) AND the Case 2
+    scenario (a record whose question is gone but whose solution
+    survived is a candidate for missing_question_for_solution).
+    A record with no stem, no options, no answer, and no solution
+    is the empty-class (no question ever extracted).
+    A record with no stem and no options but a non-empty solution
+    is the Case 2 class (solution-only phantom).
+    Both classes are UNRESOLVED per the design's Case 2 spec."""
+    has_stem = bool((rec.get("question_text") or "").strip())
+    has_options = bool(rec.get("options"))
+    return not (has_stem or has_options)
 
 
 # ---------------------------------------------------------------------------
@@ -481,11 +496,22 @@ def _record_mostly_empty(rec: dict) -> bool:
 #    (chapter, q_no) for the three split files, plus the support files.
 # ---------------------------------------------------------------------------
 
-def _source_pages_for(qn: int, qn_source_pages: dict) -> list:
-    sp = qn_source_pages.get(qn) or []
+def _source_pages_for(qn: int, qn_source_pages) -> list:
+    """Accept either a dict {qn: pages} (the live-pipeline shape) or
+    a per-record value (set/list/int, as stored on
+    rec["_qn_source_pages"] by write_split_outputs). Returns a sorted
+    list of unique int page numbers."""
+    if isinstance(qn_source_pages, dict):
+        sp = qn_source_pages.get(qn) or []
+    else:
+        sp = qn_source_pages or []
     if isinstance(sp, set):
-        return sorted(sp)
-    return sorted(int(p) for p in sp)
+        return sorted(int(p) for p in sp)
+    if isinstance(sp, (list, tuple)):
+        return sorted(int(p) for p in sp)
+    if isinstance(sp, int):
+        return [sp]
+    return []
 
 
 def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
@@ -799,19 +825,33 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
     _atomic_jsonl_write(chapter_dir / "image_manifest.jsonl", image_manifest_rows)
 
     # Completeness summary -- the master per-chapter report
+    # Per the design: q_id_grade is the SAME string across all three
+    # files for a given source question, so we count once per q_id
+    # (NOT once per (q_id, file) -- that would triple-count).
+    # extraction_status is per-row (per file) because the three files
+    # have different COMPLETE/INCOMPLETE semantics (a question can be
+    # COMPLETE in questions.jsonl but INCOMPLETE in solutions.jsonl).
     grade_counts = {g: 0 for g in ALLOWED_Q_ID_GRADES}
+    seen_qids = set()
     extraction_counts = {"COMPLETE": 0, "INCOMPLETE": 0}
+    pass_summary: dict = {}
+    seen_prov_pairs: set = set()
     for r in question_rows + answer_rows + solution_rows:
-        g = r.get("q_id_grade")
-        if g in grade_counts:
-            grade_counts[g] += 1
+        qid = r.get("q_id")
+        if qid not in seen_qids:
+            seen_qids.add(qid)
+            g = r.get("q_id_grade")
+            if g in grade_counts:
+                grade_counts[g] += 1
         es = r.get("extraction_status")
         if es in extraction_counts:
             extraction_counts[es] += 1
-    pass_summary: dict = {}
-    for r in question_rows + answer_rows + solution_rows:
+        # pass_summary: count each (q_id, prov_label) pair exactly once,
+        # so an A_PASS and a Q_PASS on the same q_id each count once.
         for prov_label in (r.get("q_no_anchors") or {}).get("model_q_no_provs") or []:
-            pass_summary[prov_label] = pass_summary.get(prov_label, 0) + 1
+            if (qid, prov_label) not in seen_prov_pairs:
+                seen_prov_pairs.add((qid, prov_label))
+                pass_summary[prov_label] = pass_summary.get(prov_label, 0) + 1
 
     completeness = {
         "chapter_id": chapter_id,
