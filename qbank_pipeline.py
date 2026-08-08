@@ -1427,12 +1427,21 @@ def find_incomplete_records(chapter_records, force_solution_qns=(), printed_solu
 def build_targeted_retry_prompt(incomplete_items, chapter_records,
                                 stem_only_qns=None):
     """Focused retry schema.  Tables must never be returned inside prose.
-    stem_only_qns (run-12): q_nos whose stem was contamination-blocked in a
-    previous round -- for these, ask for the STEM REGION ONLY (the text
-    between the printed question number and the first option label), never
-    the options/solution, and do NOT echo the (possibly contaminated)
-    existing text. This breaks the run-12 dead-end where retry kept returning
-    the same solution prose and the guard kept blocking it."""
+    stem_only_qns (run-12, hardened 2026-08-08):
+      q_nos whose stem was contamination-blocked in a previous round
+      (their record carries `_stem_suspect_reason`) -- for these, ask
+      for the STEM REGION ONLY (the text between the printed question
+      number and the first option label), never the options/solution,
+      and CRITICALLY do NOT echo the (possibly contaminated) existing
+      text. The legacy prompt echoed the existing stem in a "stem
+      begins: '...'" prefix, which BIASED the rescue model toward
+      re-paraphrasing the same solution prose -- the very thing the
+      contamination heuristic had just rejected. Suppressing the echo
+      in stem-only mode forces the model to look at the printed page
+      and return the actual stem region (or null when absent).
+      Other missing classes (answer, options, solution) keep the
+      existing text echo so the model has context for the missing
+      piece."""
     stem_only = set(stem_only_qns or ())
     lines = [
         "You already extracted most of this chapter from these SAME pages. Find ONLY the requested missing pieces.",
@@ -1445,19 +1454,37 @@ def build_targeted_retry_prompt(incomplete_items, chapter_records,
     ]
     for qn, missing in incomplete_items:
         rec = chapter_records[qn]
-        qtext = (rec.get("question_text") or "")[:120]
-        lines.append(f"Question {qn} (stem begins: {qtext!r}):")
+        # STEM-ONLY MODE: do NOT echo the existing (contaminated) text.
+        # The legacy behavior echoed "stem begins: '...'" which biased the
+        # model toward re-paraphrasing the same solution prose. For
+        # _stem_suspect_reason records the existing text is provably
+        # contaminated, so echo is the worst possible input. A real stem
+        # on the page is the ONLY acceptable return value.
+        in_stem_only = qn in stem_only
+        if not in_stem_only:
+            qtext = (rec.get("question_text") or "")[:120]
+            lines.append(f"Question {qn} (stem begins: {qtext!r}):")
+        else:
+            # Use a clear marker so the model can see the per-record
+            # mode and the model-side context (no echo) is unambiguous.
+            lines.append(f"Question {qn} (STEM-ONLY ASK -- do NOT echo the "
+                         f"prior suspect text; return ONLY the verbatim text "
+                         f"printed between the question number and option A):")
         if "question" in missing:
-            if qn in stem_only:
+            if in_stem_only:
                 # RUN-12: stem-region-only ask. The earlier broad ask kept
                 # returning the solution text; a tight region instruction
-                # cannot be satisfied by explanation prose.
+                # cannot be satisfied by explanation prose. Hardened 2026-08-08:
+                # the prompt also explicitly forbids the model from
+                # paraphrasing the surrounding solution, and instructs null
+                # when the region is empty (no hallucinated stems).
                 lines.append(
                     f"- Return ONLY q{qn}'s QUESTION STEM: the exact sentence(s) "
                     f"printed directly under the question number and ABOVE the "
                     f"option labels (A./B./C./D.). The stem is the question the "
                     f"options answer. Do NOT include any option text, answer "
-                    f"letter, explanation, or 'Solution to Question' text. If "
+                    f"letter, explanation, or 'Solution to Question' text. "
+                    f"Do NOT paraphrase the surrounding solution prose. If "
                     f"the page shows no stem region for q{qn}, return null.")
             else:
                 lines.append(f"- Return full verbatim question stem and all four options A-D for q{qn}.")
@@ -1786,8 +1813,26 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
             qn0 = qns_here[0]
             prompt = answer_rescue_prompt(qn0, chapter_records[qn0], chapter_records)
         else:
+            # CONTAMINATION STEM ROUTING (2026-08-08): for any q_no whose
+            # record carries `_stem_suspect_reason`, the rescue pass must
+            # use the STEM-ONLY ask template (suppresses the echo of the
+            # existing contaminated text, forces verbatim stem-region
+            # extraction). Without this routing, the rescue pass always
+            # re-paraphrases the same solution prose the contamination
+            # heuristic just rejected, and the chapter ships with a
+            # suspect_stem violation forever. This is the partner fix
+            # to the build_targeted_retry_prompt stem-only mode hardened
+            # in 2026-08-08: the prompt template is right, but the rescue
+            # caller never told it which q_nos need the stem-only mode.
+            stem_only = {qn for qn in qns_here
+                         if chapter_records.get(qn, {}).get("_stem_suspect_reason")}
+            if stem_only:
+                print(f"  [RESCUE] page {page_no}: stem-only mode for "
+                      f"q{sorted(stem_only)} (suspect stems; no prior text echo)")
             prompt = build_targeted_retry_prompt(
-                [(qn, sorted(qn_missing[qn])) for qn in qns_here], chapter_records)
+                [(qn, sorted(qn_missing[qn])) for qn in qns_here],
+                chapter_records,
+                stem_only_qns=stem_only)
         before_n = sum(_count_fields(chapter_records[qn], qn_missing[qn]) for qn in qns_here)
         try:
             raw = call_gemini_on_pages(model, [pf], context=RECOVERY_CONTEXT, prompt=prompt)
