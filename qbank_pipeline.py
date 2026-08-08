@@ -1786,16 +1786,56 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
         return n
 
     filled, calls = 0, 0
+    # Build a per-page map: page_no -> {"qns": set, "purpose": str}
+    # The "purpose" is the gap type this page is being used for on this
+    # q_no ("question"/"options"/"answer"/"solution"). Multiple q_nos may
+    # share a page; we run ONE call per page, asking for ALL needed
+    # fields of ALL the q_nos on that page (the build_targeted_retry_prompt
+    # already handles per-q_no gap lists).
+    #
+    # 2026-08-08 routing fix: each q_no's needed pages are taken ONLY
+    # from the category that matches the gap (question-side for stems/
+    # options, answer-side for answers, solution-side for solutions).
+    # The old code took the union of all categories and sent stem rescues
+    # to solution-side pages where the model found no stem region.
     pages_of = {}
-    for qn, pages in located.items():
-        for p in pages:
-            pages_of.setdefault(p, []).append(qn)
+    for qn, cats in located.items():
+        need = qn_missing.get(qn, set())
+        # Per-category page lists for this q_no (empty if category
+        # wasn't located in the text layer).
+        q_pages = cats.get("question") or []   # q-side pages
+        a_pages = cats.get("answer") or []      # key-table pages
+        s_pages = cats.get("solution") or []   # solution-side pages
+        # Build the set of pages to use FOR THIS Q_NO based on its gaps.
+        # (We don't store the purpose per (qn, page) -- the per-page
+        # call asks for whichever fields are missing for all q_nos on
+        # the page, and the prompt handles each q_no's gaps. The
+        # IMPORTANT thing is that the page set is the UNION of only the
+        # category-correct pages, not the union of all categories.)
+        relevant_pages = set()
+        if "question" in need or "options" in need:
+            relevant_pages.update(q_pages)
+        if "answer" in need:
+            relevant_pages.update(a_pages)
+        if "solution" in need:
+            relevant_pages.update(s_pages)
+        for p in relevant_pages:
+            slot = pages_of.setdefault(p, {"qns": set(), "purposes": set()})
+            slot["qns"].add(qn)
+            if "question" in need or "options" in need:
+                if p in q_pages:
+                    slot["purposes"].add("question/options")
+            if "answer" in need and p in a_pages:
+                slot["purposes"].add("answer")
+            if "solution" in need and p in s_pages:
+                slot["purposes"].add("solution")
     for page_no in sorted(pages_of):
         if calls >= max_calls:
             print(f"  [RESCUE] call budget ({max_calls}) exhausted -- remaining gaps go "
                   f"to --auto-recover / manual review")
             break
-        qns_here = pages_of[page_no]
+        qns_here = pages_of[page_no]["qns"]
+        purposes_here = pages_of[page_no]["purposes"]
         pf = next((p for p in page_files
                    if int(p.stem.split("-")[-1]) == page_no), None)
         if pf is None:
@@ -1808,8 +1848,16 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
         # FIELD-SPECIFIC PROMPT (run-11 RC-5): an answer-only gap gets an
         # answer-only ask (the broad rescue prompt returned text the scope/
         # contamination filters rejected -> '0 field(s) filled' every time).
+        # We check the per-page PURPOSES (which gap-types are being
+        # recovered for the q_nos on this page) to decide prompt shape.
         need = sorted({f for qn in qns_here for f in qn_missing[qn]})
-        if need == ["answer"] and len(qns_here) == 1:
+        # 2026-08-08: if the page is ONLY being used for answer-recovery
+        # (no question/options gap on it), AND only one q_no is on it,
+        # use the focused answer_rescue_prompt. This avoids the
+        # "scope/contamination filter rejected" failure when the broad
+        # prompt returns other-field text for an answer-only gap.
+        if (need == ["answer"] and len(qns_here) == 1
+                and purposes_here == {"answer"}):
             qn0 = qns_here[0]
             prompt = answer_rescue_prompt(qn0, chapter_records[qn0], chapter_records)
         else:
@@ -1824,11 +1872,28 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
             # to the build_targeted_retry_prompt stem-only mode hardened
             # in 2026-08-08: the prompt template is right, but the rescue
             # caller never told it which q_nos need the stem-only mode.
-            stem_only = {qn for qn in qns_here
-                         if chapter_records.get(qn, {}).get("_stem_suspect_reason")}
+            #
+            # CRITICAL 2026-08-08: the stem-only ask is meaningful ONLY
+            # when the page being sent is a question-side page (where
+            # the printed "N." stem region actually exists). With the
+            # per-page-purpose tracking above, we know whether THIS
+            # page is a question-side page. If a page being used for
+            # stem recovery is NOT a question-side page, we skip the
+            # call entirely (no point sending a stem-only ask to a
+            # solutions page -- the user observed this exact bug:
+            # "yrr solutions to us page pr h hi nhi").
+            if not purposes_here.intersection({"question/options"}):
+                # This page is only used for answer/solution recovery,
+                # not for stem recovery. Skip the stem-only path; the
+                # regular build_targeted_retry_prompt below handles it.
+                stem_only = set()
+            else:
+                stem_only = {qn for qn in qns_here
+                             if chapter_records.get(qn, {}).get("_stem_suspect_reason")}
             if stem_only:
                 print(f"  [RESCUE] page {page_no}: stem-only mode for "
-                      f"q{sorted(stem_only)} (suspect stems; no prior text echo)")
+                      f"q{sorted(stem_only)} (suspect stems; no prior text echo; "
+                      f"purpose={sorted(purposes_here)})")
             prompt = build_targeted_retry_prompt(
                 [(qn, sorted(qn_missing[qn])) for qn in qns_here],
                 chapter_records,
@@ -2300,17 +2365,27 @@ def chapter_printed_question_qns(pdf_path, page_files):
 
 def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_records):
     """One zero-token text-layer pass over the chapter's pages; returns
-    {qn: [true_pdf_page, ...]} for every incomplete qn whose number is
-    printed as a question stem, a 'Solution to Question N:' header, OR (run-11
-    RC-4 fix) an ANSWER-KEY table row -- an answer-missing record's rescue
-    must target the page where its answer is printed, which is the answer
-    table page, not the question page.
+    {qn: {"question": [pages], "answer": [pages], "solution": [pages]}}
+    for every incomplete qn whose number is printed as a question stem,
+    a 'Solution to Question N:' header, OR an ANSWER-KEY table row.
 
+    WHY THREE CATEGORIES (2026-08-08): the rescue pass was sending every
+    gap type to the same page list, including solution-side pages
+    (105-107) for STEM rescues. The model found no stem region there
+    and returned null -- 0 fields filled for all 5 contaminated
+    stems. User observed: "yrr solutions to us page pr h hi nhi,
+    verify kiu Krna h bs jesa h de de q_id honi chahiye". The
+    category split lets the rescue pass route each gap type to
+    the correct page set:
+      * "question"/"options" -> question-side pages ("N." is printed)
+      * "answer"             -> any answer-key row page
+      * "solution"           -> solution-side pages ("Solution to Question N:")
     Powers the chapter-end rescue pass: instead of re-sending the whole
     chapter (which targeted retry already did and stalled on), the rescue
     re-asks ONLY the pages where the missing record is actually printed."""
     qns = set(qn_missing)
-    pages = {qn: set() for qn in qns}
+    pages = {qn: {"question": set(), "answer": set(), "solution": set()}
+             for qn in qns}
     if not qns:
         return {}
     header_re = re.compile(r"Solution\s+to\s+Question\s+(\d{1,3})", re.IGNORECASE)
@@ -2334,29 +2409,43 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
         if not text.strip():
             continue
         is_key_page = bool(KEY_TABLE_PROBE_RE.search(text))
+        # QUESTION-SIDE: the printed question-stem heading ("N." / "N)" / "N-")
+        # is on this page -> add to this q_no's "question" page list. The
+        # stem itself is the text between this heading and the next option
+        # label (A./B./C./D.), so this is the right page for STEM and
+        # OPTIONS recovery.
         for qn in qns:
             if qn not in stem_re_cache:
                 stem_re_cache[qn] = re.compile(
                     r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[.:\-–)]" % qn)
             if stem_re_cache[qn].search(text):
-                pages[qn].add(page_no)
+                pages[qn]["question"].add(page_no)
+        # SOLUTION-SIDE: a "Solution to Question N:" header on this page
+        # -> this is the page where the explanation for q_no is printed.
+        # Use it for SOLUTION recovery, NOT for stem recovery.
         for m in header_re.finditer(text):
             qn = int(m.group(1))
             if qn in pages:
-                pages[qn].add(page_no)
-        # answer rows (match on any page; header strengthens but is not
-        # required -- ch15 q15's key page did not carry the probe header)
+                pages[qn]["solution"].add(page_no)
+        # ANSWER-SIDE: a key-table row on this page (markdown pipe row,
+        # column list, or "13-B" line) -> this page has the answer for
+        # q_no. Use it for ANSWER recovery. Note: a page that is BOTH
+        # a key-page AND a solution page (rare, but seen on some MCQ
+        # books) gets both categories, so the rescue can use whichever
+        # page it lands on first.
         for m in key_row_re.finditer(text):
             qn = int(m.group(1) or m.group(3) or m.group(5))
             if qn in pages:
-                pages[qn].add(page_no)
+                pages[qn]["answer"].add(page_no)
         if is_key_page:
             # even a headerless table still puts every row's q on this page
             for m in re.finditer(r"(?m)^\s*\|\s*(\d{1,3})\s*\|", text):
                 qn = int(m.group(1))
                 if qn in pages:
-                    pages[qn].add(page_no)
-    return {qn: sorted(ps) for qn, ps in pages.items() if ps}
+                    pages[qn]["answer"].add(page_no)
+    return {qn: {k: sorted(v) for k, v in cats.items() if v}
+            for qn, cats in pages.items()
+            if any(cats.values())}
 
 
 def answer_rescue_prompt(qn, rec, chapter_records):
