@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -2581,6 +2582,108 @@ class Run17CodeAuditTests(unittest.TestCase):
         batch = [Path("page-1.jpg")]
         self.assertEqual(qp._batch_after_routing("S", batch, set()), batch)
         self.assertEqual(qp._batch_after_routing("Q", batch, set()), batch)
+
+
+class Run19DataPackageTests(unittest.TestCase):
+    """run-19 master-data workflow: the pipeline must export a clean per-
+    subject DATA PACKAGE (chapters.json + chapters/*.jsonl + questions.jsonl
+    + images/) and a separate QA report zip. Every flagged row carries a
+    'needs_review' marker so the user can manually correct them without
+    cross-checking sidecars."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_root, self._old_data, self._old_assets = (qp.OUTPUT_ROOT,
+                                                            qp.DATA_DIR,
+                                                            qp.ASSETS_DIR)
+        qp.OUTPUT_ROOT = self.tmp / "out"
+        qp.DATA_DIR = qp.OUTPUT_ROOT / "data"
+        qp.ASSETS_DIR = qp.OUTPUT_ROOT / "assets"
+        (qp.DATA_DIR / "by_chapter").mkdir(parents=True)
+        self.subj = qp.ASSETS_DIR / "questions" / "PAY"
+        self.subj.mkdir(parents=True)
+        self._old_cwd = os.getcwd()
+
+    def tearDown(self):
+        qp.OUTPUT_ROOT, qp.DATA_DIR, qp.ASSETS_DIR = self._old_root, self._old_data, self._old_assets
+        os.chdir(self._old_cwd)
+        qp.clear_render_cache()
+
+    # -- needs_review marker ----------------------------------------------
+    def test_needs_review_marks_incomplete_rows(self):
+        rec = {"q_no": 1, "question_text": None, "options": {},
+               "correct_option": None, "solution_text": "sol",
+               "_stem_suspect_reason": "opens with explanation-style language"}
+        issues = qp._row_review_issues(rec)
+        self.assertIn("missing_stem", issues)
+        self.assertIn("bad_options", issues)
+        self.assertIn("missing_answer", issues)
+        self.assertIn("suspect_stem", issues)
+
+    def test_needs_review_none_on_complete_row(self):
+        rec = {"q_no": 1, "question_text": "Which drug?",
+               "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+               "correct_option": "B", "solution_text": "sol"}
+        self.assertIsNone(qp._row_review_issues(rec) or None)
+
+    # -- data package builder ---------------------------------------------
+    def test_build_subject_bundle_includes_images_and_chapters(self):
+        (self.subj / "PAY-001-001_Q_01.webp").write_bytes(b"x" * 3000)
+        (self.subj / "PAY-001-002_Q_01.webp").write_bytes(b"x" * 3000)
+        (self.subj / "PAY-p999-temp.webp").write_bytes(b"x" * 3000)  # unreferenced
+        rows = [
+            {"id": "PAY-001-001", "chapter_id": "PAY-001",
+             "question": {"text": "q1", "images": [{"type": "figure", "file": "PAY/PAY-001-001_Q_01.webp"}]},
+             "options": [], "correct_options": [], "solution": {"text": "s", "images": [], "tables": []}},
+            {"id": "PAY-001-002", "chapter_id": "PAY-001",
+             "question": {"text": "q2", "images": []},
+             "options": [], "correct_options": [],
+             "solution": {"text": "s", "images": [{"type": "figure", "file": "PAY/PAY-001-002_Q_01.webp"}], "tables": []}},
+        ]
+        (qp.DATA_DIR / "by_chapter" / "PAY-001.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows))
+        (qp.DATA_DIR / "chapters.json").write_text(
+            json.dumps([{"chapter_id": "PAY-001", "subject": "PAY", "chapter_no": 1}]))
+        n = qp.build_subject_bundle("PAY")
+        self.assertEqual(n, 1)
+        root = qp.OUTPUT_ROOT / "subjects" / "PAY"
+        self.assertTrue((root / "chapters" / "PAY-001.jsonl").exists())
+        self.assertTrue((root / "questions.jsonl").exists())
+        self.assertTrue((root / "chapters.json").exists())
+        # only REFERENCED images copied, path tail preserved
+        self.assertTrue((root / "images" / "PAY-001-001_Q_01.webp").exists())
+        self.assertTrue((root / "images" / "PAY-001-002_Q_01.webp").exists())
+        self.assertFalse((root / "images" / "PAY-p999-temp.webp").exists())
+
+    # -- data zip = subjects only; QA zip = sidecars only -----------------
+    def test_data_zip_only_subjects_and_qa_zip_sidecars(self):
+        import app as appmod
+        out = qp.OUTPUT_ROOT
+        (out / "subjects" / "PAY").mkdir(parents=True)
+        (out / "subjects" / "PAY" / "chapters.json").write_text("[]")
+        (out / "data" / "questions.jsonl").write_text("row\n")
+        (out / "data" / "orphans.jsonl").write_text("{}\n")
+        (out / "data" / "export_gate.jsonl").write_text("{}\n")
+        (out / "_archive" / "old").mkdir(parents=True)
+        (out / "_archive" / "old" / "data").mkdir()
+        (out / "_archive" / "old" / "data" / "questions.jsonl").write_text("stale\n")
+        os.chdir(self.tmp)          # output_results.zip / qa_report.zip here
+        appmod.make_zip()
+        appmod.make_qa_zip()
+        import zipfile
+        with zipfile.ZipFile(self.tmp / "output_results.zip") as zf:
+            names = zf.namelist()
+        # zip preserves the out/ prefix (f.relative_to(out.parent)) -- every
+        # entry must be a subject data package, nothing else
+        self.assertTrue(all(n.endswith("subjects/PAY/chapters.json") for n in names), names)
+        self.assertFalse(any("_archive" in n for n in names))
+        self.assertFalse(any("/data/" in n for n in names))
+        with zipfile.ZipFile(self.tmp / "qa_report.zip") as zf:
+            qa_names = zf.namelist()
+        self.assertTrue(any(n.endswith("orphans.jsonl") for n in qa_names))
+        self.assertTrue(any(n.endswith("export_gate.jsonl") for n in qa_names))
+        self.assertFalse(any(n.endswith("questions.jsonl") for n in qa_names))
+        self.assertFalse(any("_archive" in n for n in qa_names))
 
 
 class ZipResetIsolationTests(unittest.TestCase):
