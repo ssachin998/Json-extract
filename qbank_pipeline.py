@@ -3266,6 +3266,30 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                       f"present on q{dup_qn} (verified duplicate -- not data loss)")
                 continue
         if owner is None:
+            # RUN-20 (2026-08-08): a FOREIGN-chapter q_no drop is EXPECTED,
+            # not data loss. The merge correctly rejected the item (its
+            # q_no was not in the chapter's question range and not in
+            # carry), the split layer will route it to
+            # unresolved_qids.jsonl with reason=
+            # "missing_question_for_solution", and the export gate
+            # already counts it there. Logging "Could not determine
+            # owner" + bumping stats["orphans_remaining"] would
+            # double-count: the operator would see N in unresolved
+            # orphans AND a count of N in unresolved_qids.jsonl, and
+            # have no way to tell they're the same set. Print a clear
+            # note and DO NOT count it as unresolved.
+            if orph.get("drop_reason") == "foreign_chapter_qno":
+                item_qn = (orph.get("item") or {}).get("q_no")
+                print(f"  [ORPHAN] q{item_qn}: foreign-chapter q_no drop "
+                      f"kept for review in orphans.jsonl (NOT a data loss; "
+                      f"split layer will route to unresolved_qids.jsonl "
+                      f"with reason='missing_question_for_solution')")
+                # Keep the item in remaining so the orphans.jsonl record
+                # is still persisted for the human reviewer -- but DO NOT
+                # count it as unresolved here (the split layer's count
+                # is the authoritative one for this class).
+                remaining.append(orph)
+                continue
             print(f"  [ORPHAN] Could not determine owner: page={page} kept in orphans.jsonl")
             remaining.append(orph)
             continue
@@ -3518,7 +3542,17 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False,
                   f"caller will route to orphans with reason='foreign_chapter_qno'")
             stats["foreign_chapter_qno_dropped"] = stats.get(
                 "foreign_chapter_qno_dropped", 0) + 1
-            skipped.append(item)
+            # Tag the dropped item with a _drop_reason so the caller's
+            # RC-2 salvage buffer (and downstream export gate) can
+            # distinguish a FOREIGN drop -- expected, not data loss,
+            # already correctly routed to unresolved_qids.jsonl by the
+            # split layer -- from a real orphan that genuinely lost its
+            # owner (data loss, gate violation). Without this marker
+            # the gate's `orphan_unresolved` check fired on every
+            # foreign-dropped item as if it were missing content (the
+            # 4 [ORPHAN] page=100 lines in the post-fix Railway run).
+            # The dict() copies the item so the original is not mutated.
+            skipped.append({**item, "_drop_reason": "foreign_chapter_qno"})
             continue
         # ---- PROVENANCE + PATCH-ONLY RECOVERY (run-7 hardening #1/#2/#4):
         # every item carries _prov (set by the pass that produced it, e.g.
@@ -5151,6 +5185,23 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
     # orphan summary / export gate / validator / ZIP disagreed). Empty or
     # junk fragments (everything None) are not data loss and stay silent.
     for o in unresolved_orphans or ():
+        # RUN-20 (2026-08-08): skip FOREIGN-chapter q_no drops. These are
+        # EXPECTED (cross-chapter "Solution to Question N:" headers that
+        # fell into this chapter's page range, e.g. PSY-006's tail into
+        # PSY-007's pages 100-107 returning q23..26). The upstream merge
+        # correctly rejected them as foreign, the caller routes them
+        # to orphans.jsonl for human review, and the split layer's
+        # reconcile_qids writes them to unresolved_qids.jsonl with
+        # reason="missing_question_for_solution". They are NOT data loss:
+        # the export gate's `missing_question_for_solution` upstream
+        # check (counted by the split layer) is the authoritative report
+        # for this class. Including them again as `orphan_unresolved`
+        # would double-count and inflate gate violation counts.
+        # Other orphan classes (q_no is None, stem-rejected to empty,
+        # solution fragment with no owner) remain flagged -- those are
+        # genuine data loss.
+        if o.get("drop_reason") == "foreign_chapter_qno":
+            continue
         item = o.get("item") or {}
         present = [k for k in ("question_text", "options", "correct_option",
                                "solution_text", "tables")
@@ -5787,6 +5838,16 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                         "last_qn_in_batch": last_qn_in_batch,
                         "pass": pass_name,
                         "item": it,
+                        # RUN-20 (2026-08-08): propagate the merge's
+                        # _drop_reason (set when the FOREIGN guard drops
+                        # the item) so recover_orphans and the export
+                        # gate's orphan_unresolved check can recognize
+                        # foreign-chapter drops as EXPECTED (not data
+                        # loss). Items dropped for any other reason
+                        # (e.g. q_no is None, stem-rejected to empty)
+                        # leave drop_reason unset -- the export gate
+                        # still flags THOSE as data loss.
+                        "drop_reason": it.get("_drop_reason"),
                     })
                 stats["orphans_buffered"] += len(skipped)
                 if pass_name in ("Q", "S"):
