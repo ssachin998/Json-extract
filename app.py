@@ -109,6 +109,36 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         log(f"❌ Error: {e}")
         traceback.print_exc()  # full traceback with file/line -> Railway Deploy Logs
 
+def _entries_to_archive(out_root):
+    """Everything under the output root that a reset must move into the
+    archive -- i.e. EVERYTHING except the archive itself. The old reset only
+    moved data/assets/state.json and left subjects/ behind, so a previous
+    book's per-subject chapter JSONs + questions.jsonl kept leaking into the
+    next export zip after reset. Generalized: nothing from a previous run may
+    survive into the fresh output."""
+    if not out_root.exists():
+        return []
+    return [(p.name, p) for p in sorted(out_root.iterdir())
+            if p.name != "_archive"]
+
+
+def _zip_skip(rel):
+    """True when a file (path relative to the output root) must NOT go into
+    the export zip: healer backups, the reset archive, and the zip itself
+    (self-inclusion guard). Everything else -- data/, assets/, subjects/,
+    state.json -- is current-run content."""
+    parts = rel.parts
+    if not parts:
+        return True
+    if parts[0] == "_archive":
+        return True
+    if ".bak-" in Path(rel).name:
+        return True
+    if Path(rel).name == "output_results.zip":
+        return True
+    return False
+
+
 def make_zip():
     # Use the pipeline's live root rather than recalculating OUTPUT_DIR.  This
     # keeps an export paired with the data the pipeline actually wrote.
@@ -121,10 +151,8 @@ def make_zip():
             if not f.is_file():
                 continue
             rel = f.relative_to(out)
-            if ".bak-" in f.name:
-                continue  # healer backups are raw snapshots, not dataset content
-            if rel.parts and rel.parts[0] == "_archive":
-                continue  # /reset archives live on the volume, not in exports
+            if _zip_skip(rel):
+                continue  # archive / backups / self -- never export these
             zf.write(f, f.relative_to(out.parent))
 
 PAGE = """
@@ -747,11 +775,12 @@ def validate():
 
 @app.route("/reset", methods=["POST"])
 def reset_output():
-    """Clean-slate for the NEXT book: move current output into
-    _archive/<timestamp>/ INSIDE the volume (nothing is deleted), so a
-    fresh run starts with empty data/assets/state. Needed because test
-    runs accumulate alongside real data (e.g. the same trial book run
-    twice under two subject codes = 868 duplicate rows in one volume)."""
+    """Clean-slate for the NEXT book: move EVERYTHING in the output root
+    (data/, assets/, subjects/, state.json, any strays) into
+    _archive/<timestamp>/ INSIDE the volume (nothing is deleted), so a fresh
+    run starts empty. The old reset only archived data/assets/state.json and
+    left subjects/ behind -- a previous book's per-subject chapter JSONs and
+    questions.jsonl kept leaking into the next export zip after reset."""
     if VOLUME_WARN:
         return ("Volume /data pe attach nahi hai -- reset blocked (archive bhi kahin "
                 "survive nahi karegi). Pehle Volume lagao.", 400)
@@ -764,17 +793,12 @@ def reset_output():
     arch = out / "_archive" / stamp
     moved = []
     try:
-        for name in ("data", "assets"):
-            src = out / name
-            if src.exists():
-                arch.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(arch / name))
-                moved.append(f"{name}/")
-        sf = out / "state.json"
-        if sf.exists():
+        entries = _entries_to_archive(out)
+        if entries:
             arch.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(sf), str(arch / "state.json"))
-            moved.append("state.json")
+        for name, src in entries:
+            shutil.move(str(src), str(arch / name))
+            moved.append(f"{name}/" if src.is_dir() else name)
         log(f"🧹 RESET complete -- archived: {', '.join(moved) if moved else '(already clean)'} "
             f"-> _archive/{stamp}/ (volume ke andar hi safe hai; zip me include nahi hota)")
         log("🆕 Fresh start -- ab nayi book run karo.")

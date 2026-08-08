@@ -523,6 +523,35 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
+### 4.32 Changelog — 2026-08-08 (export-zip isolation: reset archives EVERYTHING)
+
+**Symptom:** Railway's download ZIP contained PREVIOUS run's output JSONs even
+after pressing Reset — the fresh run's zip still had old chapters/data.
+
+**Root cause:** `reset_output()` archived only `data/`, `assets/` and
+`state.json`. The per-subject bundle written by `build_subject_bundle()`
+(`subjects/<SUB>/chapters/*.jsonl` + `questions.jsonl`) was LEFT BEHIND, so
+a previous book's JSONs survived the reset and `make_zip()`'s `rglob("*")`
+packaged them into the next export.
+
+**Fix (`app.py`):**
+- `_entries_to_archive(out)` — a reset now archives EVERYTHING under the
+  output root except `_archive` itself (data/, assets/, subjects/, state.json,
+  any strays). Fresh run starts truly empty; nothing from a previous run can
+  leak into the zip.
+- `_zip_skip(rel)` — belt-and-suspenders in `make_zip()`: never export
+  `_archive/`, healer `*.bak-*` files, or `output_results.zip` itself.
+- `reset_output()` uses `_entries_to_archive`; `make_zip()` uses `_zip_skip`.
+
+Tests: `ZipResetIsolationTests` (+4): reset archives subjects too / excludes
+the archive itself; zip skip rules (archive + backups + self excluded,
+current content kept); end-to-end zip build has no `_archive` entries and
+keeps fresh data + subjects.
+
+Note: this pass builds on the user's manual `qbank_pipeline.py` updates
+(commits `b3e543b` / `16cc70d` on GitHub — run-18 regex/tiebreaker
+improvements) — merged cleanly, suite green. Suite: **145 tests OK**.
+
 ### 4.31 Changelog — 2026-08-06 (full-code audit: bug fixes + dead/duplicate code removal)
 
 Full audit of all pipeline code (qbank_pipeline 6324→6260 lines; validator,

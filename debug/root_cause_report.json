@@ -305,5 +305,19 @@
       "ValidatorContaminationTests.test_verbatim_stem_solution_flagged"
     ],
     "test_result": "141 tests OK (1 skipped: opt-in real-PDF fixture)"
+  },
+  "run_18_zip_isolation": {
+    "symptom": "Railway download ZIP contains previous run's output JSONs even after Reset",
+    "root_cause": "reset_output() archived only data/, assets/, state.json; subjects/ (build_subject_bundle per-subject chapter JSONs + questions.jsonl) survived reset and make_zip() rglob packaged it into the next export",
+    "fix": [
+      "app._entries_to_archive(out): reset archives EVERYTHING except _archive (data, assets, subjects, state.json, strays)",
+      "app._zip_skip(rel): make_zip never exports _archive/, *.bak-*, output_results.zip (self)",
+      "reset_output uses _entries_to_archive; make_zip uses _zip_skip"
+    ],
+    "user_manual_changes": "commits b3e543b + 16cc70d (qbank_pipeline.py run-18 regex/tiebreaker improvements) merged cleanly",
+    "tests_added": [
+      "ZipResetIsolationTests x4 (entries_to_archive includes subjects/excludes archive, reset moves subjects into archive, zip skip rules, end-to-end zip no stale archive entries)"
+    ],
+    "test_result": "145 tests OK (1 skipped: opt-in real-PDF fixture)"
   }
 }

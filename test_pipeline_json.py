@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 import zlib
@@ -2580,6 +2581,90 @@ class Run17CodeAuditTests(unittest.TestCase):
         batch = [Path("page-1.jpg")]
         self.assertEqual(qp._batch_after_routing("S", batch, set()), batch)
         self.assertEqual(qp._batch_after_routing("Q", batch, set()), batch)
+
+
+class ZipResetIsolationTests(unittest.TestCase):
+    """run-18: after a reset the export ZIP must contain ONLY the new run's
+    output. The old reset archived only data/assets/state.json and left the
+    per-subject bundle (subjects/<SUB>/chapters/*.jsonl + questions.jsonl)
+    behind, so a previous book's JSONs leaked into the next zip via
+    make_zip()'s rglob. Fix: reset archives EVERYTHING except _archive, and
+    make_zip() skips _archive / healer backups / the zip itself."""
+
+    def setUp(self):
+        import app as appmod
+        self.app = appmod
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        qp.clear_render_cache()
+
+    # -- reset archives EVERYTHING except the archive itself ---------------
+    def test_entries_to_archive_includes_subjects(self):
+        root = self.tmp / "out"
+        (root / "data").mkdir(parents=True)
+        (root / "assets").mkdir()
+        (root / "subjects" / "PAY" / "chapters").mkdir(parents=True)
+        (root / "subjects" / "PAY" / "questions.jsonl").write_text("{}")
+        (root / "state.json").write_text("{}")
+        (root / "_archive" / "old").mkdir(parents=True)   # previous archive
+        entries = self.app._entries_to_archive(root)
+        names = {n for n, _p in entries}
+        self.assertEqual(names, {"data", "assets", "subjects", "state.json"})
+        self.assertNotIn("_archive", names)   # the archive itself survives
+
+    def test_reset_moves_subjects_into_archive(self):
+        root = self.tmp / "out"
+        (root / "subjects" / "PAY" / "chapters").mkdir(parents=True)
+        (root / "subjects" / "PAY" / "questions.jsonl").write_text("old-json")
+        (root / "data").mkdir()
+        stamp = "20260806-000000"
+        arch = root / "_archive" / stamp
+        for name, src in self.app._entries_to_archive(root):
+            arch.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(arch / name))
+        # fresh output root has NO stale subjects/ -- next run starts clean
+        self.assertFalse((root / "subjects").exists())
+        self.assertFalse((root / "data").exists())
+        self.assertTrue((arch / "subjects" / "PAY" / "questions.jsonl").exists())
+
+    # -- make_zip skip rules ----------------------------------------------
+    def test_zip_skip_excludes_archive_backups_and_self(self):
+        self.assertTrue(self.app._zip_skip(Path("_archive/x/data/questions.jsonl")))
+        self.assertTrue(self.app._zip_skip(Path("data/row.bak-2026-08-06.jsonl")))
+        self.assertTrue(self.app._zip_skip(Path("output_results.zip")))
+        # current-run content must NOT be skipped
+        self.assertFalse(self.app._zip_skip(Path("data/questions.jsonl")))
+        self.assertFalse(self.app._zip_skip(Path("subjects/PAY/questions.jsonl")))
+        self.assertFalse(self.app._zip_skip(Path("state.json")))
+
+    def test_make_zip_excludes_stale_subjects_after_reset(self):
+        # simulate: old subjects/ left behind (pre-fix bug) -> _zip_skip
+        # must keep it out ONLY when it lives under _archive; a REAL stale
+        # subjects/ at the top level is removed by reset (test above). The
+        # zip writer uses _zip_skip, so verify end-to-end by building a zip
+        # from a root that has archive + a fresh subjects/.
+        root = self.tmp / "out"
+        (root / "_archive" / "old" / "subjects" / "PAY").mkdir(parents=True)
+        (root / "_archive" / "old" / "subjects" / "PAY" / "questions.jsonl").write_text("stale")
+        (root / "subjects" / "PAY").mkdir(parents=True)
+        (root / "subjects" / "PAY" / "questions.jsonl").write_text("fresh")
+        (root / "data").mkdir()
+        (root / "data" / "questions.jsonl").write_text("fresh-master")
+        zip_path = self.tmp / "out.zip"
+        import zipfile
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for f in root.rglob("*"):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(root)
+                if self.app._zip_skip(rel):
+                    continue
+                zf.write(f, rel.as_posix())
+        names = zipfile.ZipFile(zip_path).namelist()
+        self.assertFalse(any("_archive" in n for n in names))     # no stale
+        self.assertTrue(any(n.endswith("subjects/PAY/questions.jsonl") for n in names))
+        self.assertTrue(any(n.endswith("data/questions.jsonl") for n in names))
 
 
 if __name__ == "__main__":
