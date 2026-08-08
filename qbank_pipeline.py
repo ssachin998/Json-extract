@@ -192,99 +192,26 @@ def write_chapter_file(subject, chapter_id, chapter_rows):
         encoding="utf-8")
 
 
-def _row_review_issues(rec):
-    """run-19: deterministic list of issues a master-data reviewer must fix on
-    this row. Mirrors the export-gate checks so a flagged row is self-
-    describing ('needs_review' field) without looking up the QA sidecars."""
-    issues = []
-    if not (rec.get("question_text") or "").strip():
-        issues.append("missing_stem")
-    opts = rec.get("options") or {}
-    if len(opts) != 4 or any(not str(v or "").strip() for v in opts.values()):
-        issues.append("bad_options")
-    if not rec.get("correct_option"):
-        issues.append("missing_answer")
-    if rec.get("_stem_suspect_reason"):
-        issues.append("suspect_stem")
-    return issues
-
-
-def build_subject_bundle(subject, chapters_out=None):
-    """MASTER-DATA PACKAGE for ONE subject under subjects/{SUBJECT}/:
-      chapters.json        -- this subject's chapter list
-      chapters/{CH}.jsonl  -- chapter-wise question rows
-      questions.jsonl      -- concat of the chapter files (master)
-      images/<tail>        -- every image REFERENCED by the rows, copied from
-                              assets/questions (path after 'SUBJECT/' kept, so
-                              ref 'PAY/PAY-001-001_Q_01.webp' ->
-                              images/PAY-001-001_Q_01.webp)
-
-    Built from the COMMITTED data dir (data/by_chapter + data/chapters.json),
-    so it is always a consistent snapshot even mid-run / after a resume. This
-    is the "Data package" a master-data builder consumes; QA sidecars
-    (orphans, export_gate, unresolved_images, ...) are intentionally NOT
-    included -- they ship separately as the QA report."""
+def build_subject_bundle(subject, chapters_out):
+    """All chapters done -> bundle everything under subjects/{SUBJECT_NAME}/:
+    chapters.json (this subject only), questions.jsonl (concat of the
+    per-chapter files, in chapter order) and chapters/{CH}.jsonl copies.
+    Additive convenience layer -- data/questions.jsonl stays the master."""
     src = DATA_DIR / "by_chapter"
     ch_files = sorted(src.glob(f"{subject}-*.jsonl")) if src.exists() else []
-    if not ch_files:
-        return 0
     root = OUTPUT_ROOT / "subjects" / subject
     (root / "chapters").mkdir(parents=True, exist_ok=True)
     combined = []
-    refs = set()
     for f in ch_files:
         txt = f.read_text(encoding="utf-8")
         (root / "chapters" / f.name).write_text(txt, encoding="utf-8")
         combined.append(txt)
-        for ln in txt.splitlines():
-            if not ln.strip():
-                continue
-            try:
-                row = json.loads(ln)
-            except json.JSONDecodeError:
-                continue
-            for img in ((row.get("question") or {}).get("images") or []):
-                if img.get("file"):
-                    refs.add(img["file"])
-            for o in (row.get("options") or []):
-                for img in (o.get("images") or []):
-                    if img.get("file"):
-                        refs.add(img["file"])
-            for img in ((row.get("solution") or {}).get("images") or []):
-                if img.get("file"):
-                    refs.add(img["file"])
     (root / "questions.jsonl").write_text("".join(combined), encoding="utf-8")
-    # chapters.json: prefer the caller's in-memory list, else the committed file
-    mine = []
-    if chapters_out:
-        mine = [c for c in chapters_out if c.get("subject") == subject]
-    else:
-        cpath = DATA_DIR / "chapters.json"
-        if cpath.exists():
-            try:
-                mine = [c for c in json.loads(cpath.read_text())
-                        if c.get("subject") == subject]
-            except Exception:
-                mine = []
+    mine = [c for c in chapters_out if c.get("subject") == subject]
     (root / "chapters.json").write_text(json.dumps(mine, indent=2, ensure_ascii=False),
                                         encoding="utf-8")
-    # images: copy ONLY referenced files, keeping the tail of the ref path
-    img_root = root / "images"
-    n_img = 0
-    for ref in sorted(refs):
-        parts = ref.split("/", 1)
-        tail = parts[1] if len(parts) == 2 else ref
-        srcf = ASSETS_DIR / "questions" / ref
-        if not srcf.exists():
-            continue
-        dst = img_root / tail
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(srcf, dst)
-        n_img += 1
-    print(f"[{subject}] data package ready -> subjects/{subject}/ "
-          f"({len(ch_files)} chapter file(s) + chapters.json + "
-          f"questions.jsonl + {n_img} image(s))")
-    return len(ch_files)
+    print(f"[{subject}] bundle ready -> subjects/{subject}/ "
+          f"({len(ch_files)} chapter file(s) + chapters.json + questions.jsonl)")
 
 def today_stamp():
     return time.strftime("%Y-%m-%d")
@@ -3788,11 +3715,6 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         # a downstream reviewer (human or the critique pass below) jump
         # straight to source without re-deriving it from the page ledger.
         "source_pages": sorted(source_pages) if source_pages else [],
-        # run-19 MASTER-DATA REVIEW MARKER: every issue that needs a human's
-        # eye when building the final app data. The user manually corrects
-        # flagged rows, so each row says exactly what is wrong -- no need to
-        # cross-check the QA sidecars to find them.
-        "needs_review": _row_review_issues(rec),
         # run-13: quarantined suspect stem marker -- ships in questions.jsonl
         # so the post-run validator flags it too (not only the export gate).
         "stem_suspect": rec.get("_stem_suspect_reason"),

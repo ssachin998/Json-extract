@@ -139,78 +139,21 @@ def _zip_skip(rel):
     return False
 
 
-def _ensure_data_packages():
-    """Rebuild every subject's DATA PACKAGE from the committed data dir, so
-    the download zip is ALWAYS a fresh, self-contained per-subject package
-    (chapters.json + chapters/*.jsonl + questions.jsonl + images/). Runs at
-    zip time: even a partial/resumed run exports a consistent snapshot."""
-    out = Path(pipeline.OUTPUT_ROOT)
-    cpath = pipeline.DATA_DIR / "chapters.json"
-    subjects = []
-    if cpath.exists():
-        try:
-            subjects = sorted({c.get("subject") for c in json.loads(cpath.read_text())
-                               if c.get("subject")})
-        except Exception:
-            subjects = []
-    for s in subjects:
-        try:
-            pipeline.build_subject_bundle(s)
-        except Exception as e:
-            print(f"  [WARN] data package build failed for {s}: {e}")
-
-
 def make_zip():
-    """DATA PACKAGE zip: only subjects/* (per-subject master-data packages).
-    QA sidecars (orphans, export_gate, unresolved_images, page_ledger, ...)
-    are NOT in here -- they ship separately via make_qa_zip()/download-qa."""
+    # Use the pipeline's live root rather than recalculating OUTPUT_DIR.  This
+    # keeps an export paired with the data the pipeline actually wrote.
     out = Path(pipeline.OUTPUT_ROOT)
     if not out.exists():
         return
-    _ensure_data_packages()
     zpath = Path("output_results.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in out.rglob("*"):
             if not f.is_file():
                 continue
             rel = f.relative_to(out)
-            if rel.parts and rel.parts[0] != "subjects":
-                continue           # DATA PACKAGE ONLY -- no sidecars, no assets
             if _zip_skip(rel):
-                continue           # archive / backups / self -- never export
+                continue  # archive / backups / self -- never export these
             zf.write(f, f.relative_to(out.parent))
-    # the QA report is regenerated alongside every data package so the two
-    # downloads always describe the SAME snapshot
-    make_qa_zip()
-
-
-QA_SIDECAR_NAMES = {
-    "export_gate.jsonl", "orphans.jsonl", "unresolved_images.jsonl",
-    "unmatched_images.jsonl", "page_ledger.jsonl", "image_ownership.jsonl",
-    "integrity_flags.jsonl", "still_incomplete_after_retry.jsonl",
-    "dropped_anchorless.jsonl", "dropped_phantom_records.jsonl",
-    "stem_conflicts.jsonl", "validation_report.json",
-}
-
-
-def make_qa_zip():
-    """QA REPORT zip: the diagnostic sidecars (orphans, unresolved images,
-    export gate, page ledger, ...) for checking a run -- separate from the
-    master-data package so the data zip stays clean."""
-    out = Path(pipeline.OUTPUT_ROOT)
-    if not out.exists():
-        return
-    zpath = Path("qa_report.zip")
-    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in out.rglob("*"):
-            if not f.is_file():
-                continue
-            rel = f.relative_to(out)
-            if _zip_skip(rel):
-                continue
-            if rel.parts and rel.parts[0] == "data" and len(rel.parts) == 2 \
-                    and rel.parts[1] in QA_SIDECAR_NAMES:
-                zf.write(f, f.relative_to(out.parent))
 
 PAGE = """
 <!DOCTYPE html>
@@ -237,8 +180,7 @@ PAGE = """
   <div class="bg-white rounded-lg shadow p-4">
     <p class="text-sm mb-2">Status: <span class="font-semibold">{{ state.status }}</span></p>
     {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
-    <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">⬇️ Download DATA package (.zip)</a>
-    <a href="/download-qa" class="inline-block mt-2 bg-slate-600 text-white text-sm px-3 py-2 rounded">📋 Download QA report (.zip)</a>
+    <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">Download results (.zip)</a>
     {% if state.get('test_ready') %}
     <a href="/download-test" class="inline-block mt-2 bg-violet-600 text-white text-sm px-3 py-2 rounded">⬇️ Download TEST results (.zip)</a>
     {% endif %}
@@ -1098,16 +1040,6 @@ def download():
     if os.path.exists("output_results.zip"):
         return send_file("output_results.zip", as_attachment=True)
     return "No results yet", 404
-
-
-@app.route("/download-qa")
-def download_qa():
-    """QA report zip: diagnostic sidecars only (orphans, unresolved images,
-    export gate, page ledger, ...) -- separate from the data package."""
-    make_qa_zip()
-    if os.path.exists("qa_report.zip"):
-        return send_file("qa_report.zip", as_attachment=True)
-    return "No QA report yet", 404
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))

@@ -319,23 +319,5 @@
       "ZipResetIsolationTests x4 (entries_to_archive includes subjects/excludes archive, reset moves subjects into archive, zip skip rules, end-to-end zip no stale archive entries)"
     ],
     "test_result": "145 tests OK (1 skipped: opt-in real-PDF fixture)"
-  },
-  "run_19_master_data_package": {
-    "goal": "final app ke liye master data -- user flagged questions ko manually correct karega",
-    "design": [
-      "DATA PACKAGE zip (output_results.zip): sirf subjects/<SUB>/ -- chapters.json + chapters/*.jsonl + questions.jsonl + images/ (sirf referenced images, ref ke baad ka path preserve)",
-      "QA REPORT zip (qa_report.zip): sirf data/*.jsonl sidecars (orphans, export_gate, unresolved_images, unmatched_images, page_ledger, image_ownership, integrity_flags, still_incomplete, dropped_*, stem_conflicts, validation_report)",
-      "har flagged row me 'needs_review' marker (missing_stem/bad_options/missing_answer/suspect_stem) -- user ko pata rahe kaunse correct karne hain"
-    ],
-    "code_changes": [
-      "qbank_pipeline.build_subject_bundle -> data package (chapters.json fallback from data/, images/ copy with path-tail, sirf referenced)",
-      "qbank_pipeline._row_review_issues + build_final_question 'needs_review'",
-      "app._ensure_data_packages (zip time pe fresh rebuild), make_zip = subjects-only, make_qa_zip = sidecars-only, /download-qa route + 2 buttons",
-      "reset (run-18) already archives subjects/ -- data package kabhi stale nahi"
-    ],
-    "tests_added": [
-      "Run19DataPackageTests x4 (needs_review marker, package with images/chapters, data-zip subjects-only, qa-zip sidecars-only)"
-    ],
-    "test_result": "149 tests OK (1 skipped: opt-in real-PDF fixture)"
   }
 }

@@ -523,42 +523,6 @@ Run artifacts: `debug/root_cause_report.json` (machine-readable matrix).
 
 ---
 
-### 4.33 Changelog — 2026-08-08 (master-data workflow: clean DATA package + separate QA report)
-
-Goal (user): build master data for the final app, manually correcting flagged
-questions. Railway now exports TWO clean artifacts instead of one mixed zip:
-
-**⬇️ Download DATA package (`output_results.zip`)** — master-data only:
-```
-subjects/PAY/
-├── chapters.json
-├── chapters/PAY-001.jsonl ...        (chapter-wise rows)
-├── questions.jsonl                   (concat master)
-└── images/PAY-001-001_Q_01.webp ...  (ONLY images the rows reference;
-                                        ref 'PAY/PAY-...webp' -> images/PAY-...webp)
-```
-Rebuilt fresh at zip time from the committed data dir, so partial/resumed
-runs export a consistent snapshot. NO QA sidecars, NO assets raw, NO archive.
-
-**📋 Download QA report (`qa_report.zip`)** — checking only:
-`export_gate.jsonl, orphans.jsonl, unresolved_images.jsonl,
-unmatched_images.jsonl, page_ledger.jsonl, image_ownership.jsonl,
-integrity_flags.jsonl, still_incomplete_after_retry.jsonl,
-dropped_anchorless.jsonl, dropped_phantom_records.jsonl, stem_conflicts.jsonl,
-validation_report.json`.
-
-**Manual-correction marker:** every question row now carries `"needs_review"`:
-`["missing_stem", "bad_options", "missing_answer", "suspect_stem"]` (or null) —
-the flagged questions are self-describing, no sidecar cross-check needed.
-
-Implementation: `build_subject_bundle` → data-package builder (chapters.json
-fallback from data/, images copy with path-tail, referenced-only);
-`_row_review_issues`; `app._ensure_data_packages` + `make_zip` (subjects-only)
-+ `make_qa_zip` (sidecars-only) + `/download-qa` + two dashboard buttons.
-Built on the user's manual run-19 `source_pages` additions — preserved.
-
-Tests: `Run19DataPackageTests` (+4). Suite: **149 tests OK**.
-
 ### 4.32 Changelog — 2026-08-08 (export-zip isolation: reset archives EVERYTHING)
 
 **Symptom:** Railway's download ZIP contained PREVIOUS run's output JSONs even
