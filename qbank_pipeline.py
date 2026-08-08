@@ -5508,11 +5508,25 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 # positive, and orphans already get a chapter-end recovery
                 # pass).
                 if pass_name == "Q" and items:
+                    def _as_int_qno(v):
+                        try:
+                            return int(v)
+                        except (TypeError, ValueError):
+                            return None
                     known_qnos = [qn for qn in chapter_records if isinstance(qn, int)]
                     known_max = max(known_qnos) if known_qnos else 0
+                    # run-19 fix: Gemini returns q_no as int OR string ("1" vs
+                    # 1) depending on the call -- confirmed in production,
+                    # where a string-only batch made every isinstance(int)
+                    # check below silently fail, emptied trusted_qnos, and
+                    # sent an entire genuine chapter-1 batch (q1-26+) to
+                    # orphans. Normalize once, up front, exactly like
+                    # merge_question_records already does for the same
+                    # reason.
                     batch_qnos = sorted(set(
-                        it.get("q_no") for it in items
-                        if isinstance(it, dict) and isinstance(it.get("q_no"), int)))
+                        qn for qn in (_as_int_qno(it.get("q_no")) for it in items
+                                      if isinstance(it, dict))
+                        if qn is not None))
                     # connected runs (gap <= 2) within this batch's numbers --
                     # a run is trusted (no OCR needed) if it's substantial
                     # (>=5 items: a real fresh chapter start looks like this)
@@ -5535,7 +5549,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     verified_items, unverified = [], []
                     ocr_conf_cache = {}
                     for it in items:
-                        qn = it.get("q_no") if isinstance(it, dict) else None
+                        qn = _as_int_qno(it.get("q_no")) if isinstance(it, dict) else None
                         if qn is None or qn in chapter_records or qn in trusted_qnos:
                             verified_items.append(it)
                             continue
