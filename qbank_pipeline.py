@@ -900,9 +900,57 @@ def _stem_reject_reason(qtext, rec=None):
         return None
     if _EXPLANATION_START_RE.match(t):
         return "opens with explanation-style language"
-    if rec and len(t) >= 60:
-        sol = (rec.get("solution_text") or "").strip()
-        if sol and _frag_mostly_present(t, sol, CONTAMINATION_TOKEN_SHARE):
+    # RUN-20: hoist `sol` to function scope so the second-clause phantom
+    # guard below can reference it even when len(t) < 60 (the first-clause
+    # token-containment check is skipped for short stems; without the
+    # hoist that path raises UnboundLocalError on `sol`). Defaults to ""
+    # so the second-clause's `if rec and t and sol` is False for genuine
+    # solution-only records (question_text=None -> sol may be the only
+    # field, but the guard still works: t is "" and the check is skipped).
+    sol = (rec.get("solution_text") or "").strip() if rec else ""
+    # RUN-20 HALLUCINATED-STEM GUARD (PSY-007 Q23-Q26 phantom fix,
+    # 2026-08-08): the real PSY-007 run had Q23-Q26 records with
+    # question_text populated (the run-19 critique pass hallucinated a
+    # stem from the surrounding solution prose), but the records had
+    # NO options and NO correct_option (the real question lives in a
+    # different chapter). The above checks all passed because the
+    # hallucinated text was question-shaped, NOT a verbatim copy of
+    # the solution, and not over _MAX_REAL_STEM_LEN. The deterministic
+    # discriminator that DOES catch the phantom shape is: a non-empty
+    # question_text WITH a non-empty solution_text AND empty options
+    # AND no correct_option. A real MCQ record has at minimum
+    # question_text + options + answer + solution_text (the S-pass
+    # fragment is the only one that can legitimately arrive without
+    # options/answer, but in that case the S-pass PROV guard already
+    # dropped the question_text above). When all four are present,
+    # the question_text is real; when only question_text+solution_text
+    # are present, the question_text is suspect and the record needs
+    # review. This guard does NOT block legitimate solution-only
+    # records (which have no question_text at all) -- the question_text
+    # check is `if t:` (non-empty), so a None or empty question_text
+    # passes through.
+    #
+    # ORDER MATTERS: the phantom-shape guard fires BEFORE the legacy
+    # token-containment check below, because a phantom record's
+    # hallucinated stem and its real solution are typically about the
+    # same chapter (high token overlap), so the token check would
+    # fire first with a less specific reason and the phantom shape
+    # -- the deterministic, trustworthy signal -- would never be
+    # reached. The shape guard is the run-20 fix; the token check
+    # is a legacy heuristic that still catches the genuine
+    # question_text == solution_text contamination class.
+    if rec and t and sol:
+        opts = rec.get("options") or {}
+        correct = rec.get("correct_option")
+        opts_empty = (not isinstance(opts, dict)
+                      or len(opts) < 4
+                      or any(not str(v or "").strip() for v in opts.values()))
+        no_answer = not (correct and str(correct).strip())
+        if opts_empty and no_answer:
+            return ("record has only question_text+solution_text (no options, no "
+                    "answer) -- phantom-record shape: the real question is in "
+                    "another chapter; run-20 upstream fix")
+    if rec and len(t) >= 60 and sol:
             # RUN-14: a would-be stem that is (near-)IDENTICAL to the whole
             # solution (ch7 q23/q25: question_text == solution_text verbatim,
             # e.g. "The patient has developed acute muscular dystonia ..."
@@ -2168,6 +2216,43 @@ def chapter_printed_solution_qns(pdf_path, page_files, chapter_records):
     return found
 
 
+def chapter_printed_question_qns(pdf_path, page_files):
+    """Which q_nos have a printed question-stem heading somewhere on the
+    chapter's pages (zero-token text layer). The deterministic, no-Gemini
+    complement to the Q-pass extraction: where the text layer is readable
+    (the MARROW/PSY chapter Q-stem pages), this gives the chapter's actual
+    question range. Where the text layer is garbled (scanned pages, certain
+    books), this returns an empty set -- the caller must fall back to
+    the Q-pass anchor set.
+
+    Reuses the same regex as qns_printed_on_page, but does NOT filter on
+    `if qn in chapter_records` -- we want the chapter's full set of
+    question-stem-printed q_nos, not just those already in chapter_records,
+    because the upstream bug we're fixing is exactly: S-pass accepts
+    q_nos for which the question stem was never printed in this chapter.
+
+    Returns a set of q_nos. Zero pdftotext subprocesses per page -- the
+    text layer was already read by the rest of the pipeline, but we read
+    it again here for clarity (this runs ONCE per chapter, not per window)."""
+    found = set()
+    # run-18: accept "Question N:" / "N." / "N)" / "N -" / "Q N." headings
+    stem_re = re.compile(
+        r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-\u2013)]"
+    )
+    for pf in page_files:
+        try:
+            page_no = int(pf.stem.split("-")[-1])
+        except (ValueError, IndexError):
+            continue
+        text = pdftotext_page(pdf_path, page_no)
+        if not text.strip():
+            continue
+        for m in stem_re.finditer(text):
+            qn = int(m.group(1))
+            found.add(qn)
+    return found
+
+
 def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_records):
     """One zero-token text-layer pass over the chapter's pages; returns
     {qn: [true_pdf_page, ...]} for every incomplete qn whose number is
@@ -3350,12 +3435,33 @@ def attribute_orphan_image(model, rel_path, chapter_records, state):
 # page and its answer/solution on a later page) into final records
 # ============================================================
 
-def merge_question_records(existing, new_items, stats=None, fill_only=False):
+def merge_question_records(existing, new_items, stats=None, fill_only=False,
+                             known_chapter_qns=None, carry_q_nos=()):
     """existing: dict keyed by q_no -> record (in progress for current chapter).
     stats: optional dict updated with "duplicates_merged"/"conflicts" counters.
     fill_only: recovery mode -- never overwrite a field that already has
     content; only fill what's missing (heals old rows without risking
     re-extraction noise replacing good data).
+
+    known_chapter_qns (run-20 upstream fix, 2026-08-08): the set of
+    q_nos the chapter's text layer prints question-stem headers for
+    (chapter_printed_question_qns), UNION the set the Q-pass already
+    returned in this chapter (chapter_records.keys()). When this is
+    non-empty, an incoming item whose q_no is NEITHER in this set NOR
+    in carry_q_nos is treated as a foreign-chapter q_no and DROPPED to
+    the skipped list (the caller appends it to the chapter's orphans
+    with reason="foreign_chapter_qno"). This is the upstream fix for
+    the PSY-007 Q23-Q26 phantom-record bug: the S-pass returns
+    "Solution to Question 23:" fragments from the previous chapter's
+    solution tail that lives inside PSY-007's page range, but Q23 is
+    not in PSY-007's question set, so accepting it would create a
+    phantom record whose real question lives in a different chapter.
+
+    carry_q_nos (run-20): the q_nos currently open in carry-forward
+    state from a previous window. An incoming item whose q_no is in
+    carry_q_nos is allowed even if it is not in known_chapter_qns
+    (legitimate cross-page continuation of a real question the
+    previous window was mid-solution on).
 
     Overlap-merge rules (sliding window re-extracts shared pages by design):
     - same q_no + question text similarity >= 95%  -> genuine re-extraction:
@@ -3366,8 +3472,19 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
     merged (never invent a number -- handoff rule #3) but ARE returned to the
     caller for orphan recovery (see ROOT_CAUSE_ANALYSIS.md RC-2)."""
     if stats is None:
-        stats = {"duplicates_merged": 0, "conflicts": 0}
+        stats = {"duplicates_merged": 0, "conflicts": 0,
+                 "foreign_chapter_qno_dropped": 0}
     skipped = []
+    carry_set = set(carry_q_nos or ())
+    # Build the allowed set: existing chapter_records (everything already
+    # merged in earlier windows) + the known_chapter_qns from the text layer.
+    # If known_chapter_qns is empty (scanned-only PDF, text layer garbled)
+    # we fall back to existing.keys() -- which is the pre-fix behavior, so
+    # no regression for books the text layer can't read.
+    if known_chapter_qns is None:
+        allowed_qns = set(existing.keys())
+    else:
+        allowed_qns = set(existing.keys()) | set(known_chapter_qns)
     for item in new_items:
         raw_qn = item.get("q_no")
         if raw_qn is None:
@@ -3381,6 +3498,26 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False):
                                # never compares int against str.
         except (TypeError, ValueError):
             print(f"  [WARN] Gemini returned a non-numeric q_no ({raw_qn!r}), skipping")
+            skipped.append(item)
+            continue
+        # ---- FOREIGN-CHAPTER Q_NO GUARD (run-20 upstream fix, 2026-08-08):
+        # the S-pass on PSY-007 pages 105-107 returned 9 items including
+        # q_no=23..26 from cross-chapter solution headers; the merge
+        # accepted them and created phantom chapter_records[23..26] whose
+        # real questions are in a different chapter. This guard drops such
+        # items AT the merge step (not at the output step) so the master
+        # chapter_records dict the build_final_question loop consumes
+        # never carries them. Bypassed for legitimate carry-forward
+        # continuations (carry_q_nos) and for chapters where the text
+        # layer is unreadable (known_chapter_qns is None: we trust
+        # chapter_records.keys() instead, which is the pre-fix path).
+        if known_chapter_qns is not None and qn not in allowed_qns and qn not in carry_set:
+            print(f"  [FOREIGN] q{qn}: not in known chapter q_nos "
+                  f"(text layer / Q-pass anchors) and not in carry "
+                  f"-- dropped at merge step (phantom record prevented); "
+                  f"caller will route to orphans with reason='foreign_chapter_qno'")
+            stats["foreign_chapter_qno_dropped"] = stats.get(
+                "foreign_chapter_qno_dropped", 0) + 1
             skipped.append(item)
             continue
         # ---- PROVENANCE + PATCH-ONLY RECOVERY (run-7 hardening #1/#2/#4):
@@ -5168,6 +5305,20 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                                     # from -- exported per-question, and used
                                     # by the post-chapter critique pass below
                                     # to know which page to re-show Gemini.
+        # run-20 (PSY-007 Q23-Q26 phantom-record fix, 2026-08-08): the
+        # set of q_nos the text layer prints question-stem headers for
+        # in this chapter (chapter_printed_question_qns), UNION the
+        # q_nos the Q-pass already produced in this chapter
+        # (chapter_records.keys() as the windows progress). Threaded
+        # into merge_question_records so the S-pass cannot create a
+        # phantom record for a q_no whose real question is in another
+        # chapter. Computed ONCE per chapter (one pdftotext pass over
+        # the chapter's pages); the Q-pass-anchor portion is updated
+        # as chapter_records grows. None when the text layer is empty
+        # (scanned-only PDF) -- the merge falls back to the pre-fix
+        # behavior in that case (no regression for books the text
+        # layer cannot read).
+        known_chapter_qns = chapter_printed_question_qns(pdf_path, page_files)
         stats = {"batches": 0, "duplicates_merged": 0, "conflicts": 0,
                  "carry_used": 0, "carry_merges": 0,
                  "orphans_recovered": 0, "orphans_buffered": 0, "orphans_remaining": 0,
@@ -5592,7 +5743,24 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                             "pass": pass_name, "item": it,
                         })
                     stats["orphans_buffered"] = stats.get("orphans_buffered", 0) + len(unverified)
-                chapter_records, skipped = merge_question_records(chapter_records, items, stats)
+                # run-20: thread the chapter's known q_no set (text-layer
+                # printed headers + Q-pass anchors accumulated so far) and
+                # the carry-in's open q_no into merge_question_records.
+                # Foreign-chapter q_nos are dropped at the merge step
+                # (before the master build_final_question loop), not at
+                # the split-output step. Carry-only is allowed (legitimate
+                # cross-page continuation of a real question).
+                carry_qns = []
+                if carry_in and carry_in.get("last_open_question") is not None:
+                    carry_qns.append(carry_in["last_open_question"])
+                chapter_records, skipped = merge_question_records(
+                    chapter_records, items, stats,
+                    known_chapter_qns=known_chapter_qns,
+                    carry_q_nos=carry_qns)
+                # Refresh known_chapter_qns with the Q-pass anchors that
+                # merged in this window (the text-layer portion is fixed;
+                # this grows the allowed set as new real questions appear).
+                known_chapter_qns |= {qn for qn in chapter_records if isinstance(qn, int)}
                 for it in items:
                     _qn = it.get("q_no") if isinstance(it, dict) else None
                     if isinstance(_qn, (int, str)):
@@ -6213,6 +6381,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
               f" | conflicts dropped: {stats['conflicts']} | carry-forward used: {stats['carry_used']}"
               f" | carry merges: {stats['carry_merges']}"
               f" | orphans: {stats['orphans_recovered']} recovered, {stats['orphans_remaining']} unresolved"
+              f" | foreign-chapter q_nos dropped: {stats.get('foreign_chapter_qno_dropped', 0)}"
               f" | unmatched images: {n_unmatched}"
               f" | rescue: {stats.get('rescue_filled', 0)} filled / {stats.get('rescue_calls', 0)} calls"
               f" | anchorless dropped: {stats.get('anchorless_dropped', 0)}")
