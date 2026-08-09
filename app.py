@@ -22,6 +22,7 @@ from flask import Flask, render_template_string, request, redirect, url_for, sen
 from werkzeug.utils import secure_filename
 
 import qbank_pipeline as pipeline
+import master_review_export  # MASTER_REVIEW/ package builder (read-only)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB per PDF upload
@@ -97,6 +98,17 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
             state["status"] = "completed"
         log("✅ Done (or paused at daily Gemini limit — tap Run again tomorrow to resume).")
         make_zip()
+        # After a successful run, also build the MASTER_REVIEW package
+        # (read-only copy of split/ + assets/ + data/) so it's ready
+        # for download alongside output_results.zip. Build failures
+        # are LOGGED but do NOT fail the run -- the live output is
+        # the source of truth, MASTER_REVIEW is just a convenience
+        # view for the human reviewer.
+        try:
+            master_review_export.build_master_review_zip(Path(pipeline.OUTPUT_ROOT))
+            log("📒 MASTER_REVIEW package ready -> tap 'Download MASTER_REVIEW' below.")
+        except Exception as mre:
+            log(f"⚠️ MASTER_REVIEW build skipped (live output unaffected): {mre}")
     except SystemExit:
         with state_lock:
             state["status"] = "paused"
@@ -181,6 +193,7 @@ PAGE = """
     <p class="text-sm mb-2">Status: <span class="font-semibold">{{ state.status }}</span></p>
     {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
     <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">Download results (.zip)</a>
+    <a href="/download-master-review" class="inline-block mt-2 bg-amber-600 text-white text-sm px-3 py-2 rounded">📒 Download MASTER_REVIEW (.zip)</a>
     {% if state.get('test_ready') %}
     <a href="/download-test" class="inline-block mt-2 bg-violet-600 text-white text-sm px-3 py-2 rounded">⬇️ Download TEST results (.zip)</a>
     {% endif %}
@@ -1040,6 +1053,46 @@ def download():
     if os.path.exists("output_results.zip"):
         return send_file("output_results.zip", as_attachment=True)
     return "No results yet", 404
+
+
+@app.route("/download-master-review")
+def download_master_review():
+    """Build (or rebuild) the MASTER_REVIEW/ tree from the live output
+    and serve a zip of it. Read-only: never modifies split/, assets/,
+    data/, subjects/, or any extraction file -- only writes a fresh
+    MASTER_REVIEW/ directory + zip next to the output root. Safe to
+    click any time after at least one chapter has been split-written."""
+    out = Path(OUTPUT_ROOT_ENV)
+    if not out.exists():
+        return "Output folder missing -- pehle Run karo.", 400
+    split_dir = out / "split"
+    if not split_dir.exists() or not any(split_dir.iterdir()):
+        return ("MASTER_REVIEW ke liye split/ directory chahiye, but "
+                "split/ is empty. Run complete nahi hua ya split layer "
+                "ne kuch nahi likha. Pehle Run complete hone do."), 400
+    try:
+        zip_path = master_review_export.build_master_review_zip(out)
+    except Exception as e:
+        log(f"❌ MASTER_REVIEW build failed: {e}")
+        traceback.print_exc()
+        return f"MASTER_REVIEW build failed: {e}", 500
+    # Log a short summary so the dashboard log box shows what
+    # happened (matches the existing 'Download results' UX where
+    # /make-zip prints a one-liner).
+    try:
+        manifest = json.loads(
+            (out / "MASTER_REVIEW" / "MASTER_REVIEW_MANIFEST.json").read_text(
+                encoding="utf-8"))
+        log(f"📒 MASTER_REVIEW: {manifest.get('total_chapters', 0)} chapter(s), "
+            f"{manifest.get('total_files_copied', 0)} file(s) copied, "
+            f"{manifest.get('total_images_copied', 0)} image(s) copied, "
+            f"{manifest.get('total_files_missing', 0)} file(s) missing, "
+            f"{manifest.get('total_images_missing', 0)} image(s) missing "
+            f"-> {zip_path.name}")
+    except Exception:
+        log(f"📒 MASTER_REVIEW zip ready -> {zip_path}")
+    return send_file(str(zip_path), as_attachment=True,
+                     download_name="MASTER_REVIEW.zip")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
